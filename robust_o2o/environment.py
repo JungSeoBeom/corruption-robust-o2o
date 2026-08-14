@@ -826,6 +826,14 @@ def preserve_training_rng_state():
     numpy_state = np.random.get_state()
     torch_state = torch.random.get_rng_state()
     cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    mps_available = (
+        hasattr(torch, "mps")
+        and hasattr(torch.mps, "get_rng_state")
+        and hasattr(torch.mps, "set_rng_state")
+        and hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    )
+    mps_state = torch.mps.get_rng_state().clone() if mps_available else None
     try:
         yield
     finally:
@@ -834,6 +842,8 @@ def preserve_training_rng_state():
         torch.random.set_rng_state(torch_state)
         if cuda_states is not None:
             torch.cuda.set_rng_state_all(cuda_states)
+        if mps_state is not None:
+            torch.mps.set_rng_state(mps_state)
 
 
 @torch.no_grad()

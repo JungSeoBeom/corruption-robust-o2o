@@ -424,6 +424,9 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
         normalized_dataset = apply_normalizer(corrupted_dataset, normalizer)
         offline = OfflineDataset(normalized_dataset, config.seed)
 
+        # Decouple learner initialization and subsequent training randomness
+        # from preprocessing, adversarial attacks, and cache hit/miss state.
+        seed_everything(config.seed)
         agent = build_agent(config, state_dim, action_dim, max_action, device)
         if checkpoint_payload is not None:
             agent.load_checkpoint_state(checkpoint_payload["agent"])

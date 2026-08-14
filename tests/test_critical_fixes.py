@@ -14,7 +14,11 @@ from robust_o2o.corruption import (
     mc_returns_from_reward_deltas,
 )
 from robust_o2o.device import seed_env_only, seed_everything
-from robust_o2o.environment import StateNormalizer, evaluate_agent
+from robust_o2o.environment import (
+    StateNormalizer,
+    evaluate_agent,
+    preserve_training_rng_state,
+)
 from robust_o2o.experiment import _make_evaluation_env
 from robust_o2o.replay import (
     OfflineDataset,
@@ -86,7 +90,86 @@ def flattened_parameters(agent: torch.nn.Module) -> torch.Tensor:
     return torch.cat([parameter.detach().reshape(-1) for parameter in agent.parameters()])
 
 
+MPS_RNG_AVAILABLE = (
+    hasattr(torch, "mps")
+    and hasattr(torch.mps, "get_rng_state")
+    and hasattr(torch.mps, "set_rng_state")
+    and hasattr(torch.backends, "mps")
+    and torch.backends.mps.is_available()
+)
+
+
 class EvaluationSeedRegressionTest(unittest.TestCase):
+    def small_iql_config(self, seed: int) -> ExperimentConfig:
+        return ExperimentConfig(
+            "riql_naive",
+            "hopper-medium-replay-v2",
+            seed=seed,
+            hidden_dim=16,
+            hidden_layers=2,
+            num_critics=3,
+        )
+
+    def test_learner_initialization_ignores_preprocessing_rng_consumption(self):
+        config = self.small_iql_config(seed=37)
+        seed_everything(config.seed)
+        for _ in range(100):
+            random.random()
+        np.random.random(1_000)
+        torch.rand(1_000)
+        seed_everything(config.seed)
+        after_preprocessing = build_agent(
+            config, 3, 2, 1.0, torch.device("cpu")
+        )
+
+        seed_everything(config.seed)
+        without_preprocessing = build_agent(
+            config, 3, 2, 1.0, torch.device("cpu")
+        )
+        self.assertTrue(
+            torch.equal(
+                flattened_parameters(after_preprocessing),
+                flattened_parameters(without_preprocessing),
+            )
+        )
+
+    def test_simulated_cache_hit_and_miss_initialize_identically(self):
+        config = self.small_iql_config(seed=53)
+
+        def initialize(cache_hit: bool) -> torch.Tensor:
+            seed_everything(config.seed)
+            if not cache_hit:
+                random.random()
+                np.random.random(257)
+                torch.rand(257)
+            seed_everything(config.seed)
+            agent = build_agent(config, 3, 2, 1.0, torch.device("cpu"))
+            return flattened_parameters(agent)
+
+        self.assertTrue(torch.equal(initialize(True), initialize(False)))
+
+    def test_rng_context_preserves_python_numpy_and_cpu_torch(self):
+        seed_everything(71)
+        expected = (random.random(), np.random.random(8), torch.rand(8))
+        seed_everything(71)
+        with preserve_training_rng_state():
+            random.random()
+            np.random.random(128)
+            torch.rand(128)
+        actual = (random.random(), np.random.random(8), torch.rand(8))
+        self.assertEqual(expected[0], actual[0])
+        np.testing.assert_array_equal(expected[1], actual[1])
+        self.assertTrue(torch.equal(expected[2], actual[2]))
+
+    @unittest.skipUnless(MPS_RNG_AVAILABLE, "MPS RNG APIs are unavailable")
+    def test_preserve_training_rng_state_restores_mps_rng(self):
+        torch.manual_seed(83)
+        before = torch.mps.get_rng_state().clone()
+        with preserve_training_rng_state():
+            torch.rand(128, device="mps")
+        after = torch.mps.get_rng_state()
+        self.assertTrue(torch.equal(before, after))
+
     def test_eval_environment_creation_and_seeding_preserve_all_global_rngs(self):
         seed_everything(123)
         expected = (random.random(), np.random.random(), torch.rand(4))
