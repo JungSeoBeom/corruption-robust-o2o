@@ -27,25 +27,41 @@ def plot_single_run(run_dir: Path) -> Optional[Path]:
     frame = pd.read_csv(metrics_path)
     if frame.empty:
         return None
+    frame = add_global_plot_steps(frame)
     figure, axis = plt.subplots(figsize=(8, 5))
     for phase, phase_frame in frame.groupby("phase"):
-        x_column = "env_steps" if phase == "online" else "step"
         axis.plot(
-            phase_frame[x_column],
+            phase_frame["global_step"],
             phase_frame["normalized_return_mean"],
             marker="o",
             markersize=2,
-            label=phase,
+            label=(
+                "offline (gradient updates)"
+                if phase == "offline"
+                else "online (environment steps)"
+            ),
         )
         axis.fill_between(
-            phase_frame[x_column],
+            phase_frame["global_step"],
             phase_frame["normalized_return_mean"]
             - phase_frame["normalized_return_std"],
             phase_frame["normalized_return_mean"]
             + phase_frame["normalized_return_std"],
             alpha=0.15,
         )
-    axis.set_xlabel("Environment steps / offline updates")
+    completed_offline = int(
+        frame.loc[frame["phase"] == "offline", "step"].max()
+        if (frame["phase"] == "offline").any()
+        else 0
+    )
+    axis.axvline(
+        completed_offline,
+        color="black",
+        linestyle="--",
+        linewidth=1.0,
+        label="offline → online",
+    )
+    axis.set_xlabel("Completed offline updates + online environment steps")
     axis.set_ylabel("D4RL normalized return")
     axis.grid(alpha=0.25)
     axis.legend()
@@ -54,6 +70,22 @@ def plot_single_run(run_dir: Path) -> Optional[Path]:
     figure.savefig(output, dpi=180)
     plt.close(figure)
     return output
+
+
+def add_global_plot_steps(frame):
+    """Return a copy with a monotonic offline-to-online x-coordinate."""
+    result = frame.copy()
+    offline = result["phase"] == "offline"
+    online = result["phase"] == "online"
+    completed_offline = int(result.loc[offline, "step"].max()) if offline.any() else 0
+    result["global_step"] = result["step"]
+    result.loc[online, "global_step"] = (
+        completed_offline + result.loc[online, "env_steps"]
+    )
+    ordered = result.sort_values(["global_step", "phase"])["global_step"].to_numpy()
+    if len(ordered) > 1 and (ordered[1:] < ordered[:-1]).any():
+        raise ValueError("offline/online plot coordinates are not monotonic")
+    return result
 
 
 def _load_runs(root: Path):
@@ -92,6 +124,10 @@ def _load_runs(root: Path):
             float(elapsed) if elapsed is not None else float("nan")
         )
         frame["planned_offline_steps"] = int(config.get("offline_steps", 0))
+        offline_rows = frame[frame["phase"] == "offline"]
+        frame["completed_offline_steps"] = (
+            int(offline_rows["step"].max()) if not offline_rows.empty else 0
+        )
         frame["planned_online_steps"] = int(config.get("online_steps", 0))
         frames.append(frame)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -189,7 +225,7 @@ def plot_aggregate(
         frame["plot_step"] = frame["step"]
         online = frame["phase"] == "online"
         frame.loc[online, "plot_step"] = (
-            frame.loc[online, "planned_offline_steps"]
+            frame.loc[online, "completed_offline_steps"]
             + frame.loc[online, "env_steps"]
         )
         x_column = "plot_step"
@@ -242,8 +278,14 @@ def plot_aggregate(
             va="center",
         )
     if phase == "offline_online" and not frame.empty:
-        boundary = int(frame["planned_offline_steps"].max())
-        axis.axvline(boundary, color="black", linestyle="--", linewidth=1.2)
+        boundary = int(frame["completed_offline_steps"].max())
+        axis.axvline(
+            boundary,
+            color="black",
+            linestyle="--",
+            linewidth=1.2,
+            label="offline → online",
+        )
     axis.set_xlabel(x_label)
     axis.set_ylabel("D4RL normalized return")
     axis.grid(alpha=0.25)

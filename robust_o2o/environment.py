@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
+import random
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, distribution, version
@@ -344,6 +346,35 @@ def raw_monte_carlo_returns(
     return returns
 
 
+def raw_episode_ids(
+    raw: Mapping[str, np.ndarray], max_episode_steps: int
+) -> np.ndarray:
+    """Return stable trajectory IDs while respecting terminals and timeouts."""
+    size = _validate_raw_dataset(raw)
+    terminals = np.asarray(raw["terminals"], dtype=bool).reshape(-1)
+    timeouts = (
+        np.asarray(raw["timeouts"], dtype=bool).reshape(-1)
+        if "timeouts" in raw
+        else None
+    )
+    ids = np.empty(size, dtype=np.int64)
+    episode_id = 0
+    episode_step = 0
+    for index in range(size):
+        ids[index] = episode_id
+        final_timestep = (
+            bool(timeouts[index])
+            if timeouts is not None
+            else episode_step == max_episode_steps - 1
+        )
+        if bool(terminals[index]) or final_timestep:
+            episode_id += 1
+            episode_step = 0
+        else:
+            episode_step += 1
+    return ids
+
+
 def _assert_official_dataset_matches(
     official: Mapping[str, np.ndarray],
     converted: Mapping[str, np.ndarray],
@@ -466,6 +497,12 @@ def load_d4rl_dataset(
         dataset["mc_returns"] = raw_returns[valid_indices].astype(
             np.float32, copy=True
         )
+        dataset["episode_id"] = raw_episode_ids(raw, max_episode_steps)[
+            valid_indices
+        ].astype(np.float32, copy=True)
+        dataset["mc_calibration_valid"] = np.ones(
+            len(valid_indices), dtype=np.float32
+        )
         return validate_dataset(dataset, env)
     if protocol != LEGACY_PROTOCOL:
         raise ValueError(f"Unknown dataset protocol {protocol!r}")
@@ -487,6 +524,12 @@ def load_d4rl_dataset(
     }
     raw_returns = raw_monte_carlo_returns(raw, discount, max_episode_steps)
     dataset["mc_returns"] = raw_returns[valid_indices].astype(np.float32, copy=True)
+    dataset["episode_id"] = raw_episode_ids(raw, max_episode_steps)[
+        valid_indices
+    ].astype(np.float32, copy=True)
+    dataset["mc_calibration_valid"] = np.ones(
+        len(valid_indices), dtype=np.float32
+    )
     return validate_dataset(dataset, env)
 
 
@@ -591,6 +634,10 @@ def environment_metadata(
         "observation_dim": int(dataset["observations"].shape[1]),
         "action_dim": int(dataset["actions"].shape[1]),
         "dataset_size": int(len(dataset["rewards"])),
+        "environment_max_episode_steps": _max_episode_steps(env),
+        "environment_seed": int(seed),
+        # Backward-compatible metadata aliases. Run configuration values are
+        # merged afterwards so these cannot overwrite resolved CLI values.
         "max_episode_steps": _max_episode_steps(env),
         "seed": int(seed),
     }
@@ -625,32 +672,68 @@ def preflight_runtime(
 class StateNormalizer:
     mean: np.ndarray
     std: np.ndarray
+    mode: str = "standard"
 
     @classmethod
-    def fit(cls, dataset: Dataset, enabled: bool = True) -> "StateNormalizer":
+    def fit(
+        cls,
+        dataset: Dataset,
+        enabled: bool = True,
+        mode: str = "standard",
+    ) -> "StateNormalizer":
         state_dim = dataset["observations"].shape[-1]
-        if not enabled:
+        if not enabled or mode == "none":
             return cls(
                 mean=np.zeros(state_dim, dtype=np.float32),
                 std=np.ones(state_dim, dtype=np.float32),
+                mode="none",
             )
         states = np.concatenate(
             (dataset["observations"], dataset["next_observations"]), axis=0
         )
+        if mode == "standard":
+            location = states.mean(axis=0)
+            scale = states.std(axis=0)
+        elif mode == "robust_median_mad":
+            location = np.median(states, axis=0)
+            scale = 1.4826 * np.median(np.abs(states - location), axis=0)
+        else:
+            raise ValueError(f"Unknown normalization mode {mode!r}")
         return cls(
-            mean=states.mean(axis=0).astype(np.float32),
-            std=(states.std(axis=0) + 1e-3).astype(np.float32),
+            mean=np.asarray(location, dtype=np.float32),
+            std=np.maximum(np.asarray(scale, dtype=np.float32), 1e-3),
+            mode=mode,
         )
 
     def transform(self, states: np.ndarray) -> np.ndarray:
         return ((states - self.mean) / self.std).astype(np.float32)
 
     def state_dict(self) -> Dict[str, np.ndarray]:
-        return {"mean": self.mean, "std": self.std}
+        return {"mean": self.mean, "std": self.std, "mode": self.mode}
+
+    def diagnostics(self, dataset: Dataset) -> Dict[str, float | str]:
+        transformed = self.transform(dataset["observations"])
+        return {
+            "normalizer_mode": self.mode,
+            "mean_or_median_min": float(self.mean.min()),
+            "mean_or_median_max": float(self.mean.max()),
+            "scale_min": float(self.std.min()),
+            "scale_max": float(self.std.max()),
+            "fraction_of_near_constant_dimensions": float(
+                np.mean(self.std <= 1.001e-3)
+            ),
+            "maximum_normalized_absolute_value": float(
+                np.max(np.abs(transformed))
+            ),
+        }
 
     @classmethod
     def from_state_dict(cls, state: Dict[str, np.ndarray]) -> "StateNormalizer":
-        return cls(np.asarray(state["mean"]), np.asarray(state["std"]))
+        return cls(
+            np.asarray(state["mean"]),
+            np.asarray(state["std"]),
+            str(state.get("mode", "standard")),
+        )
 
 
 def apply_normalizer(dataset: Dataset, normalizer: StateNormalizer) -> Dataset:
@@ -736,6 +819,23 @@ def step_env(
     )
 
 
+@contextmanager
+def preserve_training_rng_state():
+    """Keep evaluation from consuming any training RNG stream."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
 @torch.no_grad()
 def evaluate_agent(
     env: object,
@@ -747,29 +847,41 @@ def evaluate_agent(
     max_episode_steps: int,
     seed: int,
     protocol: str = DEFAULT_PROTOCOL,
+    evaluation_mode: str = "deterministic_diagnostic",
 ) -> Dict[str, float]:
     returns = []
-    for episode in range(episodes):
-        raw_state = reset_env(
-            env,
-            seed=seed + 10_000 + episode,
-            protocol=protocol,
-        )
-        episode_return = 0.0
-        for _ in range(max_episode_steps):
-            state = torch.as_tensor(
-                normalizer.transform(raw_state), dtype=torch.float32, device=device
-            )
-            action = agent.select_action(state, evaluate=True)
-            raw_state, reward, terminated, truncated, _ = step_env(
+    with preserve_training_rng_state():
+        for episode in range(episodes):
+            raw_state = reset_env(
                 env,
-                action.detach().cpu().numpy(),
+                seed=seed + 10_000 + episode,
                 protocol=protocol,
             )
-            episode_return += reward
-            if terminated or truncated:
-                break
-        returns.append(episode_return)
+            episode_return = 0.0
+            for _ in range(max_episode_steps):
+                state = torch.as_tensor(
+                    normalizer.transform(raw_state),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                action = agent.select_action(
+                    state,
+                    evaluate=True,
+                    evaluation_mode=evaluation_mode,
+                )
+                action_np = action.detach().cpu().numpy()
+                action_np = np.clip(
+                    action_np, env.action_space.low, env.action_space.high
+                ).astype(np.float32)
+                raw_state, reward, terminated, truncated, _ = step_env(
+                    env,
+                    action_np,
+                    protocol=protocol,
+                )
+                episode_return += reward
+                if terminated or truncated:
+                    break
+            returns.append(episode_return)
 
     returns_np = np.asarray(returns, dtype=np.float64)
     normalized = normalized_d4rl_scores(env_name, returns_np, protocol)

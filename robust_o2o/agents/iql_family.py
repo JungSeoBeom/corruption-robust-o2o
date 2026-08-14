@@ -13,6 +13,7 @@ from ..networks import (
     DoubleQNetwork,
     EnsembleQNetwork,
     ExpansionGaussianPolicy,
+    LegacyExpansionGaussianPolicy,
     TanhGaussianPolicy,
     ValueNetwork,
 )
@@ -83,7 +84,12 @@ class IQLFamilyAgent(BaseAgent):
                 self.max_action,
             )
         if self.config.algorithm == "rpex":
-            return ExpansionGaussianPolicy(
+            policy_class = (
+                ExpansionGaussianPolicy
+                if self.config.action_distribution == "tanh_gaussian"
+                else LegacyExpansionGaussianPolicy
+            )
+            return policy_class(
                 self.state_dim,
                 self.action_dim,
                 self.config.hidden_dim,
@@ -98,8 +104,13 @@ class IQLFamilyAgent(BaseAgent):
             self.max_action,
         )
 
-    def _make_online_actor(self) -> ExpansionGaussianPolicy:
-        return ExpansionGaussianPolicy(
+    def _make_online_actor(self) -> nn.Module:
+        policy_class = (
+            ExpansionGaussianPolicy
+            if self.config.action_distribution == "tanh_gaussian"
+            else LegacyExpansionGaussianPolicy
+        )
+        return policy_class(
             self.state_dim,
             self.action_dim,
             self.config.hidden_dim,
@@ -138,12 +149,17 @@ class IQLFamilyAgent(BaseAgent):
         return actor.act(states, deterministic=deterministic)
 
     def _expansion_action(
-        self, states: torch.Tensor, evaluate: bool, return_components: bool = False
+        self,
+        states: torch.Tensor,
+        evaluate: bool,
+        return_components: bool = False,
+        evaluation_mode: str = "deterministic_diagnostic",
     ):
         if self.offline_actor is None:
             raise RuntimeError("begin_online() must be called before policy expansion")
         offline_action = self._actor_action(self.offline_actor, states, True)
-        if evaluate:
+        method_faithful = evaluate and evaluation_mode == "method_faithful"
+        if method_faithful:
             online_action = self._actor_action(self.actor, states, True)
             sampled_online_action = self._actor_action(self.actor, states, False)
             sample_mask = (
@@ -152,6 +168,8 @@ class IQLFamilyAgent(BaseAgent):
             online_action = torch.where(
                 sample_mask, sampled_online_action, online_action
             )
+        elif evaluate:
+            online_action = self._actor_action(self.actor, states, True)
         else:
             online_action = self._actor_action(self.actor, states, False)
         q_offline = self._aggregate_q(self.critic, states, offline_action)
@@ -177,7 +195,9 @@ class IQLFamilyAgent(BaseAgent):
             q_online = q_online + coefficient * online_ipw
 
         logits = torch.stack((q_offline, q_online), dim=-1) * self.config.inv_temperature
-        if evaluate:
+        if evaluate and not method_faithful:
+            choice = logits.argmax(dim=-1)
+        elif method_faithful:
             choice = logits.argmax(dim=-1)
             # RPEX evaluates the policy-expansion categorical with eps=0.1.
             random_mask = torch.rand(choice.shape, device=choice.device) < 0.1
@@ -190,11 +210,18 @@ class IQLFamilyAgent(BaseAgent):
             return result, offline_action, online_action, choice.float().mean()
         return result
 
-    def select_action(self, state: torch.Tensor, evaluate: bool = False) -> torch.Tensor:
+    def select_action(
+        self,
+        state: torch.Tensor,
+        evaluate: bool = False,
+        evaluation_mode: str = "deterministic_diagnostic",
+    ) -> torch.Tensor:
         single = state.ndim == 1
         states = state.unsqueeze(0) if single else state
         if self.online_phase and self.expansion:
-            action = self._expansion_action(states, evaluate)
+            action = self._expansion_action(
+                states, evaluate, evaluation_mode=evaluation_mode
+            )
         else:
             action = self._actor_action(self.actor, states, evaluate)
         return action.squeeze(0) if single else action
@@ -221,6 +248,9 @@ class IQLFamilyAgent(BaseAgent):
         value_loss = expectile_loss(advantage, self.config.expectile)
         self.value_optimizer.zero_grad(set_to_none=True)
         value_loss.backward()
+        value_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.value.parameters(), float("inf")
+        )
         self.value_optimizer.step()
 
         targets = rewards + (1.0 - terminals) * self.config.discount * next_value
@@ -234,6 +264,9 @@ class IQLFamilyAgent(BaseAgent):
             q_loss = F.mse_loss(predicted, targets.unsqueeze(0).expand_as(predicted))
         self.q_optimizer.zero_grad(set_to_none=True)
         q_loss.backward()
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.critic.parameters(), float("inf")
+        )
         self.q_optimizer.step()
         soft_update(
             self.target_critic, self.critic, self.config.target_update_rate
@@ -262,15 +295,47 @@ class IQLFamilyAgent(BaseAgent):
         actor_loss = (weights * bc_loss).mean()
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.actor.parameters(), float("inf")
+        )
         self.actor_optimizer.step()
         self.total_updates += 1
-        return {
+        absolute_td = (targets.unsqueeze(0) - predicted).detach().abs().reshape(-1)
+        threshold = 1.0 / (self.config.riql_sigma**2)
+        saturated = weights.detach() >= 100.0 - 1e-6
+        policy_log_std = None
+        if not isinstance(self.actor, DeterministicPolicy):
+            policy_log_std = self.actor.distribution(states).stddev.log()
+        metrics = {
             "q_loss": float(q_loss.item()),
+            "critic_loss": float(q_loss.item()),
             "value_loss": float(value_loss.item()),
             "actor_loss": float(actor_loss.item()),
             "advantage_mean": float(advantage.mean().item()),
+            "advantage_std": float(advantage.std(unbiased=False).item()),
+            "awr_weight_p50": float(torch.quantile(weights.detach(), 0.5).item()),
+            "awr_weight_p95": float(torch.quantile(weights.detach(), 0.95).item()),
+            "awr_weight_max": float(weights.detach().max().item()),
+            "awr_weight_saturation_fraction": float(saturated.float().mean().item()),
+            "gradient_norm_actor": float(actor_grad_norm.item()),
+            "gradient_norm_critic": float(critic_grad_norm.item()),
+            "gradient_norm_value": float(value_grad_norm.item()),
+            "number_of_actor_updates": 1.0,
+            "number_of_critic_updates": 1.0,
+            "robust_loss_threshold": float(threshold),
+            "absolute_td_error_mean": float(absolute_td.mean().item()),
+            "absolute_td_error_p95": float(torch.quantile(absolute_td, 0.95).item()),
+            "linear_regime_fraction": float((absolute_td >= threshold).float().mean().item()),
+            "quadratic_regime_fraction": float((absolute_td < threshold).float().mean().item()),
             "expansion_online_fraction": float(expansion_online_fraction.item()),
         }
+        if policy_log_std is not None:
+            metrics.update(
+                policy_log_std_mean=float(policy_log_std.mean().item()),
+                policy_log_std_min=float(policy_log_std.min().item()),
+                policy_log_std_max=float(policy_log_std.max().item()),
+            )
+        return metrics
 
     def optimizer_state(self) -> Dict[str, object]:
         return {

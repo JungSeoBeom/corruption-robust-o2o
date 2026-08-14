@@ -121,7 +121,10 @@ class ExperimentConfig:
     discount: float = 0.99
     target_update_rate: float = 0.005
     normalize_states: bool = True
+    state_normalization: str = "standard"
     deterministic_policy: bool = False
+    action_distribution: str = "tanh_gaussian"
+    evaluation_mode: str = "deterministic_diagnostic"
 
     # IQL / RIQL / PEX / RPEX
     expectile: float = 0.7
@@ -146,6 +149,13 @@ class ExperimentConfig:
     cql_alpha_online: float = 1.0
     cql_n_actions: int = 10
     bc_steps: int = 100_000
+    backup_entropy: bool = False
+    mc_return_source: str = "post_corruption"
+
+    # Off2OnRL balanced replay. ``uniform`` is an explicit ablation.
+    pqe_replay_mode: str = "balanced_density"
+    balanced_replay_temperature: float = 5.0
+    priority_floor: float = 1e-3
 
     # RO2O
     ro2o_beta_policy: float = 1.0
@@ -165,6 +175,8 @@ class ExperimentConfig:
     offline_attack_steps: int = 100
     online_attack_steps: int = 2
     attack_step_size: float = 0.01
+    attack_min_step_size: float = 0.0
+    attack_norm: str = "linf"
     force_regenerate_attack: bool = False
     mixed_ratios: Tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
 
@@ -178,7 +190,17 @@ class ExperimentConfig:
         self.corruption_target = self.corruption_target.lower()
         self.stage = self.stage.lower()
         self.protocol = self.protocol.lower()
+        self.state_normalization = self.state_normalization.lower()
+        self.action_distribution = self.action_distribution.lower()
+        self.evaluation_mode = self.evaluation_mode.lower()
+        self.mc_return_source = self.mc_return_source.lower()
+        self.pqe_replay_mode = self.pqe_replay_mode.lower()
+        self.attack_norm = self.attack_norm.lower()
         self.mixed_ratios = tuple(float(value) for value in self.mixed_ratios)
+
+        if not self.normalize_states:
+            self.state_normalization = "none"
+        self.normalize_states = self.state_normalization != "none"
 
         if self.algorithm not in ALGORITHMS:
             raise ValueError(f"Unknown algorithm {self.algorithm!r}; choose from {ALGORITHMS}")
@@ -197,6 +219,34 @@ class ExperimentConfig:
             raise ValueError(
                 f"Unknown protocol {self.protocol!r}; choose from {PROTOCOLS}"
             )
+        if self.state_normalization not in ("standard", "robust_median_mad", "none"):
+            raise ValueError(
+                "state_normalization must be standard, robust_median_mad, or none"
+            )
+        if self.action_distribution not in ("tanh_gaussian", "legacy_gaussian"):
+            raise ValueError(
+                "action_distribution must be tanh_gaussian or legacy_gaussian"
+            )
+        if self.evaluation_mode not in (
+            "deterministic_diagnostic",
+            "method_faithful",
+            "both",
+        ):
+            raise ValueError(
+                "evaluation_mode must be deterministic_diagnostic, "
+                "method_faithful, or both"
+            )
+        if self.mc_return_source not in (
+            "post_corruption",
+            "legacy_pre_corruption",
+        ):
+            raise ValueError(
+                "mc_return_source must be post_corruption or legacy_pre_corruption"
+            )
+        if self.pqe_replay_mode not in ("balanced_density", "uniform"):
+            raise ValueError("pqe_replay_mode must be balanced_density or uniform")
+        if self.attack_norm != "linf":
+            raise ValueError("Only attack_norm=linf is currently implemented")
         if self.corruption == "clean":
             self.corruption_target = "none"
         elif self.corruption_target == "none":
@@ -218,6 +268,12 @@ class ExperimentConfig:
                 raise ValueError(f"{name} must be in [0, 1]")
         if self.offline_ratio is not None and not 0.0 <= self.offline_ratio <= 1.0:
             raise ValueError("offline_ratio must be in [0, 1]")
+        if self.balanced_replay_temperature <= 0.0:
+            raise ValueError("balanced_replay_temperature must be positive")
+        if self.priority_floor <= 0.0:
+            raise ValueError("priority_floor must be positive")
+        if self.attack_step_size < 0.0 or self.attack_min_step_size < 0.0:
+            raise ValueError("attack step sizes cannot be negative")
         if self.batch_size < 2:
             raise ValueError("batch_size must be at least 2")
         for name in ("offline_steps", "online_steps", "checkpoint_period"):
@@ -359,7 +415,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--target-update-rate", type=float, default=0.005)
     parser.add_argument("--no-normalize-states", dest="normalize_states", action="store_false")
+    parser.add_argument(
+        "--state-normalization",
+        choices=("standard", "robust_median_mad", "none"),
+        default="standard",
+    )
     parser.add_argument("--deterministic-policy", action="store_true")
+    parser.add_argument(
+        "--action-distribution",
+        choices=("tanh_gaussian", "legacy_gaussian"),
+        default="tanh_gaussian",
+        help="bounded default, or unsafe reproduction-only PEX/RPEX Gaussian",
+    )
+    parser.add_argument(
+        "--evaluation-mode",
+        choices=("deterministic_diagnostic", "method_faithful", "both"),
+        default="deterministic_diagnostic",
+    )
 
     parser.add_argument("--expectile", type=float, default=0.7)
     parser.add_argument("--beta", type=float, default=3.0)
@@ -381,6 +453,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cql-alpha-online", type=float, default=1.0)
     parser.add_argument("--cql-n-actions", type=int, default=10)
     parser.add_argument("--bc-steps", type=int, default=100_000)
+    parser.add_argument("--backup-entropy", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--mc-return-source",
+        choices=("post_corruption", "legacy_pre_corruption"),
+        default="post_corruption",
+    )
+    parser.add_argument(
+        "--pqe-replay-mode",
+        choices=("balanced_density", "uniform"),
+        default="balanced_density",
+    )
+    parser.add_argument("--balanced-replay-temperature", type=float, default=5.0)
+    parser.add_argument("--priority-floor", type=float, default=1e-3)
 
     parser.add_argument("--ro2o-beta-policy", type=float, default=1.0)
     parser.add_argument("--ro2o-beta-ood", type=float, default=0.1)
@@ -398,6 +483,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--offline-attack-steps", type=int, default=100)
     parser.add_argument("--online-attack-steps", type=int, default=2)
     parser.add_argument("--attack-step-size", type=float, default=0.01)
+    parser.add_argument("--attack-min-step-size", type=float, default=0.0)
+    parser.add_argument("--attack-norm", choices=("linf",), default="linf")
     parser.add_argument("--force-regenerate-attack", action="store_true")
     parser.add_argument(
         "--mixed-ratios",

@@ -68,6 +68,7 @@ class SACEnsembleAgent(BaseAgent):
         )
         self.log_alpha = torch.nn.Parameter(torch.zeros(1))
         self.ro2o_uncertainty = config.ro2o_uncertainty
+        self.last_priority_values: torch.Tensor | None = None
         self.to(device)
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(), lr=config.learning_rate
@@ -93,7 +94,13 @@ class SACEnsembleAgent(BaseAgent):
     def alpha(self) -> torch.Tensor:
         return self.log_alpha.exp()
 
-    def select_action(self, state: torch.Tensor, evaluate: bool = False) -> torch.Tensor:
+    def select_action(
+        self,
+        state: torch.Tensor,
+        evaluate: bool = False,
+        evaluation_mode: str = "deterministic_diagnostic",
+    ) -> torch.Tensor:
+        del evaluation_mode
         single = state.ndim == 1
         states = state.unsqueeze(0) if single else state
         action = self.actor.act(states, deterministic=evaluate)
@@ -156,7 +163,7 @@ class SACEnsembleAgent(BaseAgent):
             penalty = penalty + (q2_ood - q2_data).mean()
         return penalty
 
-    def _density_loss_and_weights(
+    def _density_loss_and_priorities(
         self, batch: TensorBatch, states: torch.Tensor, actions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.density_ratio is None or "_source" not in batch:
@@ -176,10 +183,18 @@ class SACEnsembleAgent(BaseAgent):
         )
         density_loss = offline_f_star.mean() - online_f_prime.mean()
         priority = torch.ones_like(weights)
-        normalized = offline_weights.pow(1.0 / 5.0)
-        normalized = normalized / (normalized.mean().detach() + 1e-10)
-        priority[offline_mask] = normalized.detach().clamp(0.001, 1_000.0)
+        denominator = offline_weights.pow(
+            1.0 / self.config.balanced_replay_temperature
+        ).mean()
+        normalized = weights.pow(1.0 / self.config.balanced_replay_temperature)
+        normalized = normalized / (denominator.detach() + 1e-10)
+        priority = normalized.detach().clamp(self.config.priority_floor, 1_000.0)
         return density_loss, priority
+
+    def consume_priority_values(self) -> torch.Tensor | None:
+        result = self.last_priority_values
+        self.last_priority_values = None
+        return result
 
     def _ro2o_noised_states(
         self, states: torch.Tensor, epsilon: float
@@ -250,13 +265,16 @@ class SACEnsembleAgent(BaseAgent):
         return penalty
 
     def update(self, batch: TensorBatch) -> Dict[str, float]:
+        self.last_priority_values = None
         states = batch["observations"]
         actions = batch["actions"]
         rewards = batch["rewards"].reshape(-1)
         next_states = batch["next_observations"]
         terminals = batch["terminals"].reshape(-1)
 
-        sampled_actions, log_prob, _, _ = self.actor(states, need_log_prob=True)
+        sampled_actions, log_prob, _, policy_std = self.actor(
+            states, need_log_prob=True
+        )
         alpha_loss = -(
             self.log_alpha * (log_prob + float(-self.actor.action_dim)).detach()
         ).mean()
@@ -279,6 +297,9 @@ class SACEnsembleAgent(BaseAgent):
             actor_loss = actor_loss + policy_smoothness
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.actor.parameters(), float("inf")
+        )
         self.actor_optimizer.step()
 
         with torch.no_grad():
@@ -326,13 +347,13 @@ class SACEnsembleAgent(BaseAgent):
             critic_loss = (td_error / uncertainty).mean(dim=1).sum()
             uncertainty_mean = uncertainty.mean()
         else:
-            density_loss, sample_weights = self._density_loss_and_weights(
+            density_loss, _ = self._density_loss_and_priorities(
                 batch, states, actions
             )
             per_sample_td = td_error.mean(dim=0)
             if td_error2 is not None:
                 per_sample_td = per_sample_td + td_error2.mean(dim=0)
-            critic_loss = (per_sample_td * sample_weights).mean()
+            critic_loss = per_sample_td.mean()
 
         cql_penalty = states.new_tensor(0.0)
         if self.variant in ("wsrl", "pessimistic_q_ensemble") and not self.online_phase:
@@ -348,6 +369,12 @@ class SACEnsembleAgent(BaseAgent):
 
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
+        critic_parameters = list(self.critic.parameters())
+        if self.critic2 is not None:
+            critic_parameters += list(self.critic2.parameters())
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            critic_parameters, float("inf")
+        )
         self.critic_optimizer.step()
         soft_update(
             self.target_critic, self.critic, self.config.target_update_rate
@@ -361,13 +388,27 @@ class SACEnsembleAgent(BaseAgent):
 
         density_value = states.new_tensor(0.0)
         if self.density_optimizer is not None and "_source" in batch:
-            density_value, _ = self._density_loss_and_weights(batch, states, actions)
+            density_value, _ = self._density_loss_and_priorities(
+                batch, states, actions
+            )
             if density_value.requires_grad:
                 self.density_optimizer.zero_grad(set_to_none=True)
                 density_value.backward()
                 self.density_optimizer.step()
+            with torch.no_grad():
+                _, priorities = self._density_loss_and_priorities(
+                    batch, states, actions
+                )
+                self.last_priority_values = priorities
 
         self.total_updates += 1
+        ensemble_mean_per_sample = predicted.detach().mean(dim=0)
+        ensemble_std_per_sample = predicted.detach().std(dim=0, unbiased=False)
+        lcb_penalty = (
+            self.config.lcb_ratio * ensemble_std_per_sample
+            if self.variant == "uwmsg"
+            else torch.zeros_like(ensemble_std_per_sample)
+        )
         return {
             "critic_loss": float(critic_loss.item()),
             "actor_loss": float(actor_loss.item()),
@@ -379,6 +420,28 @@ class SACEnsembleAgent(BaseAgent):
             "policy_smoothness": float(policy_smoothness.item()),
             "ood_penalty": float(ood_penalty.item()),
             "density_loss": float(density_value.item()),
+            "bellman_loss": float(
+                (td_error.mean() + (td_error2.mean() if td_error2 is not None else 0.0)).item()
+            ),
+            "cql_to_bellman_ratio": float(
+                cql_penalty.abs().div(td_error.mean().detach().abs() + 1e-8).item()
+            ),
+            "temperature_alpha": float(self.alpha.item()),
+            "entropy": float((-log_prob.detach()).mean().item()),
+            "gradient_norm_actor": float(actor_grad_norm.item()),
+            "gradient_norm_critic": float(critic_grad_norm.item()),
+            "number_of_actor_updates": 1.0,
+            "number_of_critic_updates": 1.0,
+            "ensemble_q_mean": float(predicted.detach().mean().item()),
+            "ensemble_q_std": float(predicted.detach().std(unbiased=False).item()),
+            "lcb_penalty_mean": float(lcb_penalty.mean().item()),
+            "policy_lcb_value": float(policy_q.detach().mean().item()),
+            "fraction_lcb_penalty_larger_than_q_mean": float(
+                (lcb_penalty > ensemble_mean_per_sample.abs()).float().mean().item()
+            ),
+            "policy_log_std_mean": float(policy_std.log().mean().item()),
+            "policy_log_std_min": float(policy_std.log().min().item()),
+            "policy_log_std_max": float(policy_std.log().max().item()),
             "q_mean": float(
                 (
                     torch.minimum(predicted, predicted2).mean()

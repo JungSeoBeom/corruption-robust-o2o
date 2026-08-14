@@ -29,7 +29,87 @@ from .environment import (
 )
 from .logging_utils import RunLogger
 from .paths import results_root_from_output
-from .replay import OfflineDataset, ReplayBuffer, mixed_batch
+from .replay import (
+    OfflineDataset,
+    ReplayBuffer,
+    balanced_priority_batch,
+    mixed_batch,
+    update_sample_priorities,
+)
+
+
+class MetricAccumulator:
+    def __init__(self) -> None:
+        self.values: Dict[str, list[float]] = {}
+
+    def add(self, metrics: Dict[str, float]) -> None:
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                self.values.setdefault(key, []).append(float(value))
+
+    def means(self, reset: bool = True) -> Dict[str, float]:
+        result = {
+            key: float(np.mean(values)) for key, values in self.values.items()
+        }
+        result["NaN_or_inf_count"] = float(
+            sum(not np.isfinite(value) for values in self.values.values() for value in values)
+        )
+        if reset:
+            self.values.clear()
+        return result
+
+
+def bounded_executed_action(
+    raw_policy_action: np.ndarray,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+) -> np.ndarray:
+    return np.clip(raw_policy_action, action_low, action_high).astype(np.float32)
+
+
+def _parameter_snapshot(agent: object) -> Dict[str, list[torch.Tensor]]:
+    groups: Dict[str, list[torch.Tensor]] = {"actor": [], "critic": []}
+    actor = getattr(agent, "actor", None)
+    if actor is not None:
+        groups["actor"] = [parameter.detach().clone() for parameter in actor.parameters()]
+    critic_modules = []
+    for name in ("critic", "critic2", "q1", "q2", "value"):
+        module = getattr(agent, name, None)
+        if module is not None:
+            critic_modules.append(module)
+    groups["critic"] = [
+        parameter.detach().clone()
+        for module in critic_modules
+        for parameter in module.parameters()
+    ]
+    return groups
+
+
+def _parameter_deltas(
+    agent: object, previous: Dict[str, list[torch.Tensor]]
+) -> tuple[Dict[str, float], Dict[str, list[torch.Tensor]]]:
+    current = _parameter_snapshot(agent)
+    deltas = {}
+    for group in ("actor", "critic"):
+        squared = sum(
+            float((now - before).square().sum().item())
+            for now, before in zip(current[group], previous[group])
+        )
+        deltas[f"{group}_parameter_delta"] = float(np.sqrt(squared))
+    return deltas, current
+
+
+def _policy_log_std_metrics(agent: object) -> Dict[str, float]:
+    actor = getattr(agent, "actor", None)
+    log_std = getattr(actor, "log_std", None)
+    if log_std is None or not torch.is_tensor(log_std):
+        return {}
+    values = log_std.detach()
+    return {
+        "policy_log_std_mean": float(values.mean().item()),
+        "policy_log_std_min": float(values.min().item()),
+        "policy_log_std_max": float(values.max().item()),
+    }
 
 
 def _torch_load(path: Path, device: torch.device) -> Dict[str, Any]:
@@ -51,7 +131,7 @@ def save_checkpoint(
     action_dim: int,
 ) -> None:
     payload = {
-        "format_version": 1,
+        "format_version": 2,
         "algorithm": config.algorithm,
         "env_name": config.env_name,
         "protocol": config.protocol,
@@ -139,6 +219,19 @@ def _validate_checkpoint(
         )
     if payload.get("state_dim") != state_dim or payload.get("action_dim") != action_dim:
         raise ValueError("Checkpoint observation/action dimensions do not match the env")
+    saved_config = payload.get("config", {})
+    if config.algorithm in ("rpex", "riql_pex", "pex"):
+        saved_distribution = saved_config.get("action_distribution")
+        if saved_distribution is None:
+            raise ValueError(
+                "Legacy expansion checkpoint lacks action_distribution metadata; "
+                "load it only with a converted checkpoint or retrain explicitly"
+            )
+        if saved_distribution != config.action_distribution:
+            raise ValueError(
+                "Checkpoint action_distribution="
+                f"{saved_distribution!r}, requested={config.action_distribution!r}"
+            )
 
 
 def _restore_agent_config(config: ExperimentConfig, payload: Dict[str, Any]) -> None:
@@ -169,6 +262,9 @@ def _restore_agent_config(config: ExperimentConfig, payload: Dict[str, Any]) -> 
         "cql_alpha_online",
         "cql_n_actions",
         "bc_steps",
+        "backup_entropy",
+        "mc_return_source",
+        "action_distribution",
         "ro2o_beta_policy",
         "ro2o_beta_ood",
         "ro2o_q_smooth_eps",
@@ -195,17 +291,39 @@ def _evaluate(
     step: int,
     env_steps: int,
 ) -> None:
-    metrics = evaluate_agent(
-        env,
-        config.env_name,
-        agent,
-        normalizer,
-        device,
-        config.eval_episodes,
-        config.max_episode_steps,
-        config.seed,
-        config.protocol,
+    modes = (
+        ("deterministic_diagnostic", "method_faithful")
+        if config.evaluation_mode == "both"
+        else (config.evaluation_mode,)
     )
+    evaluations = {
+        mode: evaluate_agent(
+            env,
+            config.env_name,
+            agent,
+            normalizer,
+            device,
+            config.eval_episodes,
+            config.max_episode_steps,
+            config.seed,
+            config.protocol,
+            mode,
+        )
+        for mode in modes
+    }
+    primary_mode = (
+        "deterministic_diagnostic"
+        if "deterministic_diagnostic" in evaluations
+        else modes[0]
+    )
+    metrics = dict(evaluations[primary_mode])
+    for mode, values in evaluations.items():
+        suffix = "deterministic" if mode == "deterministic_diagnostic" else "method_faithful"
+        metrics[f"return_{suffix}"] = values["return_mean"]
+        metrics[f"normalized_return_{suffix}"] = values[
+            "normalized_return_mean"
+        ]
+    metrics["evaluation_mode"] = primary_mode
     logger.log_evaluation(
         phase, step, env_steps, agent.total_updates, metrics
     )
@@ -285,7 +403,9 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
             )
         else:
             normalizer = StateNormalizer.fit(
-                corrupted_dataset, enabled=config.normalize_states
+                corrupted_dataset,
+                enabled=config.normalize_states,
+                mode=config.state_normalization,
             )
         normalized_dataset = apply_normalizer(corrupted_dataset, normalizer)
         offline = OfflineDataset(normalized_dataset, config.seed)
@@ -296,13 +416,14 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
 
         logger.write_config(
             {
-                **config.to_dict(),
                 **protocol_metadata,
+                **config.to_dict(),
                 "resolved_device": str(device),
                 "run_dir": str(logger.run_dir),
                 "state_dim": state_dim,
                 "action_dim": action_dim,
                 "offline_corruption": corruption_stats,
+                "normalizer": normalizer.diagnostics(corrupted_dataset),
             }
         )
         logger.logger.info(
@@ -367,11 +488,31 @@ def _run_offline(
 ) -> None:
     logger.logger.info("offline pre-training started")
     last_metrics: Dict[str, float] = {}
+    accumulator = MetricAccumulator()
+    parameter_snapshot = _parameter_snapshot(agent)
     for step in range(1, config.offline_steps + 1):
         batch = offline.sample(config.batch_size, device)
         last_metrics = agent.update(batch)
+        accumulator.add(last_metrics)
         if step % config.train_log_period == 0:
-            logger.log_train("offline", step, 0, agent.total_updates, last_metrics)
+            parameter_deltas, parameter_snapshot = _parameter_deltas(
+                agent, parameter_snapshot
+            )
+            logger.log_train(
+                "offline",
+                step,
+                0,
+                agent.total_updates,
+                {
+                    **accumulator.means(),
+                    **parameter_deltas,
+                    **_policy_log_std_metrics(agent),
+                    "replay_size_offline": float(offline.size),
+                    "replay_size_online": 0.0,
+                    "offline_batch_fraction": 1.0,
+                    "online_batch_fraction": 0.0,
+                },
+            )
         if step % config.eval_period == 0:
             _evaluate(
                 logger,
@@ -454,6 +595,8 @@ def _run_online(
     episode_steps = 0
     corrupted_online = 0
     last_metrics: Dict[str, float] = {}
+    accumulator = MetricAccumulator()
+    parameter_snapshot = _parameter_snapshot(agent)
     offline_ratio = config.effective_offline_ratio
     online_batch_count = config.batch_size - int(
         round(config.batch_size * offline_ratio)
@@ -463,16 +606,43 @@ def _run_online(
         if config.algorithm == "wsrl"
         else config.initial_collection_steps
     )
+    action_low = np.asarray(env.action_space.low, dtype=np.float32)
+    action_high = np.asarray(env.action_space.high, dtype=np.float32)
+    raw_action_abs_max = 0.0
+    executed_action_abs_max = 0.0
+    executed_oob = 0
+    replay_mismatch = 0
+    priority_metrics: Dict[str, float] = {}
+    desired_online_fraction = 1.0 - offline_ratio
+    initial_online_priority = (
+        offline.size
+        * desired_online_fraction
+        / max(offline_ratio * max(warmup, 1), 1e-12)
+        if config.algorithm == "pessimistic_q_ensemble"
+        and config.pqe_replay_mode == "balanced_density"
+        and offline_ratio > 0.0
+        else 1.0
+    )
 
     for env_step in range(1, config.online_steps + 1):
         state_tensor = torch.as_tensor(
             normalizer.transform(raw_state), dtype=torch.float32, device=device
         )
         with torch.no_grad():
-            action = agent.select_action(state_tensor, evaluate=False)
-        action_np = action.detach().cpu().numpy().astype(np.float32)
+            raw_policy_action = agent.select_action(state_tensor, evaluate=False)
+        raw_action_np = raw_policy_action.detach().cpu().numpy().astype(np.float32)
+        executed_action = bounded_executed_action(
+            raw_action_np, action_low, action_high
+        )
+        raw_action_abs_max = max(raw_action_abs_max, float(np.abs(raw_action_np).max()))
+        executed_action_abs_max = max(
+            executed_action_abs_max, float(np.abs(executed_action).max())
+        )
+        executed_oob += int(
+            np.any(executed_action < action_low) or np.any(executed_action > action_high)
+        )
         raw_next_state, reward, terminated, truncated, _ = step_env(
-            env, action_np, protocol=config.protocol
+            env, executed_action, protocol=config.protocol
         )
         episode_steps += 1
 
@@ -484,7 +654,7 @@ def _run_online(
             was_corrupted,
         ) = corrupt_online_transition(
             raw_state,
-            action_np,
+            executed_action,
             reward,
             raw_next_state,
             config,
@@ -494,12 +664,16 @@ def _run_online(
             action_std,
         )
         corrupted_online += int(was_corrupted)
+        replay_mismatch += int(
+            not np.allclose(stored_action, executed_action, rtol=1e-6, atol=1e-6)
+        )
         replay.add(
             normalizer.transform(stored_state),
             stored_action,
             stored_reward,
             normalizer.transform(stored_next_state),
             float(terminated),
+            priority=initial_online_priority,
         )
         raw_state = raw_next_state
         if terminated or truncated or episode_steps >= config.max_episode_steps:
@@ -509,27 +683,57 @@ def _run_online(
         can_update = env_step > warmup and replay.size >= max(online_batch_count, 1)
         if can_update:
             for _ in range(config.updates_per_step):
-                batch = mixed_batch(
-                    offline,
-                    replay,
-                    config.batch_size,
-                    offline_ratio,
-                    device,
-                    prioritized_online=(
-                        config.algorithm == "pessimistic_q_ensemble"
-                    ),
+                prioritized = (
+                    config.algorithm == "pessimistic_q_ensemble"
+                    and config.pqe_replay_mode == "balanced_density"
                 )
+                if prioritized:
+                    batch = balanced_priority_batch(
+                        offline, replay, config.batch_size, device
+                    )
+                else:
+                    batch = mixed_batch(
+                        offline,
+                        replay,
+                        config.batch_size,
+                        offline_ratio,
+                        device,
+                    )
                 last_metrics = agent.update(batch)
+                accumulator.add(last_metrics)
+                if prioritized:
+                    priorities = agent.consume_priority_values()
+                    if priorities is None:
+                        raise RuntimeError(
+                            "Pessimistic Q-Ensemble skipped a required priority update"
+                        )
+                    priority_metrics = update_sample_priorities(
+                        offline, replay, batch, priorities
+                    )
         if env_step % config.train_log_period == 0:
+            parameter_deltas, parameter_snapshot = _parameter_deltas(
+                agent, parameter_snapshot
+            )
             logger.log_train(
                 "online",
                 env_step,
                 env_step,
                 agent.total_updates,
                 {
-                    **last_metrics,
+                    **accumulator.means(),
+                    **parameter_deltas,
+                    **_policy_log_std_metrics(agent),
                     "replay_size": float(replay.size),
+                    "replay_size_offline": float(offline.size),
+                    "replay_size_online": float(replay.size),
+                    "offline_batch_fraction": float(offline_ratio),
+                    "online_batch_fraction": float(1.0 - offline_ratio),
                     "online_corruption_fraction": corrupted_online / env_step,
+                    "raw_action_abs_max": raw_action_abs_max,
+                    "executed_action_abs_max": executed_action_abs_max,
+                    "executed_action_oob_fraction": executed_oob / env_step,
+                    "replay_env_action_mismatch_fraction": replay_mismatch / env_step,
+                    **priority_metrics,
                 },
             )
         if env_step % config.eval_period == 0:

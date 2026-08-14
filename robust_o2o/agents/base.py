@@ -24,7 +24,12 @@ class BaseAgent(nn.Module):
     def update(self, batch: TensorBatch) -> Dict[str, float]:
         raise NotImplementedError
 
-    def select_action(self, state: torch.Tensor, evaluate: bool = False) -> torch.Tensor:
+    def select_action(
+        self,
+        state: torch.Tensor,
+        evaluate: bool = False,
+        evaluation_mode: str = "deterministic_diagnostic",
+    ) -> torch.Tensor:
         raise NotImplementedError
 
     def begin_online(self) -> None:

@@ -32,6 +32,8 @@ class TanhGaussianPolicy(nn.Module):
         hidden_layers: int = 2,
         max_action: float = 1.0,
         deterministic: bool = False,
+        action_low: Optional[torch.Tensor] = None,
+        action_high: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.trunk = mlp(state_dim, hidden_dim, hidden_layers, hidden_dim)
@@ -40,6 +42,12 @@ class TanhGaussianPolicy(nn.Module):
         self.action_dim = action_dim
         self.max_action = float(max_action)
         self.deterministic_policy = deterministic
+        low = torch.full((action_dim,), -self.max_action) if action_low is None else torch.as_tensor(action_low, dtype=torch.float32)
+        high = torch.full((action_dim,), self.max_action) if action_high is None else torch.as_tensor(action_high, dtype=torch.float32)
+        if low.shape != (action_dim,) or high.shape != (action_dim,) or not torch.all(high > low):
+            raise ValueError("action bounds must be finite vectors with high > low")
+        self.register_buffer("action_scale", (high - low) / 2.0)
+        self.register_buffer("action_bias", (high + low) / 2.0)
 
         nn.init.uniform_(self.mean.weight, -1e-3, 1e-3)
         nn.init.uniform_(self.mean.bias, -1e-3, 1e-3)
@@ -64,16 +72,20 @@ class TanhGaussianPolicy(nn.Module):
         log_prob = None
         if need_log_prob:
             log_prob = dist.log_prob(raw_action).sum(dim=-1)
-            log_prob -= torch.log(1.0 - squashed.pow(2) + 1e-6).sum(dim=-1)
-        action = squashed * self.max_action
+            jacobian = self.action_scale * (1.0 - squashed.pow(2))
+            log_prob -= torch.log(jacobian + 1e-6).sum(dim=-1)
+        action = self.action_bias + self.action_scale * squashed
         return action, log_prob, dist.mean, dist.stddev
 
     def log_prob(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        scaled = (actions / self.max_action).clamp(-0.999999, 0.999999)
+        scaled = ((actions - self.action_bias) / self.action_scale).clamp(
+            -0.999999, 0.999999
+        )
         raw = torch.atanh(scaled)
         dist = self.distribution(states)
         result = dist.log_prob(raw).sum(dim=-1)
-        return result - torch.log(1.0 - scaled.pow(2) + 1e-6).sum(dim=-1)
+        jacobian = self.action_scale * (1.0 - scaled.pow(2))
+        return result - torch.log(jacobian + 1e-6).sum(dim=-1)
 
     @torch.no_grad()
     def act(self, states: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
@@ -81,7 +93,79 @@ class TanhGaussianPolicy(nn.Module):
 
 
 class ExpansionGaussianPolicy(nn.Module):
-    """Gaussian used by the official PEX/RPEX online expansion policy."""
+    """Safe bounded PEX/RPEX Gaussian with a corrected transformed density."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int = 256,
+        hidden_layers: int = 2,
+        max_action: float = 1.0,
+        action_low: Optional[torch.Tensor] = None,
+        action_high: Optional[torch.Tensor] = None,
+    ):
+        super().__init__()
+        self.trunk = mlp(state_dim, hidden_dim, hidden_layers, hidden_dim)
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.action_dim = action_dim
+        self.max_action = float(max_action)
+        low = torch.full((action_dim,), -self.max_action) if action_low is None else torch.as_tensor(action_low, dtype=torch.float32)
+        high = torch.full((action_dim,), self.max_action) if action_high is None else torch.as_tensor(action_high, dtype=torch.float32)
+        if low.shape != (action_dim,) or high.shape != (action_dim,) or not torch.all(high > low):
+            raise ValueError("action bounds must be finite vectors with high > low")
+        self.register_buffer("action_scale", (high - low) / 2.0)
+        self.register_buffer("action_bias", (high + low) / 2.0)
+        self.apply(self._initialize_linear)
+
+    @staticmethod
+    def _initialize_linear(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            nn.init.zeros_(module.bias)
+
+    def distribution(self, states: torch.Tensor) -> Independent:
+        hidden = self.trunk(states)
+        mean = self.mean(hidden)
+        std = self.log_std.clamp(LOG_STD_MIN, LOG_STD_MAX).exp()
+        return Independent(Normal(mean, std), 1)
+
+    def log_prob(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        normalized = ((actions - self.action_bias) / self.action_scale).clamp(
+            -0.999999, 0.999999
+        )
+        raw = torch.atanh(normalized)
+        jacobian = self.action_scale * (1.0 - normalized.square())
+        return self.distribution(states).log_prob(raw) - torch.log(
+            jacobian + 1e-6
+        ).sum(dim=-1)
+
+    def forward(
+        self,
+        states: torch.Tensor,
+        deterministic: bool = False,
+        need_log_prob: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+        distribution = self.distribution(states)
+        raw = distribution.mean if deterministic else distribution.rsample()
+        normalized = torch.tanh(raw)
+        action = self.action_bias + self.action_scale * normalized
+        log_prob = None
+        if need_log_prob:
+            jacobian = self.action_scale * (1.0 - normalized.square())
+            log_prob = distribution.log_prob(raw) - torch.log(
+                jacobian + 1e-6
+            ).sum(dim=-1)
+        return action, log_prob, distribution.mean, distribution.stddev
+
+    @torch.no_grad()
+    def act(self, states: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+        return self(states, deterministic=deterministic)[0]
+
+
+class LegacyExpansionGaussianPolicy(nn.Module):
+    """Unbounded official-code reproduction mode; unsafe for env execution."""
 
     def __init__(
         self,
@@ -95,14 +179,9 @@ class ExpansionGaussianPolicy(nn.Module):
         self.trunk = mlp(state_dim, hidden_dim, hidden_layers, hidden_dim)
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.action_dim = action_dim
         self.max_action = float(max_action)
-        self.apply(self._initialize_linear)
-
-    @staticmethod
-    def _initialize_linear(module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            nn.init.zeros_(module.bias)
+        self.apply(ExpansionGaussianPolicy._initialize_linear)
 
     def distribution(self, states: torch.Tensor) -> Independent:
         hidden = self.trunk(states)

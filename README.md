@@ -40,9 +40,10 @@ As requested, the online stages of `riql_naive` and `uwmsg` store newly collecte
 transitions in a replay buffer and train on mini-batches using the same objective
 as their offline updates. Following the default comparison protocol in the RPEX
 code, the RIQL variants, UWMSG, WSRL, and RO2O use online replay only by default.
-PEX, Cal-QL, and Pessimistic Q-Ensemble mix offline and online data at a 50:50
-ratio. This ratio can be changed explicitly for any algorithm with
-`--offline-ratio 0.0~1.0`.
+PEX and Cal-QL mix offline and online data at a 50:50 ratio. Pessimistic
+Q-Ensemble uses density-ratio priority over a combined offline/online priority
+mass; `--offline-ratio` sets its initial target mass. Use
+`--pqe-replay-mode uniform` for the explicit fixed-ratio ablation.
 
 ## 2. Reproducibility environment
 
@@ -146,6 +147,12 @@ The following corruption targets are supported:
 - `mixed`: allocate corrupted transitions across all four targets using
   `--mixed-ratios`
 
+Online corruption is explicitly replay-only poisoning. The bounded clean policy
+action is executed in `env.step()`. The selected observation/action/reward/next
+observation field is then corrupted only in the transition stored in replay.
+Thus clean runs require exact equality between executed and replayed actions,
+while action-corruption runs intentionally record a mismatch.
+
 The default corruption parameters match RPEX:
 
 - Offline corruption rate: `0.3`
@@ -213,10 +220,30 @@ python run_experiment.py \
   --attack-checkpoint /absolute/path/to/EDAC/2999.pt
 ```
 
-Attack results are stored in
-`results/attack_cache/<protocol>/`. An attack is not regenerated
-when the seed and corruption configuration match an existing cache entry. Add
-`--force-regenerate-attack` to regenerate it.
+Attack results are stored in `results/attack_cache/<protocol>/`. Cache keys hash
+the dataset, attack checkpoint, target/rate/range, seed, attack steps and step
+size, norm, preprocessing-relevant MC settings, and implementation version.
+`--attack-min-step-size` is explicit and defaults to zero; no hidden runtime
+lower bound is applied. Add `--force-regenerate-attack` to regenerate a cache.
+
+### Correctness-sensitive modes
+
+- `--action-distribution tanh_gaussian` is the safe RPEX/PEX default. It uses a
+  bounded transformed Gaussian and Jacobian-corrected log density.
+  `legacy_gaussian` is unbounded reproduction-only behavior; environment actions
+  are still clipped before execution.
+- `--evaluation-mode deterministic_diagnostic` uses policy means and a
+  deterministic expansion branch. `method_faithful` preserves stochastic RPEX
+  expansion, and `both` logs both. Evaluation saves/restores Python, NumPy,
+  PyTorch CPU, and CUDA RNG state.
+- `--mc-return-source post_corruption` is the Cal-QL default. Reward corruption
+  recomputes return-to-go within trajectory boundaries, and corrupted
+  state/action/next-state rows are excluded from calibration.
+  `legacy_pre_corruption` is an explicit reproduction mode.
+- `--backup-entropy` enables the entropy term in the Cal-QL Bellman backup. The
+  default is disabled, matching the task configuration used by the reference.
+- `--state-normalization` accepts `standard`, `robust_median_mad`, or `none`.
+  Statistics are fitted after corruption and serialized in checkpoints.
 
 ## 4. Running the offline and online stages separately
 
@@ -250,7 +277,27 @@ The final offline checkpoint is stored at
 `checkpoints/offline/final.pt` inside the run directory. The program fails
 immediately if the checkpoint algorithm, environment, or
 observation/action dimensions do not match the current command. The state
-normalization mean and standard deviation are also restored from the checkpoint.
+normalization mode, location, and scale are also restored from the checkpoint.
+New runs write both `config.json` and `resolved_config.json`.
+
+## Quick training diagnostics
+
+The lightweight runner checks finite updates, action/replay invariants, and
+basic return health:
+
+```bash
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 \
+python scripts/diagnose_training.py \
+  --algorithm rpex \
+  --env hopper-medium-replay-v2 \
+  --offline-steps 20 \
+  --online-steps 30 \
+  --corruption-rate 0 \
+  --quick
+```
+
+Each diagnostic run writes `diagnostics_summary.json`,
+`diagnostics_summary.csv`, and `resolved_config.json` in its run directory.
 
 ### Checkpoint intervals and retention
 

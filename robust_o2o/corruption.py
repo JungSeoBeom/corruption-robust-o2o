@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -16,6 +18,9 @@ from .config import (
 from .device import clear_accelerator_cache
 from .environment import Dataset
 from .networks import VectorizedLinear
+
+
+ATTACK_IMPLEMENTATION_VERSION = "corruption_v3_explicit_step_and_cache"
 
 
 class EDACActor(nn.Module):
@@ -78,6 +83,7 @@ class AttackOracle:
         if not checkpoint.exists():
             raise FileNotFoundError(f"Adversarial attack checkpoint not found: {checkpoint}")
         self.device = device
+        self.checkpoint = checkpoint.resolve()
         self.actor = EDACActor(state_dim, action_dim, max_action).to(device).eval()
         self.critic = EDACCritic(state_dim, action_dim).to(device).eval()
         state = torch.load(checkpoint, map_location=device)
@@ -177,19 +183,64 @@ def make_attack_oracle(
     )
 
 
-def _cache_file(config: ExperimentConfig, cache_root: Path) -> Path:
-    mixed_suffix = ""
-    if config.corruption_target == "mixed":
-        ratios = "-".join(f"{ratio:g}" for ratio in config.mixed_ratios)
-        mixed_suffix = f"_mix{ratios}"
-    name = (
-        f"{config.corruption}_{config.corruption_target}"
-        f"{mixed_suffix}"
-        f"_range{config.corruption_range:g}"
-        f"_rate{config.offline_corruption_rate:g}"
-        f"_seed{config.seed}.npz"
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def dataset_fingerprint(dataset: Dataset) -> str:
+    digest = hashlib.sha256()
+    for key in sorted(dataset):
+        array = np.ascontiguousarray(dataset[key])
+        digest.update(key.encode("utf-8"))
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(str(array.shape).encode("ascii"))
+        digest.update(memoryview(array).cast("B"))
+    return digest.hexdigest()
+
+
+def corruption_cache_fingerprint(
+    dataset: Dataset,
+    config: ExperimentConfig,
+    oracle: Optional[AttackOracle],
+) -> Tuple[str, Dict[str, Any]]:
+    dataset_hash = dataset_fingerprint(dataset)
+    checkpoint_hash = (
+        _sha256_file(oracle.checkpoint) if oracle is not None else "none"
     )
-    return cache_root / config.env_name / name
+    metadata = {
+        "dataset_fingerprint": dataset_hash,
+        "attack_checkpoint_fingerprint": checkpoint_hash,
+        "corruption": config.corruption,
+        "corruption_target": config.corruption_target,
+        "corruption_range": config.corruption_range,
+        "offline_corruption_rate": config.offline_corruption_rate,
+        "seed": config.seed,
+        "offline_attack_steps": config.offline_attack_steps,
+        "attack_step_size": config.attack_step_size,
+        "attack_min_step_size": config.attack_min_step_size,
+        "attack_norm": config.attack_norm,
+        "mixed_ratios": list(config.mixed_ratios),
+        "attack_implementation_version": ATTACK_IMPLEMENTATION_VERSION,
+        "mc_return_source": config.mc_return_source,
+        "discount": config.discount,
+    }
+    encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest(), metadata
+
+
+def _cache_file(
+    dataset: Dataset,
+    config: ExperimentConfig,
+    oracle: Optional[AttackOracle],
+    cache_root: Path,
+) -> Tuple[Path, str, Dict[str, Any]]:
+    cache_key, metadata = corruption_cache_fingerprint(dataset, config, oracle)
+    name = f"{config.corruption}_{config.corruption_target}_{cache_key}.npz"
+    return cache_root / config.env_name / name, cache_key, metadata
 
 
 def _target_dataset_key(target: str) -> str:
@@ -206,7 +257,7 @@ def _corruption_stats(
     target_indices: Dict[str, np.ndarray],
     config: ExperimentConfig,
     loaded_from_cache: bool,
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     total = sum(len(indices) for indices in target_indices.values())
     stats = {
         "corrupted_count": int(total),
@@ -224,11 +275,72 @@ def _corruption_stats(
     return stats
 
 
+def recompute_mc_returns(dataset: Dataset, discount: float) -> np.ndarray:
+    if "episode_id" not in dataset:
+        raise RuntimeError(
+            "post-corruption MC returns require episode_id trajectory metadata"
+        )
+    rewards = np.asarray(dataset["rewards"], dtype=np.float64).reshape(-1)
+    episode_ids = np.asarray(dataset["episode_id"], dtype=np.int64).reshape(-1)
+    result = np.zeros(len(rewards), dtype=np.float32)
+    running = 0.0
+    previous_episode: Optional[int] = None
+    for index in range(len(rewards) - 1, -1, -1):
+        episode = int(episode_ids[index])
+        if previous_episode is None or episode != previous_episode:
+            running = 0.0
+        running = float(rewards[index]) + discount * running
+        result[index] = running
+        previous_episode = episode
+    return result
+
+
+def _apply_mc_return_semantics(
+    clean_dataset: Dataset,
+    result: Dataset,
+    target_indices: Dict[str, np.ndarray],
+    config: ExperimentConfig,
+) -> None:
+    if "mc_returns" not in result:
+        # Generic corruption callers that are not Cal-QL datasets do not need
+        # trajectory returns. Real D4RL loads always include this metadata.
+        return
+    if config.mc_return_source == "legacy_pre_corruption":
+        result["mc_calibration_valid"] = np.ones(
+            len(result["rewards"]), dtype=np.float32
+        )
+        return
+    reward_rows = target_indices.get("rewards", np.empty(0, dtype=np.int64))
+    if len(reward_rows):
+        result["mc_returns"] = recompute_mc_returns(result, config.discount)
+    valid = np.ones(len(result["rewards"]), dtype=np.float32)
+    for target in ("observations", "actions", "dynamics"):
+        valid[target_indices.get(target, np.empty(0, dtype=np.int64))] = 0.0
+    result["mc_calibration_valid"] = valid
+
+
+def _reward_diagnostics(clean: Dataset, corrupted: Dataset) -> Dict[str, float]:
+    clean_rewards = np.asarray(clean["rewards"])
+    corrupted_rewards = np.asarray(corrupted["rewards"])
+    return {
+        "clean_reward_mean": float(clean_rewards.mean()),
+        "clean_reward_std": float(clean_rewards.std()),
+        "clean_reward_min": float(clean_rewards.min()),
+        "clean_reward_max": float(clean_rewards.max()),
+        "corrupted_reward_mean": float(corrupted_rewards.mean()),
+        "corrupted_reward_std": float(corrupted_rewards.std()),
+        "corrupted_reward_min": float(corrupted_rewards.min()),
+        "corrupted_reward_max": float(corrupted_rewards.max()),
+    }
+
+
 def _load_cached_corruption(
     dataset: Dataset,
     config: ExperimentConfig,
     cache_file: Path,
-) -> Tuple[Dataset, Dict[str, float]]:
+    cache_key: str,
+    cache_metadata: Dict[str, Any],
+) -> Tuple[Dataset, Dict[str, Any]]:
     result = {key: value.copy() for key, value in dataset.items()}
     target_indices: Dict[str, np.ndarray] = {}
     with np.load(cache_file, allow_pickle=False) as cached:
@@ -247,9 +359,18 @@ def _load_cached_corruption(
                     f"values_{target}"
                 ]
                 target_indices[target] = indices
-    return result, _corruption_stats(
+    _apply_mc_return_semantics(dataset, result, target_indices, config)
+    stats = _corruption_stats(
         len(dataset["rewards"]), target_indices, config, loaded_from_cache=True
     )
+    stats.update(
+        cache_hit=True,
+        cache_miss=False,
+        cache_key=cache_key,
+        **cache_metadata,
+    )
+    stats.update(_reward_diagnostics(dataset, result))
+    return result, stats
 
 
 def _corrupt_target_values(
@@ -310,17 +431,27 @@ def corrupt_offline_dataset(
     config: ExperimentConfig,
     oracle: Optional[AttackOracle],
     cache_root: Path,
-) -> Tuple[Dataset, Dict[str, float]]:
+) -> Tuple[Dataset, Dict[str, Any]]:
     if config.corruption == "clean":
-        return {key: value.copy() for key, value in dataset.items()}, {
+        result = {key: value.copy() for key, value in dataset.items()}
+        result["mc_calibration_valid"] = np.ones(
+            len(result["rewards"]), dtype=np.float32
+        )
+        return result, {
             "corrupted_count": 0,
             "corrupted_fraction": 0.0,
             "loaded_from_cache": 0.0,
+            "cache_hit": False,
+            "cache_miss": False,
         }
 
-    cache_file = _cache_file(config, cache_root)
+    cache_file, cache_key, cache_metadata = _cache_file(
+        dataset, config, oracle, cache_root
+    )
     if cache_file.exists() and not config.force_regenerate_attack:
-        return _load_cached_corruption(dataset, config, cache_file)
+        return _load_cached_corruption(
+            dataset, config, cache_file, cache_key, cache_metadata
+        )
 
     rng = np.random.default_rng(config.seed)
     selected = rng.random(len(dataset["rewards"])) < config.offline_corruption_rate
@@ -351,11 +482,21 @@ def corrupt_offline_dataset(
         cache_payload[f"indices_{target}"] = target_rows
         cache_payload[f"values_{target}"] = values
 
+    _apply_mc_return_semantics(dataset, result, target_indices, config)
+
     cache_file.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(cache_file, **cache_payload)
-    return result, _corruption_stats(
+    stats = _corruption_stats(
         len(dataset["rewards"]), target_indices, config, loaded_from_cache=False
     )
+    stats.update(
+        cache_hit=False,
+        cache_miss=True,
+        cache_key=cache_key,
+        **cache_metadata,
+    )
+    stats.update(_reward_diagnostics(dataset, result))
+    return result, stats
 
 
 def corrupt_online_transition(
@@ -415,7 +556,7 @@ def corrupt_online_transition(
             target,
             config.corruption_range,
             config.online_attack_steps,
-            max(config.attack_step_size, 0.1),
+            max(config.attack_step_size, config.attack_min_step_size),
         )[0]
     if target == "observations":
         state = attacked.astype(np.float32)

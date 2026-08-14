@@ -22,6 +22,11 @@ METRIC_FIELDS = (
     "return_std",
     "normalized_return_mean",
     "normalized_return_std",
+    "evaluation_mode",
+    "return_deterministic",
+    "normalized_return_deterministic",
+    "return_method_faithful",
+    "normalized_return_method_faithful",
 )
 
 
@@ -74,8 +79,9 @@ class RunLogger:
         return time.perf_counter() - self.start_monotonic
 
     def write_config(self, config: Dict[str, Any]) -> None:
-        with (self.run_dir / "config.json").open("w", encoding="utf-8") as stream:
-            json.dump(config, stream, indent=2, ensure_ascii=False, default=str)
+        for filename in ("config.json", "resolved_config.json"):
+            with (self.run_dir / filename).open("w", encoding="utf-8") as stream:
+                json.dump(config, stream, indent=2, ensure_ascii=False, default=str)
 
     def log_train(
         self,
