@@ -295,6 +295,45 @@ def recompute_mc_returns(dataset: Dataset, discount: float) -> np.ndarray:
     return result
 
 
+def mc_returns_from_reward_deltas(
+    clean_rewards: np.ndarray,
+    corrupted_rewards: np.ndarray,
+    clean_mc_returns: np.ndarray,
+    episode_ids: np.ndarray,
+    discount: float,
+) -> np.ndarray:
+    """Adjust clean returns while retaining rewards from filtered timeout tails."""
+    clean_rewards = np.array(clean_rewards, dtype=np.float64, copy=True).reshape(-1)
+    corrupted_rewards = np.array(
+        corrupted_rewards, dtype=np.float64, copy=True
+    ).reshape(-1)
+    clean_mc_returns = np.array(
+        clean_mc_returns, dtype=np.float64, copy=True
+    ).reshape(-1)
+    episode_ids = np.array(episode_ids, dtype=np.int64, copy=True).reshape(-1)
+    lengths = {
+        len(clean_rewards),
+        len(corrupted_rewards),
+        len(clean_mc_returns),
+        len(episode_ids),
+    }
+    if len(lengths) != 1:
+        raise ValueError("reward-delta MC return inputs must have equal lengths")
+
+    reward_delta = corrupted_rewards - clean_rewards
+    delta_returns = np.zeros(len(reward_delta), dtype=np.float64)
+    running = 0.0
+    next_episode: Optional[int] = None
+    for index in range(len(reward_delta) - 1, -1, -1):
+        episode = int(episode_ids[index])
+        if next_episode is None or episode != next_episode:
+            running = 0.0
+        running = float(reward_delta[index]) + discount * running
+        delta_returns[index] = running
+        next_episode = episode
+    return (clean_mc_returns + delta_returns).astype(np.float32)
+
+
 def _apply_mc_return_semantics(
     clean_dataset: Dataset,
     result: Dataset,
@@ -312,7 +351,17 @@ def _apply_mc_return_semantics(
         return
     reward_rows = target_indices.get("rewards", np.empty(0, dtype=np.int64))
     if len(reward_rows):
-        result["mc_returns"] = recompute_mc_returns(result, config.discount)
+        if "episode_id" not in clean_dataset:
+            raise RuntimeError(
+                "post-corruption MC returns require episode_id trajectory metadata"
+            )
+        result["mc_returns"] = mc_returns_from_reward_deltas(
+            clean_rewards=clean_dataset["rewards"],
+            corrupted_rewards=result["rewards"],
+            clean_mc_returns=clean_dataset["mc_returns"],
+            episode_ids=clean_dataset["episode_id"],
+            discount=config.discount,
+        )
     valid = np.ones(len(result["rewards"]), dtype=np.float32)
     for target in ("observations", "actions", "dynamics"):
         valid[target_indices.get(target, np.empty(0, dtype=np.int64))] = 0.0

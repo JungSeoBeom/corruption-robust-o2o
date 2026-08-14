@@ -16,6 +16,7 @@ from robust_o2o.corruption import (
     corrupt_offline_dataset,
     corrupt_online_transition,
     corruption_cache_fingerprint,
+    mc_returns_from_reward_deltas,
     recompute_mc_returns,
 )
 from robust_o2o.environment import StateNormalizer, evaluate_agent
@@ -221,7 +222,13 @@ class TrainingInvariantTest(unittest.TestCase):
                 float(data["rewards"][index]), data["next_observations"][index], 0.0
             )
         batch = mixed_batch(offline, online, 16, 0.5, device)
-        metrics = agent.update(batch)
+        density_offline = offline.sample(16, device, prioritized=False)
+        density_online = online.sample(16, device, prioritized=False)
+        metrics = agent.update(
+            rl_batch=batch,
+            density_offline_batch=density_offline,
+            density_online_batch=density_online,
+        )
         priorities = agent.consume_priority_values()
         self.assertIsNotNone(priorities)
         self.assertTrue(torch.isfinite(priorities).all())
@@ -244,7 +251,13 @@ class TrainingInvariantTest(unittest.TestCase):
             result, _ = corrupt_offline_dataset(
                 dataset, config, None, Path(directory)
             )
-        expected = recompute_mc_returns(result, 0.5)
+        expected = mc_returns_from_reward_deltas(
+            dataset["rewards"],
+            result["rewards"],
+            dataset["mc_returns"],
+            dataset["episode_id"],
+            0.5,
+        )
         np.testing.assert_allclose(result["mc_returns"], expected)
         np.testing.assert_array_equal(result["mc_calibration_valid"], 1.0)
 

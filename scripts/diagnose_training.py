@@ -20,14 +20,18 @@ from robust_o2o.logging_utils import RunLogger  # noqa: E402
 
 
 STATUS_CODES = (
-    "PASS",
+    "PASS_CODE_INVARIANTS",
+    "PASS_LEARNING_SIGNAL",
     "FAIL_CODE_INVARIANT",
     "FAIL_NUMERICAL",
     "FAIL_NO_PARAMETER_UPDATE",
     "FAIL_NO_RETURN_IMPROVEMENT",
-    "LIKELY_HYPERPARAMETER_ISSUE",
-    "PROTOCOL_MISMATCH",
+    "INCONCLUSIVE_SHORT_RUN",
 )
+
+PARAMETER_DELTA_TOLERANCE = 1e-8
+MIN_LEARNING_UPDATES = 100
+MIN_RETURN_IMPROVEMENT = 1.0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,11 +59,70 @@ def _read_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in stream if line.strip()]
 
 
-def _read_evaluations(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    with path.open(newline="", encoding="utf-8") as stream:
-        return list(csv.DictReader(stream))
+def classify_diagnostic_summary(
+    evidence: dict,
+    *,
+    invariant_violated: bool = False,
+    numerical_failure: bool = False,
+    min_learning_updates: int = MIN_LEARNING_UPDATES,
+    min_return_improvement: float = MIN_RETURN_IMPROVEMENT,
+) -> tuple[str, str]:
+    """Classify code health separately from statistically credible learning."""
+    numeric_keys = (
+        "initial_deterministic_return",
+        "final_deterministic_return",
+        "return_delta",
+        "actor_parameter_delta",
+        "critic_parameter_delta",
+    )
+    numeric_values = [evidence.get(key) for key in numeric_keys]
+    if numerical_failure or any(
+        value is None or not math.isfinite(float(value)) for value in numeric_values
+    ):
+        return "FAIL_NUMERICAL", "non-finite diagnostic metric"
+    if invariant_violated:
+        return "FAIL_CODE_INVARIANT", "action or replay invariant failed"
+
+    actor_updates = int(evidence.get("completed_actor_updates", 0))
+    critic_updates = int(evidence.get("completed_critic_updates", 0))
+    if actor_updates <= 0 and critic_updates <= 0:
+        return "FAIL_NO_PARAMETER_UPDATE", "no optimizer updates completed"
+    actor_delta = float(evidence["actor_parameter_delta"])
+    critic_delta = float(evidence["critic_parameter_delta"])
+    if (
+        actor_delta <= PARAMETER_DELTA_TOLERANCE
+        and critic_delta <= PARAMETER_DELTA_TOLERANCE
+    ):
+        return (
+            "FAIL_NO_PARAMETER_UPDATE",
+            "optimizer updates completed but actor and critic parameters did not change",
+        )
+
+    completed_updates = min(actor_updates, critic_updates)
+    if completed_updates < min_learning_updates:
+        return (
+            "INCONCLUSIVE_SHORT_RUN",
+            "code invariants passed and parameters changed, but the run is too short "
+            "to judge return improvement",
+        )
+    if float(evidence["return_delta"]) >= min_return_improvement:
+        return "PASS_LEARNING_SIGNAL", "deterministic return improved meaningfully"
+    return (
+        "FAIL_NO_RETURN_IMPROVEMENT",
+        "parameters changed but deterministic return did not improve meaningfully",
+    )
+
+
+def _empty_evidence() -> dict:
+    return {
+        "initial_deterministic_return": None,
+        "final_deterministic_return": None,
+        "return_delta": None,
+        "actor_parameter_delta": None,
+        "critic_parameter_delta": None,
+        "completed_actor_updates": 0,
+        "completed_critic_updates": 0,
+    }
 
 
 def _classify(
@@ -67,35 +130,22 @@ def _classify(
 ) -> dict:
     if error is not None:
         message = f"{type(error).__name__}: {error}"
-        code = "PROTOCOL_MISMATCH" if "protocol" in message.lower() else "FAIL_CODE_INVARIANT"
-        return {"status": code, "reason": message}
+        return {
+            **_empty_evidence(),
+            "classification": "FAIL_CODE_INVARIANT",
+            "classification_reason": message,
+        }
 
     train_rows = _read_jsonl(run_dir / "train_metrics.jsonl")
-    eval_rows = _read_evaluations(run_dir / "metrics.csv")
-    numeric_values = []
-    for row in train_rows:
-        numeric_values.extend(
-            float(value)
-            for key, value in row.items()
-            if key not in ("timestamp", "phase") and isinstance(value, (int, float))
-        )
-    if any(not math.isfinite(value) for value in numeric_values):
-        return {"status": "FAIL_NUMERICAL", "reason": "non-finite train metric"}
-    updates = max((int(row.get("updates", 0)) for row in train_rows), default=0)
-    if updates == 0:
-        return {
-            "status": "FAIL_NO_PARAMETER_UPDATE",
-            "reason": "no optimizer update was recorded",
-        }
-    returns = [
-        float(row["normalized_return_mean"])
-        for row in eval_rows
-        if row.get("normalized_return_mean") not in (None, "")
+    numeric_values = [
+        float(value)
+        for row in train_rows
+        for key, value in row.items()
+        if key not in ("timestamp", "phase") and isinstance(value, (int, float))
     ]
-    # A tiny one-episode diagnostic is a correctness gate, not a statistically
-    # powered benchmark. Only classify a material collapse here.
-    material_return_collapse = (
-        len(returns) >= 2 and returns[-1] < returns[0] - 10.0
+    numerical_failure = any(not math.isfinite(value) for value in numeric_values)
+    numerical_failure = numerical_failure or any(
+        float(row.get("NaN_or_inf_count", 0.0)) > 0.0 for row in train_rows
     )
     action_oob = max(
         (float(row.get("executed_action_oob_fraction", 0.0)) for row in train_rows),
@@ -108,19 +158,26 @@ def _classify(
         ),
         default=0.0,
     )
-    if action_oob > 0.0 or (require_replay_match and clean_mismatch > 0.0):
+
+    evidence_path = run_dir / "diagnostic_evidence.json"
+    if not evidence_path.exists():
         return {
-            "status": "FAIL_CODE_INVARIANT",
-            "reason": "action bound or clean replay-action invariant failed",
+            **_empty_evidence(),
+            "classification": "FAIL_CODE_INVARIANT",
+            "classification_reason": "diagnostic parameter evidence was not written",
         }
-    if material_return_collapse:
-        return {
-            "status": "LIKELY_HYPERPARAMETER_ISSUE",
-            "reason": "updates are finite but normalized return collapsed by >10",
-        }
+    with evidence_path.open(encoding="utf-8") as stream:
+        evidence = json.load(stream)
+    classification, reason = classify_diagnostic_summary(
+        evidence,
+        invariant_violated=action_oob > 0.0
+        or (require_replay_match and clean_mismatch > 0.0),
+        numerical_failure=numerical_failure,
+    )
     return {
-        "status": "PASS",
-        "reason": "finite updates and invariants passed; quick return is diagnostic only",
+        **evidence,
+        "classification": classification,
+        "classification_reason": reason,
     }
 
 
@@ -166,6 +223,7 @@ def main() -> int:
         cql_n_actions=2 if args.quick else 10,
         sac_num_critics=2 if args.quick else 10,
         num_critics=3 if args.quick else 5,
+        diagnostic_mode=True,
     )
     logger = RunLogger(config)
     error = None
@@ -177,8 +235,7 @@ def main() -> int:
         traceback.print_exc()
     diagnosis = _classify(run_dir, error, config.corruption == "clean")
     summary = {
-        "status": diagnosis["status"],
-        "reason": diagnosis["reason"],
+        **diagnosis,
         "algorithm": config.algorithm,
         "env": config.env_name,
         "seed": config.seed,
@@ -191,7 +248,12 @@ def main() -> int:
     _write_summary(run_dir, summary)
     logger.finish("completed" if error is None else "failed", str(error) if error else None)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
-    return 0 if diagnosis["status"] in ("PASS", "LIKELY_HYPERPARAMETER_ISSUE") else 1
+    healthy = diagnosis["classification"] in (
+        "PASS_CODE_INVARIANTS",
+        "PASS_LEARNING_SIGNAL",
+        "INCONCLUSIVE_SHORT_RUN",
+    )
+    return 0 if healthy else 1
 
 
 if __name__ == "__main__":

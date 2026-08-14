@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -15,7 +16,7 @@ from .corruption import (
     corrupt_online_transition,
     make_attack_oracle,
 )
-from .device import resolve_device, seed_everything
+from .device import resolve_device, seed_env_only, seed_everything
 from .environment import (
     StateNormalizer,
     apply_normalizer,
@@ -24,6 +25,7 @@ from .environment import (
     expected_env_spec_id,
     load_d4rl_dataset,
     make_env,
+    preserve_training_rng_state,
     reset_env,
     step_env,
 )
@@ -32,8 +34,8 @@ from .paths import results_root_from_output
 from .replay import (
     OfflineDataset,
     ReplayBuffer,
-    balanced_priority_batch,
     mixed_batch,
+    sample_pqe_update_batches,
     update_sample_priorities,
 )
 
@@ -65,6 +67,16 @@ def bounded_executed_action(
     action_high: np.ndarray,
 ) -> np.ndarray:
     return np.clip(raw_policy_action, action_low, action_high).astype(np.float32)
+
+
+def _make_evaluation_env(
+    env_name: str, protocol: str, seed: int
+) -> object:
+    """Construct and seed evaluation state without advancing training RNGs."""
+    with preserve_training_rng_state():
+        env = make_env(env_name, protocol)
+        seed_env_only(env, seed)
+    return env
 
 
 def _parameter_snapshot(agent: object) -> Dict[str, list[torch.Tensor]]:
@@ -331,9 +343,10 @@ def _evaluate(
 
 def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
     device = resolve_device(config.device, config.cuda_device)
+    seed_everything(config.seed)
     dataset_env = make_env(config.env_name, config.protocol)
     try:
-        seed_everything(config.seed, dataset_env)
+        seed_env_only(dataset_env, config.seed)
         raw_dataset = load_d4rl_dataset(
             dataset_env,
             config.dataset_dir,
@@ -358,10 +371,11 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
     with ExitStack() as stack:
         env = make_env(config.env_name, config.protocol)
         stack.callback(env.close)
-        eval_env = make_env(config.env_name, config.protocol)
+        eval_env = _make_evaluation_env(
+            config.env_name, config.protocol, config.seed + 10_000
+        )
         stack.callback(eval_env.close)
-        seed_everything(config.seed, env)
-        seed_everything(config.seed + 10_000, eval_env)
+        seed_env_only(env, config.seed)
         for role, instance in (("online", env), ("evaluation", eval_env)):
             spec_id = getattr(getattr(instance, "spec", None), "id", None)
             expected_spec_id = expected_env_spec_id(config.env_name, config.protocol)
@@ -414,6 +428,12 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
         if checkpoint_payload is not None:
             agent.load_checkpoint_state(checkpoint_payload["agent"])
 
+        diagnostic_snapshot = (
+            _parameter_snapshot(agent) if config.diagnostic_mode else None
+        )
+        diagnostic_initial_updates = agent.total_updates
+        diagnostic_initial_return: float | None = None
+
         logger.write_config(
             {
                 **protocol_metadata,
@@ -435,6 +455,13 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
             config.corruption_target,
             device,
         )
+        if config.algorithm == "pessimistic_q_ensemble":
+            logger.logger.warning(
+                "Pessimistic Q-Ensemble uses implementation_variant=%s: "
+                "one shared actor with critic ensembles, not the exact official "
+                "Off2OnRL independent actor/critic ensemble.",
+                config.implementation_variant,
+            )
         logger.logger.info(
             "dataset=%d offline_steps=%d online_steps=%d offline_ratio=%.2f",
             offline.size,
@@ -442,6 +469,28 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
             config.online_steps,
             config.effective_offline_ratio,
         )
+
+        if config.diagnostic_mode:
+            initial_metrics = evaluate_agent(
+                eval_env,
+                config.env_name,
+                agent,
+                normalizer,
+                device,
+                config.eval_episodes,
+                config.max_episode_steps,
+                config.seed,
+                config.protocol,
+                "deterministic_diagnostic",
+            )
+            diagnostic_initial_return = initial_metrics["return_mean"]
+            logger.log_evaluation(
+                "diagnostic_initial",
+                0,
+                0,
+                agent.total_updates,
+                {**initial_metrics, "evaluation_mode": "deterministic_diagnostic"},
+            )
 
         if config.stage in ("offline", "both"):
             _run_offline(
@@ -472,6 +521,35 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
                 state_dim,
                 action_dim,
             )
+        if diagnostic_snapshot is not None:
+            parameter_deltas, _ = _parameter_deltas(agent, diagnostic_snapshot)
+            final_metrics = evaluate_agent(
+                eval_env,
+                config.env_name,
+                agent,
+                normalizer,
+                device,
+                config.eval_episodes,
+                config.max_episode_steps,
+                config.seed,
+                config.protocol,
+                "deterministic_diagnostic",
+            )
+            final_return = final_metrics["return_mean"]
+            evidence = {
+                "initial_deterministic_return": diagnostic_initial_return,
+                "final_deterministic_return": final_return,
+                "return_delta": final_return - float(diagnostic_initial_return),
+                **parameter_deltas,
+                "completed_actor_updates": agent.total_updates
+                - diagnostic_initial_updates,
+                "completed_critic_updates": agent.total_updates
+                - diagnostic_initial_updates,
+            }
+            with (logger.run_dir / "diagnostic_evidence.json").open(
+                "w", encoding="utf-8"
+            ) as stream:
+                json.dump(evidence, stream, indent=2, ensure_ascii=False)
     return logger.run_dir
 
 
@@ -680,16 +758,35 @@ def _run_online(
             raw_state = reset_env(env, protocol=config.protocol)
             episode_steps = 0
 
-        can_update = env_step > warmup and replay.size >= max(online_batch_count, 1)
+        is_pqe = config.algorithm == "pessimistic_q_ensemble"
+        required_online_samples = (
+            config.batch_size if is_pqe else max(online_batch_count, 1)
+        )
+        can_update = env_step > warmup and replay.size >= required_online_samples
         if can_update:
             for _ in range(config.updates_per_step):
                 prioritized = (
-                    config.algorithm == "pessimistic_q_ensemble"
+                    is_pqe
                     and config.pqe_replay_mode == "balanced_density"
                 )
-                if prioritized:
-                    batch = balanced_priority_batch(
-                        offline, replay, config.batch_size, device
+                if is_pqe:
+                    (
+                        batch,
+                        density_offline_batch,
+                        density_online_batch,
+                    ) = sample_pqe_update_batches(
+                        offline,
+                        replay,
+                        config.batch_size,
+                        offline_ratio,
+                        device,
+                        prioritized_rl=prioritized,
+                    )
+                    last_metrics = agent.update(
+                        rl_batch=batch,
+                        density_offline_batch=density_offline_batch,
+                        density_online_batch=density_online_batch,
+                        rl_batch_prioritized=prioritized,
                     )
                 else:
                     batch = mixed_batch(
@@ -699,9 +796,9 @@ def _run_online(
                         offline_ratio,
                         device,
                     )
-                last_metrics = agent.update(batch)
+                    last_metrics = agent.update(batch)
                 accumulator.add(last_metrics)
-                if prioritized:
+                if is_pqe:
                     priorities = agent.consume_priority_values()
                     if priorities is None:
                         raise RuntimeError(

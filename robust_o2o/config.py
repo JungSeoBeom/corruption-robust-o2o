@@ -46,6 +46,7 @@ ALGORITHM_ALIASES = {
     "cal-ql": "cal_ql",
     "calql": "cal_ql",
     "pqe": "pessimistic_q_ensemble",
+    "pqe_shared_actor": "pessimistic_q_ensemble",
     "pessimistic-q-ensemble": "pessimistic_q_ensemble",
 }
 
@@ -98,6 +99,7 @@ class ExperimentConfig:
     comparison_name: Optional[str] = None
     device: str = "auto"
     cuda_device: int = 0
+    diagnostic_mode: bool = False
 
     offline_steps: int = 500_000
     online_steps: int = 500_000
@@ -156,6 +158,7 @@ class ExperimentConfig:
     pqe_replay_mode: str = "balanced_density"
     balanced_replay_temperature: float = 5.0
     priority_floor: float = 1e-3
+    implementation_variant: Optional[str] = None
 
     # RO2O
     ro2o_beta_policy: float = 1.0
@@ -195,6 +198,11 @@ class ExperimentConfig:
         self.evaluation_mode = self.evaluation_mode.lower()
         self.mc_return_source = self.mc_return_source.lower()
         self.pqe_replay_mode = self.pqe_replay_mode.lower()
+        self.implementation_variant = (
+            "shared_actor_approx"
+            if self.algorithm == "pessimistic_q_ensemble"
+            else None
+        )
         self.attack_norm = self.attack_norm.lower()
         self.mixed_ratios = tuple(float(value) for value in self.mixed_ratios)
 

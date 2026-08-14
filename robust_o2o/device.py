@@ -46,6 +46,19 @@ def seed_everything(seed: int, env: Optional[object] = None) -> None:
         action_space = getattr(env, "action_space", None)
         if action_space is not None and hasattr(action_space, "seed"):
             action_space.seed(seed)
+        observation_space = getattr(env, "observation_space", None)
+        if observation_space is not None and hasattr(observation_space, "seed"):
+            observation_space.seed(seed)
+
+
+def seed_env_only(env: object, seed: int) -> None:
+    """Seed environment-owned spaces without touching process-global RNGs."""
+    action_space = getattr(env, "action_space", None)
+    if action_space is not None and hasattr(action_space, "seed"):
+        action_space.seed(seed)
+    observation_space = getattr(env, "observation_space", None)
+    if observation_space is not None and hasattr(observation_space, "seed"):
+        observation_space.seed(seed)
 
 
 def clear_accelerator_cache(device: torch.device) -> None:

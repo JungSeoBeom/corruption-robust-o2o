@@ -222,6 +222,41 @@ def balanced_priority_batch(
     )
 
 
+def sample_pqe_update_batches(
+    offline: OfflineDataset,
+    online: ReplayBuffer,
+    batch_size: int,
+    offline_ratio: float,
+    device: torch.device,
+    prioritized_rl: bool,
+) -> tuple[TensorBatch, TensorBatch, TensorBatch]:
+    """Route uniform density data separately from the PQE RL replay batch."""
+    if online.size < batch_size:
+        raise ValueError(
+            f"PQE density replay contains {online.size} transitions; "
+            f"{batch_size} are required"
+        )
+    density_offline_batch = offline.sample(
+        batch_size, device, prioritized=False
+    )
+    density_online_batch = online.sample(
+        batch_size, device, prioritized=False
+    )
+    if prioritized_rl:
+        rl_batch = balanced_priority_batch(offline, online, batch_size, device)
+    else:
+        rl_batch = mixed_batch(
+            offline,
+            online,
+            batch_size,
+            offline_ratio,
+            device,
+            prioritized_online=False,
+            prioritized_offline=False,
+        )
+    return rl_batch, density_offline_batch, density_online_batch
+
+
 def update_sample_priorities(
     offline: OfflineDataset,
     online: ReplayBuffer,

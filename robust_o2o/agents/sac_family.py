@@ -163,33 +163,46 @@ class SACEnsembleAgent(BaseAgent):
             penalty = penalty + (q2_ood - q2_data).mean()
         return penalty
 
-    def _density_loss_and_priorities(
-        self, batch: TensorBatch, states: torch.Tensor, actions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.density_ratio is None or "_source" not in batch:
-            zero = states.new_tensor(0.0)
-            return zero, torch.ones(states.shape[0], device=self.device)
-        source = batch["_source"].reshape(-1)
-        weights = self.density_ratio(states, actions)
-        offline_mask = source < 0.5
-        online_mask = ~offline_mask
-        if not offline_mask.any() or not online_mask.any():
-            return states.new_tensor(0.0), torch.ones_like(weights)
-        offline_weights = weights[offline_mask]
-        online_weights = weights[online_mask]
+    def _density_loss(
+        self,
+        offline_batch: TensorBatch,
+        online_batch: TensorBatch,
+    ) -> torch.Tensor:
+        if self.density_ratio is None:
+            return self.log_alpha.new_tensor(0.0)
+        offline_weights = self.density_ratio(
+            offline_batch["observations"], offline_batch["actions"]
+        )
+        online_weights = self.density_ratio(
+            online_batch["observations"], online_batch["actions"]
+        )
         offline_f_star = -torch.log(2.0 / (offline_weights + 1.0) + 1e-10)
         online_f_prime = torch.log(
             2.0 * online_weights / (online_weights + 1.0) + 1e-10
         )
-        density_loss = offline_f_star.mean() - online_f_prime.mean()
-        priority = torch.ones_like(weights)
-        denominator = offline_weights.pow(
-            1.0 / self.config.balanced_replay_temperature
-        ).mean()
-        normalized = weights.pow(1.0 / self.config.balanced_replay_temperature)
+        return offline_f_star.mean() - online_f_prime.mean()
+
+    def _density_priorities(
+        self,
+        rl_batch: TensorBatch,
+        density_offline_batch: TensorBatch,
+    ) -> torch.Tensor:
+        if self.density_ratio is None:
+            return torch.ones(
+                len(rl_batch["observations"]), device=self.device
+            )
+        weights = self.density_ratio(
+            rl_batch["observations"], rl_batch["actions"]
+        )
+        offline_weights = self.density_ratio(
+            density_offline_batch["observations"],
+            density_offline_batch["actions"],
+        )
+        temperature = self.config.balanced_replay_temperature
+        denominator = offline_weights.pow(1.0 / temperature).mean()
+        normalized = weights.pow(1.0 / temperature)
         normalized = normalized / (denominator.detach() + 1e-10)
-        priority = normalized.detach().clamp(self.config.priority_floor, 1_000.0)
-        return density_loss, priority
+        return normalized.detach().clamp(self.config.priority_floor, 1_000.0)
 
     def consume_priority_values(self) -> torch.Tensor | None:
         result = self.last_priority_values
@@ -264,7 +277,21 @@ class SACEnsembleAgent(BaseAgent):
         )
         return penalty
 
-    def update(self, batch: TensorBatch) -> Dict[str, float]:
+    def update(
+        self,
+        batch: TensorBatch | None = None,
+        *,
+        rl_batch: TensorBatch | None = None,
+        density_offline_batch: TensorBatch | None = None,
+        density_online_batch: TensorBatch | None = None,
+        rl_batch_prioritized: bool = False,
+    ) -> Dict[str, float]:
+        if rl_batch is not None:
+            if batch is not None:
+                raise ValueError("pass either batch or rl_batch, not both")
+            batch = rl_batch
+        if batch is None:
+            raise ValueError("an RL batch is required")
         self.last_priority_values = None
         states = batch["observations"]
         actions = batch["actions"]
@@ -347,9 +374,6 @@ class SACEnsembleAgent(BaseAgent):
             critic_loss = (td_error / uncertainty).mean(dim=1).sum()
             uncertainty_mean = uncertainty.mean()
         else:
-            density_loss, _ = self._density_loss_and_priorities(
-                batch, states, actions
-            )
             per_sample_td = td_error.mean(dim=0)
             if td_error2 is not None:
                 per_sample_td = per_sample_td + td_error2.mean(dim=0)
@@ -387,19 +411,39 @@ class SACEnsembleAgent(BaseAgent):
             )
 
         density_value = states.new_tensor(0.0)
-        if self.density_optimizer is not None and "_source" in batch:
-            density_value, _ = self._density_loss_and_priorities(
-                batch, states, actions
+        density_batches_available = (
+            density_offline_batch is not None
+            and density_online_batch is not None
+        )
+        if self.density_optimizer is not None and density_batches_available:
+            density_value = self._density_loss(
+                density_offline_batch, density_online_batch
             )
-            if density_value.requires_grad:
-                self.density_optimizer.zero_grad(set_to_none=True)
-                density_value.backward()
-                self.density_optimizer.step()
+            self.density_optimizer.zero_grad(set_to_none=True)
+            density_value.backward()
+            self.density_optimizer.step()
             with torch.no_grad():
-                _, priorities = self._density_loss_and_priorities(
-                    batch, states, actions
+                self.last_priority_values = self._density_priorities(
+                    batch, density_offline_batch
                 )
-                self.last_priority_values = priorities
+
+        source = batch.get("_source")
+        if source is None:
+            rl_offline_count = len(states)
+            rl_online_count = 0
+        else:
+            rl_offline_count = int((source.reshape(-1) == 0).sum().item())
+            rl_online_count = int((source.reshape(-1) == 1).sum().item())
+        density_offline_count = (
+            len(density_offline_batch["observations"])
+            if density_offline_batch is not None
+            else 0
+        )
+        density_online_count = (
+            len(density_online_batch["observations"])
+            if density_online_batch is not None
+            else 0
+        )
 
         self.total_updates += 1
         ensemble_mean_per_sample = predicted.detach().mean(dim=0)
@@ -420,6 +464,12 @@ class SACEnsembleAgent(BaseAgent):
             "policy_smoothness": float(policy_smoothness.item()),
             "ood_penalty": float(ood_penalty.item()),
             "density_loss": float(density_value.item()),
+            "density_offline_count": float(density_offline_count),
+            "density_online_count": float(density_online_count),
+            "rl_offline_count": float(rl_offline_count),
+            "rl_online_count": float(rl_online_count),
+            "density_batches_prioritized": 0.0,
+            "rl_batch_prioritized": float(rl_batch_prioritized),
             "bellman_loss": float(
                 (td_error.mean() + (td_error2.mean() if td_error2 is not None else 0.0)).item()
             ),
