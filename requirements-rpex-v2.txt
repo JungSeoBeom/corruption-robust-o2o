@@ -1,0 +1,16 @@
+# Exact legacy runtime used by the official RPEX implementation.
+numpy==1.23.5
+gym==0.23.1
+d4rl @ git+https://github.com/rail-berkeley/d4rl@d842aa194b416e564e54b0730d9f934e3e32f854
+
+# Build/runtime packages compatible with mujoco_py and Python 3.10.
+Cython==0.29.37
+setuptools==65.5.0
+wheel==0.38.4
+h5py==3.8.0
+
+# RPEX training, logging, and plotting versions where practical.
+torch==2.5.1
+matplotlib==3.10.1
+pandas==2.2.3
+tqdm==4.67.0

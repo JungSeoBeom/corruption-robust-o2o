@@ -1,0 +1,2 @@
+# The default benchmark is the strict RPEX/D4RL-v2 legacy protocol.
+-r requirements-rpex-v2.txt

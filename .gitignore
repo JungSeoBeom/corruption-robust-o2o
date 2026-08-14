@@ -1,0 +1,44 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local environment variables
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Editors and operating-system files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Jupyter temporary files
+.ipynb_checkpoints/
+
+# Experiment outputs, logs, and checkpoints
+results/
+logs/
+wandb/
+runs/
+checkpoints/
+*.log
+*.pt
+*.pth
+*.ckpt
+*.npz
+
+# Locally downloaded offline-RL datasets
+datasets/
+data/
+*.hdf5
+*.h5
