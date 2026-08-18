@@ -15,6 +15,51 @@ Long training runs were not executed while preparing this repository. Use the
 commands below in the pinned legacy environment; exact reproduction is expected
 to require a Linux x86_64 host rather than an Apple Silicon MacBook.
 
+### KAIST RL Lab GCP Slurm (CPU only)
+
+The files under `slurm/` install and run the strict legacy environment entirely
+on the `cpu` partition. They do not request a GPU, and they enforce both
+`--device cpu` and `MUJOCO_PY_FORCE_CPU=1`. Submit them from the repository root
+on `slurm-login-001`:
+
+```bash
+# One-time setup per cluster user. This also runs the unit suite and the real
+# D4RL/MuJoCo smoke.
+sbatch --wait slurm/setup_cpu.sbatch
+
+# Short end-to-end Slurm smoke: dataset, offline update, online interaction,
+# online replay updates, evaluation, and checkpoints.
+sbatch --wait slurm/smoke_cpu.sbatch
+
+# Full default RPEX clean run (500k offline + 500k online).
+sbatch slurm/run_cpu.sbatch
+```
+
+Pass normal `run_experiment.py` arguments after the batch script to select a
+different experiment. Slurm resource overrides go before the script:
+
+```bash
+sbatch --time=12:00:00 slurm/run_cpu.sbatch \
+  --algorithm uwmsg \
+  --env-name hopper-medium-replay-v2 \
+  --corruption random \
+  --corruption-target rewards \
+  --stage both \
+  --offline-steps 500000 \
+  --online-steps 500000 \
+  --seed 0
+```
+
+The shared environment is stored under `~/.local/share/micromamba`, MuJoCo 2.1
+under `~/.mujoco/mujoco210`, and datasets under `~/.d4rl/datasets`. All are
+visible from the login and compute nodes through the shared home directory.
+Batch output is written to `slurm-*.out` in the submission directory. The CPU
+nodes are Spot VMs. Slurm may requeue the wrapper after preemption, but that
+restarts the command from the beginning; periodic checkpoints survive on the
+shared home directory but are not selected automatically. An online checkpoint
+restores model state but does not exactly restore the live MuJoCo state or
+online replay buffer.
+
 For local Apple Silicon execution, the separate `local_gymnasium_v4` protocol
 uses Gymnasium v4 with native MuJoCo and reads the cached D4RL-v2 HDF5 dataset
 directly. This is convenient for local experiments but is not an exact legacy
