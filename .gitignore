@@ -36,6 +36,7 @@ checkpoints/
 *.pth
 *.ckpt
 *.npz
+slurm-*.out
 
 # Locally downloaded offline-RL datasets
 datasets/
