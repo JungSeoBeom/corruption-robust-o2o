@@ -60,10 +60,22 @@ shared home directory but are not selected automatically. An online checkpoint
 restores model state but does not exactly restore the live MuJoCo state or
 online replay buffer.
 
-For local Apple Silicon execution, the separate `local_gymnasium_v4` protocol
+For local Apple Silicon execution, the separate
+`local_gymnasium_v4_diagnostic` protocol
 uses Gymnasium v4 with native MuJoCo and reads the cached D4RL-v2 HDF5 dataset
-directly. This is convenient for local experiments but is not an exact legacy
-RPEX environment reproduction.
+directly. It is diagnostic-only, is not a D4RL-v2 benchmark result, and requires
+the explicit `--allow-diagnostic-protocol` acknowledgement. The old
+`local_gymnasium_v4` spelling is accepted only as an alias and is recorded under
+the canonical diagnostic name.
+
+The default algorithm profile is `reference`. It resolves Cal-QL to
+`calql_reference` (no BC warmup, actor LR `1e-4`, critic LR `3e-4`, max-Q target
+backup) and WSRL to `wsrl_reference_redq10x2` (CQL-REDQ pretrainer, 10 critics,
+2-critic target subset, LayerNorm, online UTD 4 with one actor/temperature
+update). `--algorithm-profile legacy_current` is provided only to reproduce the
+previous Cal-QL BC-100k and WSRL min-all-10 implementation.
+See [REFERENCE_FIDELITY.md](docs/REFERENCE_FIDELITY.md) for the static
+before/after audit and pinned upstream source snapshots.
 
 ## 1. Algorithms
 
@@ -137,7 +149,8 @@ The current default benchmark schedule is:
 
 - Offline: `500,000` gradient updates
 - Online: `500,000` environment steps
-- Online updates: one gradient update per environment step by default
+- Online updates: one gradient update per environment step by default; reference
+  WSRL uses four critic updates and one actor/temperature update per step
 
 Use `--offline-steps`, `--online-steps`, and `--updates-per-step` to change these
 values. A single command with `--stage both` runs offline pretraining and online
@@ -282,8 +295,10 @@ lower bound is applied. Add `--force-regenerate-attack` to regenerate a cache.
   expansion, and `both` logs both. Evaluation saves/restores Python, NumPy,
   PyTorch CPU, and CUDA RNG state.
 - `--mc-return-source post_corruption` is the Cal-QL default. Reward corruption
-  recomputes return-to-go within trajectory boundaries, and corrupted
-  state/action/next-state rows are excluded from calibration.
+  recomputes return-to-go within trajectory boundaries. Reference benchmark
+  mode uses `--calibration-mask-mode all`, so it does not reveal corrupted row
+  indices to the learner. `oracle_exclude_corrupted` is explicitly labeled as
+  an oracle ablation; `disabled` turns calibration off.
   `legacy_pre_corruption` is an explicit reproduction mode.
 - `--backup-entropy` enables the entropy term in the Cal-QL Bellman backup. The
   default is disabled, matching the task configuration used by the reference.
@@ -350,7 +365,7 @@ Checkpoints are separated by algorithm through the run directory and by phase
 inside each run:
 
 ```text
-results/comparisons/<env>/<corruption>/<target>/<comparison_id>/runs/
+results/comparisons/<protocol>/<profile>/<env>/<corruption>/<target>/<comparison_id>/runs/
 └── <algorithm>/<corruption>/<target>/<env>/seed_<seed>/<run_id>/
 └── checkpoints/
     ├── offline/
@@ -417,7 +432,7 @@ python run_all_algorithms.py \
 Each comparison is stored separately:
 
 ```text
-results/comparisons/<env>/<corruption>/<target>/<comparison_id>/
+results/comparisons/<protocol>/<profile>/<env>/<corruption>/<target>/<comparison_id>/
 ├── runs/
 │   └── <algorithm>/...
 ├── comparison_offline_online.png
@@ -447,25 +462,42 @@ every completed algorithm followed by the overall start, end, and elapsed time.
 Use `--comparison-name NAME` to set the final directory name and `--keep-going`
 to continue with the remaining algorithms if one run fails.
 
-### Hopper 5 x 5 experiment suite
+### 5 x 5 experiment suite
 
 Run RPEX, RIQL naive, WSRL, Cal-QL, and Pessimistic Q-Ensemble on Hopper for
 the clean setting and all four individual random-corruption targets:
 
 ```bash
-conda activate corruption
+conda activate corruption-rpex-v2
 python run_55_experiment.py
 ```
 
+Hopper remains the default. To run the same suite on HalfCheetah:
+
+```bash
+python run_55_experiment.py --env-name halfcheetah-medium-replay-v2
+```
+
 This runs 25 experiments for the default seed, with 500,000 offline updates and
-500,000 online environment steps per experiment. Its default protocol is
-`local_gymnasium_v4`, so the existing `corruption` environment and
-`~/.d4rl/datasets/hopper_medium_replay-v2.hdf5` are sufficient. Use
+500,000 online environment steps per experiment. Its default protocol is the
+strict `rpex_d4rl_v2_legacy` benchmark. Use
 `--seeds 0,1,2` for a multi-seed suite, `--dry-run` to print all generated
 experiment commands, and `--keep-going` to continue after a failed algorithm or
 setting. Additional experiment options such as `--device cpu` are forwarded to
-every run. Pass `--protocol rpex_d4rl_v2_legacy` only on a machine with the
-pinned legacy environment.
+every run.
+
+For a local Mac smoke/debug run only:
+
+```bash
+conda activate corruption
+python run_55_experiment.py \
+  --env-name halfcheetah-medium-replay-v2 \
+  --protocol local_gymnasium_v4_diagnostic \
+  --allow-diagnostic-protocol
+```
+
+These local scores are stored and plotted as diagnostic D4RL-reference-scaled
+returns, never as benchmark D4RL normalized returns.
 
 ## 6. Full environment/corruption matrix
 
@@ -525,7 +557,7 @@ structure:
 
 ```text
 results/
-└── comparisons/<env>/<corruption>/<target>/<comparison_id>/
+└── comparisons/<protocol>/<profile>/<env>/<corruption>/<target>/<comparison_id>/
     ├── comparison_offline_online.png
     ├── comparison_offline.png
     ├── comparison_online.png
@@ -605,6 +637,12 @@ ELAPSED: 04:05:05 (14705.000 seconds)
 - MPS and CPU results may not be exactly identical because of floating-point
   implementation differences. Use the same device for all results in a
   comparison table.
+- Never aggregate different environment protocols or algorithm profiles. New
+  paths are namespaced as
+  `results/comparisons/<protocol>/<profile>/<env>/<corruption>/<target>/<id>`;
+  `comparison.ipynb` selects both values explicitly and rejects duplicates.
+- A single-seed curve has no seed-uncertainty band. Episode-return dispersion is
+  not substituted for across-seed uncertainty.
 - Adversarial offline-attack generation time is included in the total `ELAPSED`
   time. Check `offline_corruption.loaded_from_cache` in `config.json` to
   determine whether the attack cache was used.

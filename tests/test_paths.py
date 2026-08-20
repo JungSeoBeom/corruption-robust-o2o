@@ -12,6 +12,30 @@ from robust_o2o.paths import (
 
 
 class ResultPathTest(unittest.TestCase):
+    def test_new_comparisons_include_protocol_and_profile_namespaces(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            comparison = comparison_directory(
+                str(root),
+                "hopper-medium-replay-v2",
+                "clean",
+                "none",
+                "group",
+                "rpex_d4rl_v2_legacy",
+                "reference",
+            )
+            self.assertEqual(
+                comparison,
+                root
+                / "comparisons"
+                / "rpex_d4rl_v2_legacy"
+                / "reference"
+                / "hopper-medium-replay-v2"
+                / "clean"
+                / "none"
+                / "group",
+            )
+
     def test_comparisons_do_not_include_protocol_namespace(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

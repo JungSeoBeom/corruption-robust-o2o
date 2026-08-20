@@ -28,6 +28,12 @@ def plot_single_run(run_dir: Path) -> Optional[Path]:
     if frame.empty:
         return None
     frame = add_global_plot_steps(frame)
+    config_path = run_dir / "config.json"
+    config = (
+        json.loads(config_path.read_text(encoding="utf-8"))
+        if config_path.exists()
+        else {}
+    )
     figure, axis = plt.subplots(figsize=(8, 5))
     for phase, phase_frame in frame.groupby("phase"):
         axis.plot(
@@ -62,7 +68,15 @@ def plot_single_run(run_dir: Path) -> Optional[Path]:
         label="offline → online",
     )
     axis.set_xlabel("Completed offline updates + online environment steps")
-    axis.set_ylabel("D4RL normalized return")
+    if config.get("score_semantics") == "d4rl_normalized_return":
+        axis.set_ylabel("D4RL normalized return")
+    else:
+        axis.set_ylabel(
+            "Diagnostic D4RL-reference-scaled return (not benchmark normalized return)"
+        )
+        axis.set_title(
+            "DIAGNOSTIC: Gymnasium-v4 evaluation, not comparable to D4RL-v2"
+        )
     axis.grid(alpha=0.25)
     axis.legend()
     figure.tight_layout()
@@ -117,6 +131,30 @@ def _load_runs(root: Path):
             "seed",
         ):
             frame[key] = config[key]
+        frame["protocol"] = config.get("protocol", "unknown_legacy_protocol")
+        frame["algorithm_profile"] = config.get(
+            "algorithm_profile", "unknown_legacy_profile"
+        )
+        frame["resolved_algorithm_profile"] = config.get(
+            "resolved_algorithm_profile", "unknown_legacy_profile"
+        )
+        frame["score_semantics"] = config.get(
+            "score_semantics", "unknown_legacy_score"
+        )
+        frame["dataset_id"] = config.get("dataset_id", "unknown_legacy_dataset")
+        frame["evaluation_env_id"] = config.get(
+            "evaluation_env_id", "unknown_legacy_evaluation_env"
+        )
+        frame["offline_corruption_rate"] = float(
+            config.get("offline_corruption_rate", -1.0)
+        )
+        frame["online_corruption_rate"] = float(
+            config.get("online_corruption_rate", -1.0)
+        )
+        frame["learner_seed"] = int(config.get("learner_seed", config["seed"]))
+        frame["corruption_seed"] = int(
+            config.get("corruption_seed", config["seed"])
+        )
         frame["run_dir"] = str(metrics_path.parent)
         frame["run_status"] = summary.get("status", "unknown")
         elapsed = summary.get("elapsed_seconds")
@@ -163,7 +201,19 @@ def write_final_score_summary(
         .groupby("run_dir", as_index=False)
         .tail(1)
     )
-    group_keys = ["algorithm", "env_name", "corruption", "corruption_target"]
+    group_keys = [
+        "algorithm",
+        "protocol",
+        "algorithm_profile",
+        "resolved_algorithm_profile",
+        "dataset_id",
+        "evaluation_env_id",
+        "env_name",
+        "corruption",
+        "corruption_target",
+        "offline_corruption_rate",
+        "online_corruption_rate",
+    ]
     result = (
         final_runs.groupby(group_keys)
         .agg(
@@ -212,14 +262,28 @@ def plot_aggregate(
         frame = frame[frame["corruption_target"] == target]
     allowed_statuses = ("completed", "running", "unknown") if include_running else ("completed",)
     frame = frame[frame["run_status"].isin(allowed_statuses)]
-
-    latest_run_dirs = (
-        frame[["algorithm", "seed", "run_dir"]]
-        .drop_duplicates()
-        .sort_values("run_dir")
-        .drop_duplicates(["algorithm", "seed"], keep="last")["run_dir"]
-    )
-    frame = frame[frame["run_dir"].isin(latest_run_dirs)].copy()
+    identity_columns = [
+        "algorithm",
+        "algorithm_profile",
+        "protocol",
+        "learner_seed",
+        "corruption_seed",
+    ]
+    identities = frame[[*identity_columns, "run_dir"]].drop_duplicates()
+    duplicates = identities.duplicated(identity_columns, keep=False)
+    if duplicates.any():
+        raise RuntimeError(
+            "Duplicate runs for the same algorithm/profile/protocol/seeds; "
+            "select an explicit comparison directory instead of silently "
+            "choosing the latest run"
+        )
+    for column in ("protocol", "algorithm_profile", "dataset_id", "evaluation_env_id"):
+        if frame[column].nunique(dropna=False) > 1:
+            raise RuntimeError(
+                f"Mixed {column} values cannot be aggregated without an explicit "
+                "diagnostic override"
+            )
+    frame = frame.copy()
     if phase == "offline_online":
         frame = frame[frame["phase"].isin(("offline", "online"))]
         frame["plot_step"] = frame["step"]
@@ -239,28 +303,41 @@ def plot_aggregate(
 
     figure, axis = plt.subplots(figsize=(10, 6))
     summary_frames = []
-    group_keys = ("algorithm", "env_name", "corruption", "corruption_target")
+    group_keys = (
+        "algorithm",
+        "protocol",
+        "algorithm_profile",
+        "resolved_algorithm_profile",
+        "dataset_id",
+        "evaluation_env_id",
+        "env_name",
+        "corruption",
+        "corruption_target",
+        "offline_corruption_rate",
+        "online_corruption_rate",
+    )
     for group, group_frame in frame.groupby(list(group_keys)):
         summary = (
             group_frame.groupby(x_column)
             .agg(
                 mean=("normalized_return_mean", "mean"),
                 seed_std=("normalized_return_mean", "std"),
-                episode_std=("normalized_return_std", "mean"),
                 count=("seed", "nunique"),
             )
             .reset_index()
             .sort_values(x_column)
         )
-        summary["std"] = summary["seed_std"].where(
-            summary["count"] > 1, summary["episode_std"]
-        ).fillna(0.0)
+        # Bands represent uncertainty across independent training seeds only.
+        # A single seed therefore has no uncertainty band.
+        summary["std"] = summary["seed_std"].fillna(0.0)
         for key, value in zip(group_keys, group):
             summary[key] = value
         summary_frames.append(summary)
-        label = group[0]
+        label = f"{group[0]} [{group[3]}]"
+        if phase in ("offline", "offline_online") and group[0] == "wsrl":
+            label = f"CQL-REDQ pretrainer for WSRL [{group[3]}]"
         if len(frame["env_name"].unique()) > 1:
-            label += f" | {group[1]}"
+            label += f" | {group[6]}"
         axis.plot(summary[x_column], summary["mean"], label=label)
         axis.fill_between(
             summary[x_column],
@@ -287,7 +364,17 @@ def plot_aggregate(
             label="offline → online",
         )
     axis.set_xlabel(x_label)
-    axis.set_ylabel("D4RL normalized return")
+    score_semantics = set(frame.get("score_semantics", []))
+    ylabel = (
+        "D4RL normalized return"
+        if score_semantics == {"d4rl_normalized_return"}
+        else "Diagnostic D4RL-reference-scaled return (not benchmark normalized return)"
+    )
+    axis.set_ylabel(ylabel)
+    if score_semantics != {"d4rl_normalized_return"}:
+        axis.set_title(
+            "DIAGNOSTIC: Gymnasium-v4 evaluation, not comparable to D4RL-v2"
+        )
     axis.grid(alpha=0.25)
     if summary_frames:
         axis.legend(fontsize=8, ncol=2)
@@ -316,7 +403,7 @@ def update_comparison_plots(
     corruption: Optional[str] = None,
     target: Optional[str] = None,
 ) -> dict[str, Path]:
-    """Atomically refresh the three standard plots from completed/running runs."""
+    """Atomically refresh the three standard plots from completed runs only."""
     runs_dir = comparison_dir / "runs"
     outputs = {}
     for phase in ("offline_online", "offline", "online"):
@@ -328,7 +415,7 @@ def update_comparison_plots(
             corruption,
             target,
             phase,
-            include_running=True,
+            include_running=False,
         )
     return outputs
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Hopper 5-algorithm by 5-condition experiment suite."""
+"""Run one environment's 5-algorithm by 5-condition experiment suite."""
 
 from __future__ import annotations
 
@@ -13,7 +13,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-from robust_o2o.config import LOCAL_PROTOCOL, PROTOCOLS
+from robust_o2o.config import (
+    ALGORITHM_PROFILES,
+    BENCHMARK_ENVS,
+    DEFAULT_PROTOCOL,
+    LEGACY_LOCAL_PROTOCOL_ALIAS,
+    LOCAL_PROTOCOL,
+    PROTOCOLS,
+)
 
 
 ENV_NAME = "hopper-medium-replay-v2"
@@ -45,22 +52,29 @@ def _csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def _default_experiment_name() -> str:
+def _default_experiment_name(env_name: str) -> str:
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-    return f"hopper_5x5_{stamp}_{str(uuid.uuid4())[:8]}"
+    domain = env_name.split("-", 1)[0]
+    return f"{domain}_5x5_{stamp}_{str(uuid.uuid4())[:8]}"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run RPEX, RIQL naive, WSRL, Cal-QL, and Pessimistic Q-Ensemble "
-            "on Hopper clean and four random-corruption targets (25 runs per seed)"
+            "on one environment's clean and four random-corruption targets "
+            "(25 runs per seed)"
         )
     )
+    parser.add_argument("--env-name", choices=BENCHMARK_ENVS, default=ENV_NAME)
     parser.add_argument("--seeds", type=_csv, default=["0"])
     parser.add_argument("--offline-steps", type=int, default=500_000)
     parser.add_argument("--online-steps", type=int, default=500_000)
-    parser.add_argument("--protocol", choices=PROTOCOLS, default=LOCAL_PROTOCOL)
+    parser.add_argument("--protocol", choices=PROTOCOLS, default=DEFAULT_PROTOCOL)
+    parser.add_argument(
+        "--algorithm-profile", choices=ALGORITHM_PROFILES, default="reference"
+    )
+    parser.add_argument("--allow-diagnostic-protocol", action="store_true")
     parser.add_argument("--output-root", default="results")
     parser.add_argument("--dataset-dir")
     parser.add_argument(
@@ -81,6 +95,8 @@ def _validate_args(
     args: argparse.Namespace,
     passthrough: Iterable[str],
 ) -> None:
+    if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
+        args.protocol = LOCAL_PROTOCOL
     if not args.seeds:
         parser.error("--seeds cannot be empty")
     for seed in args.seeds:
@@ -90,6 +106,11 @@ def _validate_args(
             parser.error(f"invalid seed: {seed!r}")
     if args.offline_steps < 0 or args.online_steps < 0:
         parser.error("--offline-steps and --online-steps cannot be negative")
+    if args.protocol in (LOCAL_PROTOCOL, "local_gymnasium_v4") and not args.allow_diagnostic_protocol:
+        parser.error(
+            "the local Gymnasium protocol is diagnostic-only; pass "
+            "--allow-diagnostic-protocol to acknowledge this"
+        )
     if args.experiment_name and (
         not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.experiment_name)
         or args.experiment_name in (".", "..")
@@ -121,7 +142,7 @@ def commands(
             sys.executable,
             str(runner),
             "--env-name",
-            ENV_NAME,
+            args.env_name,
             "--corruption",
             corruption,
             "--corruption-target",
@@ -134,6 +155,8 @@ def commands(
             "both",
             "--protocol",
             args.protocol,
+            "--algorithm-profile",
+            args.algorithm_profile,
             "--output-root",
             args.output_root,
             "--comparison-name",
@@ -143,6 +166,8 @@ def commands(
             "--online-steps",
             str(args.online_steps),
         ]
+        if args.allow_diagnostic_protocol:
+            command.append("--allow-diagnostic-protocol")
         if args.dataset_dir:
             command.extend(("--dataset-dir", args.dataset_dir))
         if args.keep_going:
@@ -157,12 +182,12 @@ def main() -> int:
     parser = build_parser()
     args, passthrough = parser.parse_known_args()
     _validate_args(parser, args, passthrough)
-    experiment_name = args.experiment_name or _default_experiment_name()
+    experiment_name = args.experiment_name or _default_experiment_name(args.env_name)
     generated_commands = list(commands(args, passthrough, experiment_name))
     total_runs = len(ALGORITHMS) * len(SETTINGS) * len(args.seeds)
 
     print(f"EXPERIMENT_NAME: {experiment_name}", flush=True)
-    print(f"ENVIRONMENT: {ENV_NAME}", flush=True)
+    print(f"ENVIRONMENT: {args.env_name}", flush=True)
     print(f"ALGORITHMS: {', '.join(ALGORITHMS)}", flush=True)
     print("SETTINGS: clean/none, random/{observations,actions,rewards,dynamics}", flush=True)
     print(

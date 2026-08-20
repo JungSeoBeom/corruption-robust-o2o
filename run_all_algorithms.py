@@ -23,7 +23,9 @@ from robust_o2o.config import (
     CORRUPTION_MODES,
     CORRUPTION_TARGETS,
     DEFAULT_PROTOCOL,
+    ALGORITHM_PROFILES,
     LOCAL_PROTOCOL,
+    LEGACY_LOCAL_PROTOCOL_ALIAS,
     PROTOCOLS,
     normalize_env_name,
 )
@@ -84,6 +86,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seeds", type=_csv, default=["0"])
     parser.add_argument("--stage", choices=("offline", "both"), default="both")
     parser.add_argument("--protocol", choices=PROTOCOLS, default=DEFAULT_PROTOCOL)
+    parser.add_argument(
+        "--algorithm-profile", choices=ALGORITHM_PROFILES, default="reference"
+    )
+    parser.add_argument("--allow-diagnostic-protocol", action="store_true")
     parser.add_argument("--output-root", default="results")
     parser.add_argument("--dataset-dir")
     parser.add_argument("--comparison-name")
@@ -93,6 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
+        args.protocol = LOCAL_PROTOCOL
     original_env_name = args.env_name
     args.env_name = normalize_env_name(args.env_name)
     if args.env_name != original_env_name:
@@ -134,6 +142,11 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
                 "--comparison-name may contain only letters, digits, '.', '_', "
                 "and '-', and must start with a letter or digit"
             )
+    if args.protocol in (LOCAL_PROTOCOL, "local_gymnasium_v4") and not args.allow_diagnostic_protocol:
+        parser.error(
+            "the local Gymnasium protocol is diagnostic-only; pass "
+            "--allow-diagnostic-protocol to acknowledge this"
+        )
 
 
 def _comparison_directory(args: argparse.Namespace) -> Path:
@@ -147,6 +160,8 @@ def _comparison_directory(args: argparse.Namespace) -> Path:
         args.corruption,
         args.corruption_target,
         name,
+        args.protocol,
+        args.algorithm_profile,
     )
 
 
@@ -177,9 +192,13 @@ def commands(
                 args.stage,
                 "--protocol",
                 args.protocol,
+                "--algorithm-profile",
+                args.algorithm_profile,
                 "--output-dir",
                 str(runs_dir),
             ]
+            if args.allow_diagnostic_protocol:
+                command.append("--allow-diagnostic-protocol")
             if args.dataset_dir:
                 command.extend(("--dataset-dir", args.dataset_dir))
             command.extend(passthrough)
@@ -369,6 +388,7 @@ def main() -> int:
     elapsed = time.perf_counter() - start_monotonic
     manifest = {
         "protocol": args.protocol,
+        "algorithm_profile": args.algorithm_profile,
         "environment": args.env_name,
         "corruption": args.corruption,
         "corruption_target": args.corruption_target,

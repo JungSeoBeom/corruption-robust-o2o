@@ -14,12 +14,26 @@ def soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
             target_parameter.data.mul_(1.0 - tau).add_(parameter.data, alpha=tau)
 
 
+def gradient_norm(parameters) -> torch.Tensor:
+    gradients = [
+        parameter.grad.detach().norm(2)
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not gradients:
+        return torch.zeros(())
+    return torch.stack(gradients).norm(2)
+
+
 class BaseAgent(nn.Module):
     def __init__(self, device: torch.device):
         super().__init__()
         self.device = device
         self.online_phase = False
         self.total_updates = 0
+        self.actor_updates = 0
+        self.critic_updates = 0
+        self.temperature_updates = 0
 
     def update(self, batch: TensorBatch) -> Dict[str, float]:
         raise NotImplementedError
@@ -41,6 +55,9 @@ class BaseAgent(nn.Module):
             "optimizers": self.optimizer_state(),
             "online_phase": self.online_phase,
             "total_updates": self.total_updates,
+            "actor_updates": self.actor_updates,
+            "critic_updates": self.critic_updates,
+            "temperature_updates": self.temperature_updates,
         }
 
     def load_checkpoint_state(self, state: Dict[str, Any]) -> None:
@@ -48,6 +65,11 @@ class BaseAgent(nn.Module):
         self.load_optimizer_state(state.get("optimizers", {}))
         self.online_phase = bool(state.get("online_phase", False))
         self.total_updates = int(state.get("total_updates", 0))
+        self.actor_updates = int(state.get("actor_updates", self.total_updates))
+        self.critic_updates = int(state.get("critic_updates", self.total_updates))
+        self.temperature_updates = int(
+            state.get("temperature_updates", self.total_updates)
+        )
 
     def optimizer_state(self) -> Dict[str, Any]:
         return {}

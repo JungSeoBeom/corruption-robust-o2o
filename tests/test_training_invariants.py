@@ -120,7 +120,11 @@ class TrainingInvariantTest(unittest.TestCase):
         self.assertTrue(np.all(executed <= high))
 
     def test_incompatible_legacy_expansion_checkpoint_fails(self):
-        config = ExperimentConfig("rpex", "hopper-medium-replay-v2")
+        config = ExperimentConfig(
+            "rpex",
+            "hopper-medium-replay-v2",
+            allow_legacy_checkpoint_without_fingerprint=True,
+        )
         payload = {
             "algorithm": "rpex",
             "env_name": config.env_name,
@@ -331,6 +335,7 @@ class TrainingInvariantTest(unittest.TestCase):
                 hidden_layers=2,
                 cql_n_actions=2,
                 bc_steps=0,
+                calibration_mask_mode="oracle_exclude_corrupted",
             )
             agent = build_agent(config, 3, 2, 1.0, device)
             data = synthetic_dataset(size=8)

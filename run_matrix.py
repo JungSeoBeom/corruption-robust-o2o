@@ -12,8 +12,11 @@ from pathlib import Path
 
 from robust_o2o.config import (
     ALGORITHMS,
+    ALGORITHM_PROFILES,
     CORRUPTION_MODES,
     DEFAULT_PROTOCOL,
+    LOCAL_PROTOCOL,
+    LEGACY_LOCAL_PROTOCOL_ALIAS,
     PROTOCOLS,
 )
 
@@ -45,6 +48,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seeds", type=_csv, default=["0"])
     parser.add_argument("--stage", choices=("offline", "online", "both"), default="both")
     parser.add_argument("--protocol", choices=PROTOCOLS, default=DEFAULT_PROTOCOL)
+    parser.add_argument(
+        "--algorithm-profile", choices=ALGORITHM_PROFILES, default="reference"
+    )
+    parser.add_argument("--allow-diagnostic-protocol", action="store_true")
     parser.add_argument("--output-dir", default="results")
     parser.add_argument("--comparison-name")
     parser.add_argument("--dry-run", action="store_true")
@@ -80,10 +87,13 @@ def commands(
                 args.stage,
                 "--protocol",
                 args.protocol,
+                "--algorithm-profile",
+                args.algorithm_profile,
                 "--output-dir",
                 args.output_dir,
                 "--comparison-name",
                 comparison_name,
+                *(["--allow-diagnostic-protocol"] if args.allow_diagnostic_protocol else []),
                 *passthrough,
             ]
 
@@ -91,6 +101,13 @@ def commands(
 def main() -> int:
     parser = build_parser()
     args, passthrough = parser.parse_known_args()
+    if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
+        args.protocol = LOCAL_PROTOCOL
+    if args.protocol in (LOCAL_PROTOCOL, "local_gymnasium_v4") and not args.allow_diagnostic_protocol:
+        parser.error(
+            "the local Gymnasium protocol is diagnostic-only; pass "
+            "--allow-diagnostic-protocol to acknowledge this"
+        )
     comparison_name = args.comparison_name
     if not comparison_name:
         stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")

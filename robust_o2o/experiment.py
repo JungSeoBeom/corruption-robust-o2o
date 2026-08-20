@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -9,7 +10,7 @@ import numpy as np
 import torch
 
 from .agents import build_agent
-from .config import ExperimentConfig
+from .config import LEGACY_PROTOCOL, ExperimentConfig
 from .corruption import (
     AttackOracle,
     corrupt_offline_dataset,
@@ -19,6 +20,7 @@ from .corruption import (
 from .device import resolve_device, seed_env_only, seed_everything
 from .environment import (
     StateNormalizer,
+    EXPECTED_LOCOMOTION_DIMS,
     apply_normalizer,
     environment_metadata,
     evaluate_agent,
@@ -143,10 +145,12 @@ def save_checkpoint(
     action_dim: int,
 ) -> None:
     payload = {
-        "format_version": 2,
+        "format_version": 3,
         "algorithm": config.algorithm,
         "env_name": config.env_name,
         "protocol": config.protocol,
+        "algorithm_profile": config.algorithm_profile,
+        "resolved_algorithm_profile": config.resolved_algorithm_profile,
         "config": config.to_dict(),
         "normalizer": normalizer.state_dict(),
         "agent": agent.checkpoint_state(),
@@ -155,6 +159,12 @@ def save_checkpoint(
         "env_steps": env_steps,
         "state_dim": state_dim,
         "action_dim": action_dim,
+        "environment_fingerprint": getattr(
+            config, "_environment_fingerprint", None
+        ),
+        "environment_fingerprint_payload": getattr(
+            config, "_environment_fingerprint_payload", None
+        ),
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
@@ -229,8 +239,37 @@ def _validate_checkpoint(
             f"requested={config.protocol!r}; checkpoints from different "
             "environment backends cannot be mixed"
         )
+    saved_profile = payload.get("algorithm_profile")
+    if saved_profile is not None and saved_profile != config.algorithm_profile:
+        raise ValueError(
+            f"Checkpoint algorithm_profile={saved_profile!r}, "
+            f"requested={config.algorithm_profile!r}"
+        )
     if payload.get("state_dim") != state_dim or payload.get("action_dim") != action_dim:
         raise ValueError("Checkpoint observation/action dimensions do not match the env")
+    saved_fingerprint = payload.get("environment_fingerprint")
+    current_fingerprint = getattr(config, "_environment_fingerprint", None)
+    if saved_fingerprint is None:
+        if not config.allow_legacy_checkpoint_without_fingerprint:
+            raise ValueError(
+                "Legacy checkpoint has no environment fingerprint. Pass "
+                "--allow-legacy-checkpoint-without-fingerprint only after "
+                "manually verifying the dataset and environment backend."
+            )
+        warnings.warn(
+            "Loading a legacy checkpoint without an environment fingerprint; "
+            "this run is not provenance-verified.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        config._legacy_checkpoint_without_fingerprint_loaded = True
+    elif saved_fingerprint != current_fingerprint:
+        raise ValueError(
+            "Checkpoint environment fingerprint mismatch: "
+            f"saved={saved_fingerprint}, current={current_fingerprint}; "
+            f"saved_payload={payload.get('environment_fingerprint_payload')}, "
+            f"current_payload={getattr(config, '_environment_fingerprint_payload', None)}"
+        )
     saved_config = payload.get("config", {})
     if config.algorithm in ("rpex", "riql_pex", "pex"):
         saved_distribution = saved_config.get("action_distribution")
@@ -253,6 +292,10 @@ def _restore_agent_config(config: ExperimentConfig, payload: Dict[str, Any]) -> 
         "hidden_dim",
         "hidden_layers",
         "learning_rate",
+        "actor_learning_rate",
+        "critic_learning_rate",
+        "temperature_learning_rate",
+        "max_grad_norm",
         "discount",
         "target_update_rate",
         "deterministic_policy",
@@ -273,8 +316,17 @@ def _restore_agent_config(config: ExperimentConfig, payload: Dict[str, Any]) -> 
         "cql_alpha",
         "cql_alpha_online",
         "cql_n_actions",
+        "cql_temperature",
         "bc_steps",
+        "calql_bc_warmup_steps",
         "backup_entropy",
+        "cql_max_target_backup",
+        "calibration_mask_mode",
+        "wsrl_num_critics",
+        "wsrl_target_critic_subsample_size",
+        "wsrl_layer_norm",
+        "wsrl_utd_ratio",
+        "wsrl_per_critic_batch_size",
         "mc_return_source",
         "action_distribution",
         "ro2o_beta_policy",
@@ -317,7 +369,7 @@ def _evaluate(
             device,
             config.eval_episodes,
             config.max_episode_steps,
-            config.seed,
+            config.eval_seed,
             config.protocol,
             mode,
         )
@@ -343,10 +395,10 @@ def _evaluate(
 
 def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
     device = resolve_device(config.device, config.cuda_device)
-    seed_everything(config.seed)
+    seed_everything(config.learner_seed)
     dataset_env = make_env(config.env_name, config.protocol)
     try:
-        seed_env_only(dataset_env, config.seed)
+        seed_env_only(dataset_env, config.train_env_seed)
         raw_dataset = load_d4rl_dataset(
             dataset_env,
             config.dataset_dir,
@@ -358,7 +410,7 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
             dataset_env,
             config.env_name,
             raw_dataset,
-            config.seed,
+            config.train_env_seed,
             config.protocol,
             config.dataset_dir,
         )
@@ -367,15 +419,24 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
 
     state_dim = raw_dataset["observations"].shape[1]
     action_dim = raw_dataset["actions"].shape[1]
+    if config.protocol == LEGACY_PROTOCOL:
+        expected_dims = EXPECTED_LOCOMOTION_DIMS[
+            config.env_name.split("-", 1)[0]
+        ]
+        if (state_dim, action_dim) != expected_dims:
+            raise RuntimeError(
+                "Strict D4RL-v2 observation/action dimensions mismatch: "
+                f"expected={expected_dims}, actual={(state_dim, action_dim)}"
+            )
 
     with ExitStack() as stack:
         env = make_env(config.env_name, config.protocol)
         stack.callback(env.close)
         eval_env = _make_evaluation_env(
-            config.env_name, config.protocol, config.seed + 10_000
+            config.env_name, config.protocol, config.eval_seed
         )
         stack.callback(eval_env.close)
-        seed_env_only(env, config.seed)
+        seed_env_only(env, config.train_env_seed)
         for role, instance in (("online", env), ("evaluation", eval_env)):
             spec_id = getattr(getattr(instance, "spec", None), "id", None)
             expected_spec_id = expected_env_spec_id(config.env_name, config.protocol)
@@ -388,7 +449,40 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
                 raise RuntimeError(f"{role} observation dimension mismatch")
             if tuple(instance.action_space.shape) != (action_dim,):
                 raise RuntimeError(f"{role} action dimension mismatch")
+            if not np.array_equal(
+                np.asarray(instance.action_space.low, dtype=np.float64),
+                np.asarray(protocol_metadata["action_low"], dtype=np.float64),
+            ) or not np.array_equal(
+                np.asarray(instance.action_space.high, dtype=np.float64),
+                np.asarray(protocol_metadata["action_high"], dtype=np.float64),
+            ):
+                raise RuntimeError(f"{role} action bounds mismatch")
+            instance_horizon = getattr(instance, "_max_episode_steps", None)
+            if instance_horizon is None:
+                instance_horizon = getattr(
+                    getattr(instance, "spec", None), "max_episode_steps", None
+                )
+            if int(instance_horizon) != int(
+                protocol_metadata["environment_max_episode_steps"]
+            ):
+                raise RuntimeError(f"{role} environment horizon mismatch")
         max_action = float(np.max(np.abs(env.action_space.high)))
+        environment_horizon = protocol_metadata["environment_max_episode_steps"]
+        if (
+            config.protocol == LEGACY_PROTOCOL
+            and config.max_episode_steps != environment_horizon
+        ):
+            raise RuntimeError(
+                "Strict protocol horizon mismatch: "
+                f"--max-episode-steps={config.max_episode_steps}, "
+                f"environment spec={environment_horizon}"
+            )
+        config._environment_fingerprint = protocol_metadata[
+            "environment_fingerprint"
+        ]
+        config._environment_fingerprint_payload = protocol_metadata[
+            "environment_fingerprint_payload"
+        ]
 
         checkpoint_payload: Optional[Dict[str, Any]] = None
         if config.checkpoint:
@@ -422,11 +516,11 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
                 mode=config.state_normalization,
             )
         normalized_dataset = apply_normalizer(corrupted_dataset, normalizer)
-        offline = OfflineDataset(normalized_dataset, config.seed)
+        offline = OfflineDataset(normalized_dataset, config.replay_seed)
 
         # Decouple learner initialization and subsequent training randomness
         # from preprocessing, adversarial attacks, and cache hit/miss state.
-        seed_everything(config.seed)
+        seed_everything(config.learner_seed)
         agent = build_agent(config, state_dim, action_dim, max_action, device)
         if checkpoint_payload is not None:
             agent.load_checkpoint_state(checkpoint_payload["agent"])
@@ -447,6 +541,13 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
                 "action_dim": action_dim,
                 "offline_corruption": corruption_stats,
                 "normalizer": normalizer.diagnostics(corrupted_dataset),
+                "legacy_checkpoint_without_fingerprint_loaded": bool(
+                    getattr(
+                        config,
+                        "_legacy_checkpoint_without_fingerprint_loaded",
+                        False,
+                    )
+                ),
             }
         )
         logger.logger.info(
@@ -482,7 +583,7 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
                 device,
                 config.eval_episodes,
                 config.max_episode_steps,
-                config.seed,
+                config.eval_seed,
                 config.protocol,
                 "deterministic_diagnostic",
             )
@@ -534,7 +635,7 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
                 device,
                 config.eval_episodes,
                 config.max_episode_steps,
-                config.seed,
+                config.eval_seed,
                 config.protocol,
                 "deterministic_diagnostic",
             )
@@ -667,12 +768,12 @@ def _run_online(
 ) -> None:
     logger.logger.info("online fine-tuning started")
     replay = ReplayBuffer(
-        state_dim, action_dim, config.replay_size, config.seed + 1
+        state_dim, action_dim, config.replay_size, config.replay_seed
     )
-    rng = np.random.default_rng(config.seed + 2)
+    rng = np.random.default_rng(config.corruption_seed)
     state_std = raw_dataset["observations"].std(axis=0).astype(np.float32) + 1e-6
     action_std = raw_dataset["actions"].std(axis=0).astype(np.float32) + 1e-6
-    raw_state = reset_env(env, seed=config.seed, protocol=config.protocol)
+    raw_state = reset_env(env, seed=config.train_env_seed, protocol=config.protocol)
     episode_steps = 0
     corrupted_online = 0
     last_metrics: Dict[str, float] = {}
@@ -762,12 +863,26 @@ def _run_online(
             episode_steps = 0
 
         is_pqe = config.algorithm == "pessimistic_q_ensemble"
+        update_batch_size = (
+            config.wsrl_per_critic_batch_size
+            if config.algorithm == "wsrl"
+            else config.batch_size
+        )
         required_online_samples = (
-            config.batch_size if is_pqe else max(online_batch_count, 1)
+            config.batch_size if is_pqe else max(
+                update_batch_size - int(round(update_batch_size * offline_ratio)),
+                1,
+            )
         )
         can_update = env_step > warmup and replay.size >= required_online_samples
         if can_update:
-            for _ in range(config.updates_per_step):
+            update_repeats = (
+                config.wsrl_utd_ratio
+                if config.algorithm == "wsrl"
+                else config.updates_per_step
+            )
+            wsrl_batches: list[Dict[str, torch.Tensor]] = []
+            for _ in range(update_repeats):
                 prioritized = (
                     is_pqe
                     and config.pqe_replay_mode == "balanced_density"
@@ -795,11 +910,19 @@ def _run_online(
                     batch = mixed_batch(
                         offline,
                         replay,
-                        config.batch_size,
+                        update_batch_size,
                         offline_ratio,
                         device,
                     )
-                    last_metrics = agent.update(batch)
+                    if config.algorithm == "wsrl":
+                        wsrl_batches.append(batch)
+                        last_metrics = agent.update(
+                            batch,
+                            update_actor_temperature=False,
+                            update_critic=True,
+                        )
+                    else:
+                        last_metrics = agent.update(batch)
                 accumulator.add(last_metrics)
                 if is_pqe:
                     priorities = agent.consume_priority_values()
@@ -810,6 +933,17 @@ def _run_online(
                     priority_metrics = update_sample_priorities(
                         offline, replay, batch, priorities
                     )
+            if config.algorithm == "wsrl":
+                actor_batch = {
+                    key: torch.cat([batch[key] for batch in wsrl_batches], dim=0)
+                    for key in wsrl_batches[0]
+                }
+                last_metrics = agent.update(
+                    actor_batch,
+                    update_actor_temperature=True,
+                    update_critic=False,
+                )
+                accumulator.add(last_metrics)
         if env_step % config.train_log_period == 0:
             parameter_deltas, parameter_snapshot = _parameter_deltas(
                 agent, parameter_snapshot
@@ -828,6 +962,16 @@ def _run_online(
                     "replay_size_online": float(replay.size),
                     "offline_batch_fraction": float(offline_ratio),
                     "online_batch_fraction": float(1.0 - offline_ratio),
+                    "parameters_frozen_during_warmup": float(
+                        config.algorithm == "wsrl"
+                    ),
+                    "offline_data_retained_online": float(offline_ratio > 0.0),
+                    "wsrl_critic_updates_per_env_step": float(
+                        config.wsrl_utd_ratio if config.algorithm == "wsrl" else 0
+                    ),
+                    "wsrl_actor_updates_per_env_step": float(
+                        1 if config.algorithm == "wsrl" else 0
+                    ),
                     "online_corruption_fraction": corrupted_online / env_step,
                     "raw_action_abs_max": raw_action_abs_max,
                     "executed_action_abs_max": executed_action_abs_max,

@@ -4,6 +4,7 @@ import hashlib
 import json
 import platform
 import random
+import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -39,6 +40,11 @@ LOCAL_GYMNASIUM_ENV_IDS = {
     "halfcheetah": "HalfCheetah-v4",
     "hopper": "Hopper-v4",
     "walker2d": "Walker2d-v4",
+}
+EXPECTED_LOCOMOTION_DIMS = {
+    "halfcheetah": (17, 6),
+    "hopper": (11, 3),
+    "walker2d": (17, 6),
 }
 # D4RL v2 reference returns used by d4rl.get_normalized_score().
 LOCAL_D4RL_REFERENCE_SCORES = {
@@ -613,15 +619,55 @@ def environment_metadata(
         installed_commit = installed_d4rl_commit()
     else:
         raise ValueError(f"Unknown metadata protocol {protocol!r}")
-    return {
+    versions = runtime_package_versions()
+    try:
+        git_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        git_commit = "unknown"
+    action_space = env.action_space
+    action_low = np.asarray(
+        getattr(action_space, "low", np.full(action_space.shape, np.nan)),
+        dtype=np.float64,
+    ).tolist()
+    action_high = np.asarray(
+        getattr(action_space, "high", np.full(action_space.shape, np.nan)),
+        dtype=np.float64,
+    ).tolist()
+    evaluation_env_id = getattr(getattr(env, "spec", None), "id", None)
+    metadata = {
         "protocol": protocol,
+        "environment_protocol": protocol,
         "d4rl_env_id": full_env_name,
-        "env_spec_id": getattr(getattr(env, "spec", None), "id", None),
+        "dataset_id": full_env_name,
+        "env_spec_id": evaluation_env_id,
+        "evaluation_env_id": evaluation_env_id,
+        "online_env_id": evaluation_env_id,
         "unwrapped_environment_class": type(unwrapped).__name__,
         "unwrapped_environment_module": type(unwrapped).__module__,
         "environment_backend": environment_backend,
         "dataset_backend": dataset_backend,
-        "runtime_package_versions": runtime_package_versions(),
+        "runtime_package_versions": versions,
+        "python_version": versions["Python"],
+        "gym_version": versions["gym"],
+        "gymnasium_version": versions["gymnasium"],
+        "numpy_version": versions["numpy"],
+        "mujoco_backend": (
+            "mujoco_py" if protocol == LEGACY_PROTOCOL else "native_mujoco"
+        ),
+        "d4rl_version_or_commit": installed_commit or versions["d4rl"],
+        "git_commit": git_commit,
+        "benchmark_comparable": protocol == LEGACY_PROTOCOL,
+        "diagnostic_reason": (
+            None
+            if protocol == LEGACY_PROTOCOL
+            else "D4RL-v2 dataset evaluated on Gymnasium-v4 simulator"
+        ),
         "expected_d4rl_commit": expected_commit,
         "installed_d4rl_commit": installed_commit,
         "dataset_url": dataset_url,
@@ -634,6 +680,8 @@ def environment_metadata(
         "observation_dim": int(dataset["observations"].shape[1]),
         "action_dim": int(dataset["actions"].shape[1]),
         "dataset_size": int(len(dataset["rewards"])),
+        "action_low": action_low,
+        "action_high": action_high,
         "environment_max_episode_steps": _max_episode_steps(env),
         "environment_seed": int(seed),
         # Backward-compatible metadata aliases. Run configuration values are
@@ -641,6 +689,35 @@ def environment_metadata(
         "max_episode_steps": _max_episode_steps(env),
         "seed": int(seed),
     }
+    fingerprint_payload = {
+        key: metadata[key]
+        for key in (
+            "protocol",
+            "d4rl_env_id",
+            "env_spec_id",
+            "environment_backend",
+            "dataset_backend",
+            "dataset_sha256",
+            "observation_dim",
+            "action_dim",
+            "dataset_size",
+            "environment_max_episode_steps",
+            "action_low",
+            "action_high",
+            "python_version",
+            "gym_version",
+            "gymnasium_version",
+            "numpy_version",
+            "mujoco_backend",
+            "d4rl_version_or_commit",
+        )
+    }
+    serialized = json.dumps(
+        fingerprint_payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    metadata["environment_fingerprint_payload"] = fingerprint_payload
+    metadata["environment_fingerprint"] = hashlib.sha256(serialized).hexdigest()
+    return metadata
 
 
 def preflight_runtime(
@@ -656,6 +733,18 @@ def preflight_runtime(
     )
     try:
         reset_env(env, seed=0, protocol=protocol)
+        if protocol == LEGACY_PROTOCOL:
+            domain = normalize_env_name(env_name).split("-", 1)[0]
+            expected_state_dim, expected_action_dim = EXPECTED_LOCOMOTION_DIMS[domain]
+            actual = (
+                int(dataset["observations"].shape[1]),
+                int(dataset["actions"].shape[1]),
+            )
+            if actual != (expected_state_dim, expected_action_dim):
+                raise RPEXProtocolError(
+                    "Strict D4RL-v2 observation/action dimensions mismatch: "
+                    f"expected={(expected_state_dim, expected_action_dim)}, actual={actual}"
+                )
         return environment_metadata(
             env,
             env_name,
@@ -895,9 +984,17 @@ def evaluate_agent(
 
     returns_np = np.asarray(returns, dtype=np.float64)
     normalized = normalized_d4rl_scores(env_name, returns_np, protocol)
-    return {
+    result = {
         "return_mean": float(returns_np.mean()),
         "return_std": float(returns_np.std()),
         "normalized_return_mean": float(np.nanmean(normalized)),
         "normalized_return_std": float(np.nanstd(normalized)),
     }
+    if protocol == LOCAL_PROTOCOL:
+        result["diagnostic_d4rl_reference_scaled_return_mean"] = result[
+            "normalized_return_mean"
+        ]
+        result["diagnostic_d4rl_reference_scaled_return_std"] = result[
+            "normalized_return_std"
+        ]
+    return result

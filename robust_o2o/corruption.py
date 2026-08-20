@@ -218,7 +218,7 @@ def corruption_cache_fingerprint(
         "corruption_target": config.corruption_target,
         "corruption_range": config.corruption_range,
         "offline_corruption_rate": config.offline_corruption_rate,
-        "seed": config.seed,
+        "seed": config.corruption_seed,
         "offline_attack_steps": config.offline_attack_steps,
         "attack_step_size": config.attack_step_size,
         "attack_min_step_size": config.attack_min_step_size,
@@ -502,7 +502,7 @@ def corrupt_offline_dataset(
             dataset, config, cache_file, cache_key, cache_metadata
         )
 
-    rng = np.random.default_rng(config.seed)
+    rng = np.random.default_rng(config.corruption_seed)
     selected = rng.random(len(dataset["rewards"])) < config.offline_corruption_rate
     indices = np.flatnonzero(selected)
     result = {key: value.copy() for key, value in dataset.items()}

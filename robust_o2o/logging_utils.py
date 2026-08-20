@@ -22,6 +22,8 @@ METRIC_FIELDS = (
     "return_std",
     "normalized_return_mean",
     "normalized_return_std",
+    "diagnostic_d4rl_reference_scaled_return_mean",
+    "diagnostic_d4rl_reference_scaled_return_std",
     "evaluation_mode",
     "return_deterministic",
     "normalized_return_deterministic",
@@ -44,14 +46,17 @@ class RunLogger:
             config.corruption,
             config.corruption_target,
             comparison_id,
+            config.protocol,
+            config.algorithm_profile,
         )
         self.run_dir = (
             runs_dir
             / config.algorithm
+            / config.resolved_algorithm_profile
             / config.corruption
             / config.corruption_target
             / config.env_name
-            / f"seed_{config.seed}"
+            / f"seed_l{config.learner_seed}_c{config.corruption_seed}"
             / run_id
         )
         self.run_dir.mkdir(parents=True, exist_ok=False)
@@ -124,13 +129,19 @@ class RunLogger:
             writer = csv.DictWriter(stream, fieldnames=METRIC_FIELDS)
             writer.writerow({key: record.get(key, "") for key in METRIC_FIELDS})
         self.last_eval = metrics
+        score_label = (
+            "normalized"
+            if self.config.protocol == "rpex_d4rl_v2_legacy"
+            else "diagnostic_scaled"
+        )
         self.logger.info(
-            "%s step=%d env_steps=%d return=%.1f±%.1f normalized=%.1f±%.1f",
+            "%s step=%d env_steps=%d return=%.1f±%.1f %s=%.1f±%.1f",
             phase,
             step,
             env_steps,
             metrics["return_mean"],
             metrics["return_std"],
+            score_label,
             metrics["normalized_return_mean"],
             metrics["normalized_return_std"],
         )
@@ -164,6 +175,18 @@ class RunLogger:
         }
         with (self.run_dir / "summary.json").open("w", encoding="utf-8") as stream:
             json.dump(summary, stream, indent=2, ensure_ascii=False)
+        if status == "completed":
+            try:
+                from plot_results import update_comparison_plots
+
+                update_comparison_plots(
+                    self.comparison_dir,
+                    self.config.env_name,
+                    self.config.corruption,
+                    self.config.corruption_target,
+                )
+            except Exception as exc:
+                self.logger.warning("final comparison plot refresh skipped: %s", exc)
         self.logger.info("status=%s run_dir=%s", status, self.run_dir)
         # Keep these as the final three normal output lines, per the benchmark
         # requirement. The CLI prints tracebacks before calling finish().

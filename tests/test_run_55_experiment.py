@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from robust_o2o.config import LOCAL_PROTOCOL
+from robust_o2o.config import DEFAULT_PROTOCOL
 from run_55_experiment import ALGORITHMS, ENV_NAME, SETTINGS, build_parser, commands
 
 
@@ -26,7 +26,7 @@ class Run55ExperimentTest(unittest.TestCase):
         self.assertEqual(len(generated), 5)
         self.assertEqual(args.offline_steps, 500_000)
         self.assertEqual(args.online_steps, 500_000)
-        self.assertEqual(args.protocol, LOCAL_PROTOCOL)
+        self.assertEqual(args.protocol, DEFAULT_PROTOCOL)
 
         for command, (corruption, target) in zip(generated, SETTINGS):
             self.assertEqual(command[command.index("--env-name") + 1], ENV_NAME)
@@ -40,6 +40,19 @@ class Run55ExperimentTest(unittest.TestCase):
             self.assertEqual(command[command.index("--online-steps") + 1], "500000")
             self.assertEqual(
                 command[command.index("--comparison-name") + 1], "test_suite"
+            )
+
+    def test_halfcheetah_environment_override(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["--env-name", "halfcheetah-medium-replay-v2"]
+        )
+        generated = list(commands(args, (), "halfcheetah_suite"))
+        self.assertEqual(len(generated), 5)
+        for command in generated:
+            self.assertEqual(
+                command[command.index("--env-name") + 1],
+                "halfcheetah-medium-replay-v2",
             )
 
 

@@ -134,8 +134,10 @@ python run_all_algorithms.py \
 
 ## Saved provenance
 
-Strict and local results share the canonical `results/comparisons/` tree; the
-protocol is recorded in each run's `config.json` rather than encoded in its path.
+Strict and local results use separate canonical namespaces under
+`results/comparisons/<environment_protocol>/<algorithm_profile>/`. The local
+canonical name is `local_gymnasium_v4_diagnostic`, and selecting it also
+requires `--allow-diagnostic-protocol`.
 Every run's `config.json` records the protocol, complete requested ID,
 `env.spec.id`, unwrapped class/module, package versions, required and installed
 D4RL commits, dataset URL/path/SHA-256 when available, dimensions, dataset size,

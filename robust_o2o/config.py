@@ -19,9 +19,12 @@ ALGORITHMS = (
 )
 
 LEGACY_PROTOCOL = "rpex_d4rl_v2_legacy"
-LOCAL_PROTOCOL = "local_gymnasium_v4"
+LOCAL_PROTOCOL = "local_gymnasium_v4_diagnostic"
+LEGACY_LOCAL_PROTOCOL_ALIAS = "local_gymnasium_v4"
 DEFAULT_PROTOCOL = LEGACY_PROTOCOL
-PROTOCOLS = (LEGACY_PROTOCOL, LOCAL_PROTOCOL)
+PROTOCOLS = (LEGACY_PROTOCOL, LOCAL_PROTOCOL, LEGACY_LOCAL_PROTOCOL_ALIAS)
+ALGORITHM_PROFILES = ("reference", "legacy_current")
+CALIBRATION_MASK_MODES = ("all", "oracle_exclude_corrupted", "disabled")
 
 ALGORITHM_TITLES = {
     "rpex": "Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption",
@@ -91,6 +94,18 @@ class ExperimentConfig:
     stage: str = "both"
     seed: int = 0
     protocol: str = DEFAULT_PROTOCOL
+    algorithm_profile: str = "reference"
+    allow_diagnostic_protocol: bool = False
+    allow_legacy_checkpoint_without_fingerprint: bool = False
+
+    # ``seed`` remains the stable public/base seed. Role seeds are derived once
+    # and serialized so preprocessing, replay and evaluation RNG streams cannot
+    # silently affect learner initialization.
+    learner_seed: Optional[int] = None
+    corruption_seed: Optional[int] = None
+    replay_seed: Optional[int] = None
+    train_env_seed: Optional[int] = None
+    eval_seed: Optional[int] = None
 
     output_dir: str = "results"
     dataset_dir: Optional[str] = None
@@ -120,6 +135,10 @@ class ExperimentConfig:
     hidden_dim: int = 256
     hidden_layers: int = 2
     learning_rate: float = 3e-4
+    actor_learning_rate: Optional[float] = None
+    critic_learning_rate: Optional[float] = None
+    temperature_learning_rate: Optional[float] = None
+    max_grad_norm: Optional[float] = None
     discount: float = 0.99
     target_update_rate: float = 0.005
     normalize_states: bool = True
@@ -150,9 +169,21 @@ class ExperimentConfig:
     cql_alpha: float = 5.0
     cql_alpha_online: float = 1.0
     cql_n_actions: int = 10
-    bc_steps: int = 100_000
+    cql_temperature: float = 1.0
+    bc_steps: Optional[int] = None
+    calql_bc_warmup_steps: Optional[int] = None
     backup_entropy: bool = False
+    cql_max_target_backup: Optional[bool] = None
+    calibration_mask_mode: str = "all"
     mc_return_source: str = "post_corruption"
+
+    # WSRL / REDQ reference controls. ``updates_per_step`` remains a generic
+    # legacy knob; the reference WSRL schedule is resolved independently.
+    wsrl_num_critics: Optional[int] = None
+    wsrl_target_critic_subsample_size: Optional[int] = None
+    wsrl_layer_norm: Optional[bool] = None
+    wsrl_utd_ratio: Optional[int] = None
+    wsrl_per_critic_batch_size: int = 256
 
     # Off2OnRL balanced replay. ``uniform`` is an explicit ablation.
     pqe_replay_mode: str = "balanced_density"
@@ -193,10 +224,14 @@ class ExperimentConfig:
         self.corruption_target = self.corruption_target.lower()
         self.stage = self.stage.lower()
         self.protocol = self.protocol.lower()
+        if self.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
+            self.protocol = LOCAL_PROTOCOL
+        self.algorithm_profile = self.algorithm_profile.lower()
         self.state_normalization = self.state_normalization.lower()
         self.action_distribution = self.action_distribution.lower()
         self.evaluation_mode = self.evaluation_mode.lower()
         self.mc_return_source = self.mc_return_source.lower()
+        self.calibration_mask_mode = self.calibration_mask_mode.lower()
         self.pqe_replay_mode = self.pqe_replay_mode.lower()
         self.implementation_variant = (
             "shared_actor_approx"
@@ -205,6 +240,9 @@ class ExperimentConfig:
         )
         self.attack_norm = self.attack_norm.lower()
         self.mixed_ratios = tuple(float(value) for value in self.mixed_ratios)
+
+        self._resolve_role_seeds()
+        self._resolve_algorithm_profile()
 
         if not self.normalize_states:
             self.state_normalization = "none"
@@ -223,9 +261,19 @@ class ExperimentConfig:
             raise ValueError(f"Unknown corruption target {self.corruption_target!r}")
         if self.stage not in ("offline", "online", "both"):
             raise ValueError("stage must be offline, online, or both")
-        if self.protocol not in PROTOCOLS:
+        if self.protocol not in (LEGACY_PROTOCOL, LOCAL_PROTOCOL):
             raise ValueError(
                 f"Unknown protocol {self.protocol!r}; choose from {PROTOCOLS}"
+            )
+        if self.algorithm_profile not in ALGORITHM_PROFILES:
+            raise ValueError(
+                f"Unknown algorithm_profile {self.algorithm_profile!r}; "
+                f"choose from {ALGORITHM_PROFILES}"
+            )
+        if self.calibration_mask_mode not in CALIBRATION_MASK_MODES:
+            raise ValueError(
+                "calibration_mask_mode must be all, oracle_exclude_corrupted, "
+                "or disabled"
             )
         if self.state_normalization not in ("standard", "robust_median_mad", "none"):
             raise ValueError(
@@ -303,6 +351,111 @@ class ExperimentConfig:
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.max_grad_norm is not None and self.max_grad_norm <= 0.0:
+            raise ValueError("max_grad_norm must be positive when set")
+        for name in (
+            "actor_learning_rate",
+            "critic_learning_rate",
+            "temperature_learning_rate",
+        ):
+            if getattr(self, name) <= 0.0:
+                raise ValueError(f"{name} must be positive")
+        if self.calql_bc_warmup_steps < 0:
+            raise ValueError("calql_bc_warmup_steps cannot be negative")
+        if self.cql_temperature <= 0.0:
+            raise ValueError("cql_temperature must be positive")
+        if self.wsrl_utd_ratio <= 0 or self.wsrl_per_critic_batch_size <= 0:
+            raise ValueError("WSRL UTD ratio and per-critic batch size must be positive")
+        if self.wsrl_target_critic_subsample_size is not None and not (
+            1 <= self.wsrl_target_critic_subsample_size <= self.sac_num_critics
+        ):
+            raise ValueError(
+                "wsrl_target_critic_subsample_size must be between 1 and "
+                "sac_num_critics"
+            )
+
+    def _resolve_role_seeds(self) -> None:
+        offsets = {
+            "learner_seed": 0,
+            "corruption_seed": 10_001,
+            "replay_seed": 20_003,
+            "train_env_seed": 30_007,
+            "eval_seed": 40_009,
+        }
+        modulus = 2**31 - 1
+        for name, offset in offsets.items():
+            if getattr(self, name) is None:
+                setattr(self, name, int((self.seed + offset) % modulus))
+
+    def _resolve_algorithm_profile(self) -> None:
+        reference = self.algorithm_profile == "reference"
+        self.actor_learning_rate = (
+            (1e-4 if self.algorithm == "cal_ql" and reference else self.learning_rate)
+            if self.actor_learning_rate is None
+            else self.actor_learning_rate
+        )
+        self.critic_learning_rate = (
+            self.learning_rate
+            if self.critic_learning_rate is None
+            else self.critic_learning_rate
+        )
+        self.temperature_learning_rate = (
+            self.entropy_lr
+            if self.temperature_learning_rate is None
+            else self.temperature_learning_rate
+        )
+        requested_warmup = (
+            self.calql_bc_warmup_steps
+            if self.calql_bc_warmup_steps is not None
+            else self.bc_steps
+        )
+        self.calql_bc_warmup_steps = (
+            (0 if reference else 100_000)
+            if requested_warmup is None
+            else int(requested_warmup)
+        )
+        self.bc_steps = self.calql_bc_warmup_steps
+        if self.cql_max_target_backup is None:
+            self.cql_max_target_backup = bool(reference)
+        if self.algorithm == "wsrl":
+            if self.wsrl_num_critics is None:
+                self.wsrl_num_critics = 10 if reference else self.sac_num_critics
+            self.sac_num_critics = self.wsrl_num_critics
+            if self.wsrl_target_critic_subsample_size is None:
+                self.wsrl_target_critic_subsample_size = 2 if reference else self.sac_num_critics
+            if self.wsrl_layer_norm is None:
+                self.wsrl_layer_norm = reference
+            if self.wsrl_utd_ratio is None:
+                self.wsrl_utd_ratio = 4 if reference else self.updates_per_step
+        else:
+            self.wsrl_num_critics = self.sac_num_critics
+            if self.wsrl_target_critic_subsample_size is None:
+                self.wsrl_target_critic_subsample_size = self.sac_num_critics
+            if self.wsrl_layer_norm is None:
+                self.wsrl_layer_norm = False
+            if self.wsrl_utd_ratio is None:
+                self.wsrl_utd_ratio = self.updates_per_step
+
+    @property
+    def resolved_algorithm_profile(self) -> str:
+        if self.algorithm == "cal_ql":
+            base = (
+                "calql_reference"
+                if self.algorithm_profile == "reference"
+                else "calql_legacy_bc100k"
+            )
+            if self.calibration_mask_mode == "oracle_exclude_corrupted":
+                return f"{base}_oracle"
+            if self.calibration_mask_mode == "disabled":
+                return f"{base}_calibration_disabled"
+            return base
+        if self.algorithm == "wsrl":
+            return (
+                "wsrl_reference_redq10x2"
+                if self.algorithm_profile == "reference"
+                else "wsrl_legacy_min10"
+            )
+        return f"{self.algorithm}_{self.algorithm_profile}"
 
     @property
     def effective_offline_checkpoint_period(self) -> int:
@@ -344,6 +497,28 @@ class ExperimentConfig:
             "effective_online_checkpoint_period"
         ] = self.effective_online_checkpoint_period
         result["paper_title"] = ALGORITHM_TITLES[self.algorithm]
+        result["base_seed"] = self.seed
+        result["resolved_algorithm_profile"] = self.resolved_algorithm_profile
+        result["score_semantics"] = (
+            "d4rl_normalized_return"
+            if self.protocol == LEGACY_PROTOCOL
+            else "diagnostic_d4rl_reference_scaled_return"
+        )
+        if self.algorithm == "wsrl":
+            result.update(
+                {
+                    "offline_pretrainer": "cql_redq",
+                    "offline_stage_label": "CQL-REDQ pretrainer for WSRL",
+                    "parameters_frozen_during_warmup": True,
+                    "offline_data_retained_online": False,
+                    "wsrl_total_sampled_batch_size": self.wsrl_utd_ratio
+                    * self.wsrl_per_critic_batch_size,
+                }
+            )
+        if self.algorithm == "cal_ql":
+            result["calql_actor_update_mode_at_start"] = (
+                "bc_warmup" if self.calql_bc_warmup_steps > 0 else "sac"
+            )
         return result
 
 
@@ -357,14 +532,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--corruption-target", choices=CORRUPTION_TARGETS, default="none")
     parser.add_argument("--stage", choices=("offline", "online", "both"), default="both")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--learner-seed", type=int)
+    parser.add_argument("--corruption-seed", type=int)
+    parser.add_argument("--replay-seed", type=int)
+    parser.add_argument("--train-env-seed", type=int)
+    parser.add_argument("--eval-seed", type=int)
+    parser.add_argument(
+        "--algorithm-profile", choices=ALGORITHM_PROFILES, default="reference"
+    )
     parser.add_argument(
         "--protocol",
         choices=PROTOCOLS,
         default=DEFAULT_PROTOCOL,
         help=(
             "rpex_d4rl_v2_legacy for exact reproduction, or "
-            "local_gymnasium_v4 for the modern local macOS runtime"
+            "local_gymnasium_v4_diagnostic for a non-benchmark local runtime"
         ),
+    )
+    parser.add_argument(
+        "--allow-diagnostic-protocol",
+        action="store_true",
+        help="required acknowledgement for the non-benchmark Gymnasium protocol",
+    )
+    parser.add_argument(
+        "--allow-legacy-checkpoint-without-fingerprint",
+        action="store_true",
     )
     parser.add_argument("--output-dir", default="results")
     parser.add_argument(
@@ -420,6 +612,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--hidden-layers", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--actor-learning-rate", type=float)
+    parser.add_argument("--critic-learning-rate", type=float)
+    parser.add_argument("--temperature-learning-rate", type=float)
+    parser.add_argument("--max-grad-norm", type=float)
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--target-update-rate", type=float, default=0.005)
     parser.add_argument("--no-normalize-states", dest="normalize_states", action="store_false")
@@ -460,8 +656,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cql-alpha", type=float, default=5.0)
     parser.add_argument("--cql-alpha-online", type=float, default=1.0)
     parser.add_argument("--cql-n-actions", type=int, default=10)
-    parser.add_argument("--bc-steps", type=int, default=100_000)
+    parser.add_argument("--cql-temperature", type=float, default=1.0)
+    parser.add_argument("--bc-steps", type=int, help="deprecated alias for Cal-QL BC warmup")
+    parser.add_argument("--calql-bc-warmup-steps", type=int)
     parser.add_argument("--backup-entropy", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--cql-max-target-backup", action=argparse.BooleanOptionalAction
+    )
+    parser.add_argument(
+        "--calibration-mask-mode", choices=CALIBRATION_MASK_MODES, default="all"
+    )
+    parser.add_argument("--wsrl-num-critics", type=int)
+    parser.add_argument("--wsrl-target-critic-subsample-size", type=int)
+    parser.add_argument("--wsrl-layer-norm", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--wsrl-utd-ratio", type=int)
+    parser.add_argument("--wsrl-per-critic-batch-size", type=int, default=256)
     parser.add_argument(
         "--mc-return-source",
         choices=("post_corruption", "legacy_pre_corruption"),
@@ -510,7 +719,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
-    return ExperimentConfig(**vars(args))
+    if getattr(args, "bc_steps", None) is not None:
+        import warnings
+
+        warnings.warn(
+            "--bc-steps is deprecated; use --calql-bc-warmup-steps",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    config = ExperimentConfig(**vars(args))
+    if config.protocol == LOCAL_PROTOCOL and not config.allow_diagnostic_protocol:
+        raise ValueError(
+            "The local Gymnasium protocol is diagnostic-only. Re-run with "
+            "--allow-diagnostic-protocol to acknowledge that it is not a "
+            "strict D4RL benchmark result."
+        )
+    return config
 
 
 def default_attack_checkpoint(env_name: str) -> Optional[Path]:

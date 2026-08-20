@@ -12,11 +12,20 @@ LOG_STD_MIN = -5.0
 LOG_STD_MAX = 2.0
 
 
-def mlp(input_dim: int, hidden_dim: int, hidden_layers: int, output_dim: int) -> nn.Sequential:
+def mlp(
+    input_dim: int,
+    hidden_dim: int,
+    hidden_layers: int,
+    output_dim: int,
+    layer_norm: bool = False,
+) -> nn.Sequential:
     dims = [input_dim, *([hidden_dim] * hidden_layers), output_dim]
     layers = []
     for index in range(len(dims) - 2):
-        layers.extend((nn.Linear(dims[index], dims[index + 1]), nn.ReLU()))
+        layers.append(nn.Linear(dims[index], dims[index + 1]))
+        if layer_norm:
+            layers.append(nn.LayerNorm(dims[index + 1]))
+        layers.append(nn.ReLU())
     layers.append(nn.Linear(dims[-2], dims[-1]))
     return nn.Sequential(*layers)
 
@@ -34,9 +43,12 @@ class TanhGaussianPolicy(nn.Module):
         deterministic: bool = False,
         action_low: Optional[torch.Tensor] = None,
         action_high: Optional[torch.Tensor] = None,
+        layer_norm: bool = False,
     ):
         super().__init__()
-        self.trunk = mlp(state_dim, hidden_dim, hidden_layers, hidden_dim)
+        self.trunk = mlp(
+            state_dim, hidden_dim, hidden_layers, hidden_dim, layer_norm=layer_norm
+        )
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
         self.action_dim = action_dim
@@ -286,6 +298,18 @@ class VectorizedLinear(nn.Module):
         return inputs @ self.weight + self.bias
 
 
+class EnsembleLayerNorm(nn.Module):
+    def __init__(self, hidden_dim: int, ensemble_size: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ensemble_size, 1, hidden_dim))
+        self.bias = nn.Parameter(torch.zeros(ensemble_size, 1, hidden_dim))
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        mean = inputs.mean(dim=-1, keepdim=True)
+        variance = inputs.var(dim=-1, keepdim=True, unbiased=False)
+        return (inputs - mean) * torch.rsqrt(variance + 1e-5) * self.weight + self.bias
+
+
 class EnsembleQNetwork(nn.Module):
     def __init__(
         self,
@@ -294,14 +318,16 @@ class EnsembleQNetwork(nn.Module):
         hidden_dim: int = 256,
         hidden_layers: int = 2,
         num_critics: int = 5,
+        layer_norm: bool = False,
     ):
         super().__init__()
         modules = []
         input_dim = state_dim + action_dim
         for _ in range(hidden_layers):
-            modules.extend(
-                (VectorizedLinear(input_dim, hidden_dim, num_critics), nn.ReLU())
-            )
+            modules.append(VectorizedLinear(input_dim, hidden_dim, num_critics))
+            if layer_norm:
+                modules.append(EnsembleLayerNorm(hidden_dim, num_critics))
+            modules.append(nn.ReLU())
             input_dim = hidden_dim
         modules.append(VectorizedLinear(input_dim, 1, num_critics))
         self.net = nn.Sequential(*modules)

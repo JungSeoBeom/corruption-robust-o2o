@@ -8,10 +8,11 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Normal, kl_divergence
 
+from ..cql import importance_sampled_cql
 from ..config import ExperimentConfig
 from ..networks import DensityRatioNetwork, EnsembleQNetwork, TanhGaussianPolicy
 from ..replay import TensorBatch
-from .base import BaseAgent, soft_update
+from .base import BaseAgent, gradient_norm, soft_update
 
 
 class SACEnsembleAgent(BaseAgent):
@@ -34,6 +35,7 @@ class SACEnsembleAgent(BaseAgent):
             config.hidden_dim,
             max(config.hidden_layers, 3),
             max_action,
+            layer_norm=(self.variant == "wsrl" and config.wsrl_layer_norm),
         )
         self.critic = EnsembleQNetwork(
             state_dim,
@@ -41,6 +43,7 @@ class SACEnsembleAgent(BaseAgent):
             config.hidden_dim,
             max(config.hidden_layers, 3),
             config.sac_num_critics,
+            layer_norm=(self.variant == "wsrl" and config.wsrl_layer_norm),
         )
         self.target_critic = copy.deepcopy(self.critic).requires_grad_(False)
         self.critic2 = (
@@ -50,6 +53,7 @@ class SACEnsembleAgent(BaseAgent):
                 config.hidden_dim,
                 max(config.hidden_layers, 3),
                 config.sac_num_critics,
+                layer_norm=False,
             )
             if self.variant == "pessimistic_q_ensemble"
             else None
@@ -71,7 +75,7 @@ class SACEnsembleAgent(BaseAgent):
         self.last_priority_values: torch.Tensor | None = None
         self.to(device)
         self.actor_optimizer = torch.optim.Adam(
-            self.actor.parameters(), lr=config.learning_rate
+            self.actor.parameters(), lr=config.actor_learning_rate
         )
         critic_parameters = self.critic.parameters()
         if self.critic2 is not None:
@@ -79,10 +83,10 @@ class SACEnsembleAgent(BaseAgent):
                 critic_parameters, self.critic2.parameters()
             )
         self.critic_optimizer = torch.optim.Adam(
-            critic_parameters, lr=config.learning_rate
+            critic_parameters, lr=config.critic_learning_rate
         )
         self.alpha_optimizer = torch.optim.Adam(
-            [self.log_alpha], lr=config.entropy_lr
+            [self.log_alpha], lr=config.temperature_learning_rate
         )
         self.density_optimizer = (
             torch.optim.Adam(self.density_ratio.parameters(), lr=config.learning_rate)
@@ -111,6 +115,14 @@ class SACEnsembleAgent(BaseAgent):
             return values.mean(dim=0) - self.config.lcb_ratio * values.std(dim=0)
         return values.min(dim=0).values
 
+    def _sample_target_critic_indices(self, critic_count: int) -> torch.Tensor:
+        """Seeded through the learner torch RNG; sampling is with replacement."""
+        return torch.randint(
+            critic_count,
+            (self.config.wsrl_target_critic_subsample_size,),
+            device=self.device,
+        )
+
     def _critic_values_for_actions(
         self,
         critic: EnsembleQNetwork,
@@ -127,7 +139,38 @@ class SACEnsembleAgent(BaseAgent):
             critic.num_critics, batch_size, count
         )
 
-    def _cql_penalty(self, states: torch.Tensor, data_actions: torch.Tensor) -> torch.Tensor:
+    def _cql_penalty(
+        self,
+        states: torch.Tensor,
+        next_states: torch.Tensor,
+        data_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.config.algorithm_profile == "legacy_current":
+            return self._legacy_cql_penalty(states, data_actions)
+        critics = [self.critic]
+        if self.critic2 is not None:
+            critics.append(self.critic2)
+        result = importance_sampled_cql(
+            policy=self.actor,
+            evaluators=tuple(
+                lambda sample_states, sample_actions, critic=critic: self._critic_values_for_actions(
+                    critic, sample_states, sample_actions
+                )
+                for critic in critics
+            ),
+            states=states,
+            next_states=next_states,
+            data_actions=data_actions,
+            data_values=tuple(critic(states, data_actions) for critic in critics),
+            num_actions=self.config.cql_n_actions,
+            temperature=self.config.cql_temperature,
+        )
+        return result.loss
+
+    def _legacy_cql_penalty(
+        self, states: torch.Tensor, data_actions: torch.Tensor
+    ) -> torch.Tensor:
+        """Pre-profile repository objective, retained only for reproduction."""
         batch_size, action_dim = data_actions.shape
         count = self.config.cql_n_actions
         random_actions = torch.empty(
@@ -140,27 +183,24 @@ class SACEnsembleAgent(BaseAgent):
             policy_actions = self.actor.act(expanded_states).reshape(
                 batch_size, count, action_dim
             )
-        q_random = self._critic_values_for_actions(
-            self.critic, states, random_actions
-        )
-        q_policy = self._critic_values_for_actions(
-            self.critic, states, policy_actions
-        )
-        q_data = self.critic(states, data_actions)
-        ood = torch.logsumexp(torch.cat((q_random, q_policy), dim=-1), dim=-1)
-        penalty = (ood - q_data).mean()
+        critics = [self.critic]
         if self.critic2 is not None:
-            q2_random = self._critic_values_for_actions(
-                self.critic2, states, random_actions
+            critics.append(self.critic2)
+        penalty = states.new_zeros(())
+        for critic in critics:
+            q_random = self._critic_values_for_actions(
+                critic, states, random_actions
             )
-            q2_policy = self._critic_values_for_actions(
-                self.critic2, states, policy_actions
+            q_policy = self._critic_values_for_actions(
+                critic, states, policy_actions
             )
-            q2_data = self.critic2(states, data_actions)
-            q2_ood = torch.logsumexp(
-                torch.cat((q2_random, q2_policy), dim=-1), dim=-1
-            )
-            penalty = penalty + (q2_ood - q2_data).mean()
+            q_data = critic(states, data_actions)
+            penalty = penalty + (
+                torch.logsumexp(
+                    torch.cat((q_random, q_policy), dim=-1), dim=-1
+                )
+                - q_data
+            ).mean()
         return penalty
 
     def _density_loss(
@@ -285,6 +325,8 @@ class SACEnsembleAgent(BaseAgent):
         density_offline_batch: TensorBatch | None = None,
         density_online_batch: TensorBatch | None = None,
         rl_batch_prioritized: bool = False,
+        update_actor_temperature: bool = True,
+        update_critic: bool = True,
     ) -> Dict[str, float]:
         if rl_batch is not None:
             if batch is not None:
@@ -305,9 +347,10 @@ class SACEnsembleAgent(BaseAgent):
         alpha_loss = -(
             self.log_alpha * (log_prob + float(-self.actor.action_dim)).detach()
         ).mean()
-        self.alpha_optimizer.zero_grad(set_to_none=True)
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
+        if update_actor_temperature:
+            self.alpha_optimizer.zero_grad(set_to_none=True)
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
 
         policy_values = self.critic(states, sampled_actions)
         if self.critic2 is not None:
@@ -322,19 +365,92 @@ class SACEnsembleAgent(BaseAgent):
         if self.variant == "ro2o" and not self.online_phase:
             policy_smoothness = self._ro2o_policy_smoothness(states)
             actor_loss = actor_loss + policy_smoothness
-        self.actor_optimizer.zero_grad(set_to_none=True)
-        actor_loss.backward()
-        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.actor.parameters(), float("inf")
-        )
-        self.actor_optimizer.step()
+        actor_grad_norm = states.new_zeros(())
+        actor_grad_norm_after = states.new_zeros(())
+        if update_actor_temperature:
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            actor_loss.backward()
+            actor_grad_norm = (
+                gradient_norm(self.actor.parameters())
+                if self.config.max_grad_norm is None
+                else torch.nn.utils.clip_grad_norm_(
+                    self.actor.parameters(), self.config.max_grad_norm
+                )
+            )
+            actor_grad_norm_after = gradient_norm(self.actor.parameters())
+            self.actor_optimizer.step()
+
+        if not update_critic:
+            if not update_actor_temperature:
+                raise ValueError("an update must select critics and/or actor-temperature")
+            self.actor_updates += 1
+            self.temperature_updates += 1
+            return {
+                "actor_loss": float(actor_loss.item()),
+                "alpha_loss": float(alpha_loss.item()),
+                "alpha": float(self.alpha.item()),
+                "temperature_alpha": float(self.alpha.item()),
+                "entropy": float((-log_prob.detach()).mean().item()),
+                "actor_grad_norm": float(actor_grad_norm.item()),
+                "actor_grad_norm_before_clip": float(actor_grad_norm.item()),
+                "actor_grad_norm_after_clip": float(actor_grad_norm_after.item()),
+                "number_of_actor_updates": 1.0,
+                "number_of_critic_updates": 0.0,
+                "number_of_temperature_updates": 1.0,
+                "total_actor_updates": float(self.actor_updates),
+                "total_critic_updates": float(self.critic_updates),
+                "total_temperature_updates": float(self.temperature_updates),
+                "policy_lcb_value": float(policy_q.detach().mean().item()),
+                "policy_log_std_mean": float(policy_std.log().mean().item()),
+                "policy_log_std_min": float(policy_std.log().min().item()),
+                "policy_log_std_max": float(policy_std.log().max().item()),
+            }
 
         with torch.no_grad():
-            next_actions, next_log_prob, _, _ = self.actor(
-                next_states, need_log_prob=True
+            wsrl_max_backup = (
+                self.variant == "wsrl"
+                and not self.online_phase
+                and self.config.cql_max_target_backup
             )
-            next_q_all = self.target_critic(next_states, next_actions)
-            if self.variant == "uwmsg":
+            if wsrl_max_backup:
+                batch_size = len(next_states)
+                count = self.config.cql_n_actions
+                expanded_next_states = next_states[:, None, :].expand(
+                    -1, count, -1
+                ).reshape(batch_size * count, -1)
+                next_actions, next_log_prob, _, _ = self.actor(
+                    expanded_next_states, need_log_prob=True
+                )
+                next_actions = next_actions.reshape(batch_size, count, -1)
+                next_log_prob = next_log_prob.reshape(batch_size, count)
+                next_q_candidates = self._critic_values_for_actions(
+                    self.target_critic, next_states, next_actions
+                )
+                indices = self._sample_target_critic_indices(
+                    next_q_candidates.shape[0]
+                )
+                clipped_candidates = next_q_candidates.index_select(
+                    0, indices
+                ).min(dim=0).values
+                best = clipped_candidates.argmax(dim=1, keepdim=True)
+                next_q = clipped_candidates.gather(1, best).squeeze(1)
+                selected_log_prob = next_log_prob.gather(1, best).squeeze(1)
+                if self.config.backup_entropy:
+                    next_q = next_q - self.alpha.detach() * selected_log_prob
+                target_scalar = rewards + (
+                    1.0 - terminals
+                ) * self.config.discount * next_q
+                target = target_scalar.unsqueeze(0).expand(
+                    self.critic.num_critics, -1
+                )
+            else:
+                next_actions, next_log_prob, _, _ = self.actor(
+                    next_states, need_log_prob=True
+                )
+                next_q_all = self.target_critic(next_states, next_actions)
+            if wsrl_max_backup:
+                pass
+            elif self.variant == "uwmsg":
                 target = rewards.unsqueeze(0) + (
                     (1.0 - terminals) * self.config.discount
                 ).unsqueeze(0) * (
@@ -349,7 +465,15 @@ class SACEnsembleAgent(BaseAgent):
                     next_q_all - self.alpha.detach() * next_log_prob.unsqueeze(0)
                 )
             else:
-                next_q = next_q_all.min(dim=0).values
+                target_values = next_q_all
+                if self.variant == "wsrl":
+                    # Official WSRL uses randint: REDQ heads are sampled with
+                    # replacement, so duplicate indices are intentionally valid.
+                    indices = self._sample_target_critic_indices(
+                        next_q_all.shape[0]
+                    )
+                    target_values = next_q_all.index_select(0, indices)
+                next_q = target_values.min(dim=0).values
                 next_q = next_q - self.alpha.detach() * next_log_prob
                 target_scalar = rewards + (
                     1.0 - terminals
@@ -381,7 +505,9 @@ class SACEnsembleAgent(BaseAgent):
 
         cql_penalty = states.new_tensor(0.0)
         if self.variant in ("wsrl", "pessimistic_q_ensemble") and not self.online_phase:
-            cql_penalty = self.config.cql_alpha * self._cql_penalty(states, actions)
+            cql_penalty = self.config.cql_alpha * self._cql_penalty(
+                states, next_states, actions
+            )
             critic_loss = critic_loss + cql_penalty
 
         q_smoothness = states.new_tensor(0.0)
@@ -391,31 +517,43 @@ class SACEnsembleAgent(BaseAgent):
             ood_penalty = self._ro2o_ood_penalty(states)
             critic_loss = critic_loss + q_smoothness + ood_penalty
 
-        self.critic_optimizer.zero_grad(set_to_none=True)
-        critic_loss.backward()
         critic_parameters = list(self.critic.parameters())
         if self.critic2 is not None:
             critic_parameters += list(self.critic2.parameters())
-        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-            critic_parameters, float("inf")
-        )
-        self.critic_optimizer.step()
-        soft_update(
-            self.target_critic, self.critic, self.config.target_update_rate
-        )
-        if self.target_critic2 is not None and self.critic2 is not None:
-            soft_update(
-                self.target_critic2,
-                self.critic2,
-                self.config.target_update_rate,
+        critic_grad_norm = states.new_zeros(())
+        critic_grad_norm_after = states.new_zeros(())
+        if update_critic:
+            self.critic_optimizer.zero_grad(set_to_none=True)
+            critic_loss.backward()
+            critic_grad_norm = (
+                gradient_norm(critic_parameters)
+                if self.config.max_grad_norm is None
+                else torch.nn.utils.clip_grad_norm_(
+                    critic_parameters, self.config.max_grad_norm
+                )
             )
+            critic_grad_norm_after = gradient_norm(critic_parameters)
+            self.critic_optimizer.step()
+            soft_update(
+                self.target_critic, self.critic, self.config.target_update_rate
+            )
+            if self.target_critic2 is not None and self.critic2 is not None:
+                soft_update(
+                    self.target_critic2,
+                    self.critic2,
+                    self.config.target_update_rate,
+                )
 
         density_value = states.new_tensor(0.0)
         density_batches_available = (
             density_offline_batch is not None
             and density_online_batch is not None
         )
-        if self.density_optimizer is not None and density_batches_available:
+        if (
+            update_critic
+            and self.density_optimizer is not None
+            and density_batches_available
+        ):
             density_value = self._density_loss(
                 density_offline_batch, density_online_batch
             )
@@ -445,7 +583,12 @@ class SACEnsembleAgent(BaseAgent):
             else 0
         )
 
-        self.total_updates += 1
+        if update_critic:
+            self.total_updates += 1
+            self.critic_updates += 1
+        if update_actor_temperature:
+            self.actor_updates += 1
+            self.temperature_updates += 1
         ensemble_mean_per_sample = predicted.detach().mean(dim=0)
         ensemble_std_per_sample = predicted.detach().std(dim=0, unbiased=False)
         lcb_penalty = (
@@ -480,8 +623,18 @@ class SACEnsembleAgent(BaseAgent):
             "entropy": float((-log_prob.detach()).mean().item()),
             "gradient_norm_actor": float(actor_grad_norm.item()),
             "gradient_norm_critic": float(critic_grad_norm.item()),
-            "number_of_actor_updates": 1.0,
-            "number_of_critic_updates": 1.0,
+            "actor_grad_norm": float(actor_grad_norm.item()),
+            "critic_grad_norm": float(critic_grad_norm.item()),
+            "actor_grad_norm_before_clip": float(actor_grad_norm.item()),
+            "actor_grad_norm_after_clip": float(actor_grad_norm_after.item()),
+            "critic_grad_norm_before_clip": float(critic_grad_norm.item()),
+            "critic_grad_norm_after_clip": float(critic_grad_norm_after.item()),
+            "number_of_actor_updates": float(update_actor_temperature),
+            "number_of_critic_updates": float(update_critic),
+            "number_of_temperature_updates": float(update_actor_temperature),
+            "total_actor_updates": float(self.actor_updates),
+            "total_critic_updates": float(self.critic_updates),
+            "total_temperature_updates": float(self.temperature_updates),
             "ensemble_q_mean": float(predicted.detach().mean().item()),
             "ensemble_q_std": float(predicted.detach().std(unbiased=False).item()),
             "lcb_penalty_mean": float(lcb_penalty.mean().item()),

@@ -3,14 +3,14 @@ from __future__ import annotations
 import copy
 from typing import Dict, Tuple
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
+from ..cql import importance_sampled_cql
 from ..config import ExperimentConfig
 from ..networks import QNetwork, TanhGaussianPolicy
 from ..replay import TensorBatch
-from .base import BaseAgent, soft_update
+from .base import BaseAgent, gradient_norm, soft_update
 
 
 def calql_td_target(
@@ -26,6 +26,20 @@ def calql_td_target(
     if backup_entropy:
         backed_up = backed_up - alpha.detach() * next_log_prob
     return rewards + (1.0 - terminals) * discount * backed_up
+
+
+def calql_max_target_backup(
+    q1_candidates: torch.Tensor,
+    q2_candidates: torch.Tensor,
+    log_prob_candidates: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Select the action maximizing the clipped-double-Q target."""
+    candidates = torch.minimum(q1_candidates, q2_candidates)
+    best = candidates.argmax(dim=1, keepdim=True)
+    return (
+        candidates.gather(1, best).squeeze(1),
+        log_prob_candidates.gather(1, best).squeeze(1),
+    )
 
 
 class CalQLAgent(BaseAgent):
@@ -59,16 +73,16 @@ class CalQLAgent(BaseAgent):
         self.log_alpha = torch.nn.Parameter(torch.zeros(1))
         self.to(device)
         self.actor_optimizer = torch.optim.Adam(
-            self.actor.parameters(), lr=config.learning_rate
+            self.actor.parameters(), lr=config.actor_learning_rate
         )
         self.q1_optimizer = torch.optim.Adam(
-            self.q1.parameters(), lr=config.learning_rate
+            self.q1.parameters(), lr=config.critic_learning_rate
         )
         self.q2_optimizer = torch.optim.Adam(
-            self.q2.parameters(), lr=config.learning_rate
+            self.q2.parameters(), lr=config.critic_learning_rate
         )
         self.alpha_optimizer = torch.optim.Adam(
-            [self.log_alpha], lr=config.entropy_lr
+            [self.log_alpha], lr=config.temperature_learning_rate
         )
 
     @property
@@ -110,66 +124,31 @@ class CalQLAgent(BaseAgent):
         q1_data: torch.Tensor,
         q2_data: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        batch_size, action_dim = actions.shape
-        count = self.config.cql_n_actions
-        random_actions = torch.empty(
-            batch_size, count, action_dim, device=self.device
-        ).uniform_(-self.actor.max_action, self.actor.max_action)
-        current_actions, current_log_prob = self._sample_many(states, count)
-        next_actions, next_log_prob = self._sample_many(next_states, count)
-
-        q1_random = self.q1(states, random_actions)
-        q2_random = self.q2(states, random_actions)
-        q1_current = self.q1(states, current_actions.detach())
-        q2_current = self.q2(states, current_actions.detach())
-        # Cal-QL evaluates next-policy actions at the current state.
-        q1_next = self.q1(states, next_actions.detach())
-        q2_next = self.q2(states, next_actions.detach())
-
-        lower_bound = mc_returns.reshape(-1, 1).expand(-1, count)
-        valid = mc_valid.reshape(-1, 1).bool().expand(-1, count)
-        if valid.any():
-            bound_rate = 0.25 * (
-                (q1_current[valid] < lower_bound[valid]).float().mean()
-                + (q2_current[valid] < lower_bound[valid]).float().mean()
-                + (q1_next[valid] < lower_bound[valid]).float().mean()
-                + (q2_next[valid] < lower_bound[valid]).float().mean()
-            )
-        else:
-            bound_rate = states.new_tensor(0.0)
-        if not self.online_phase:
-            q1_current = torch.where(valid, torch.maximum(q1_current, lower_bound), q1_current)
-            q2_current = torch.where(valid, torch.maximum(q2_current, lower_bound), q2_current)
-            q1_next = torch.where(valid, torch.maximum(q1_next, lower_bound), q1_next)
-            q2_next = torch.where(valid, torch.maximum(q2_next, lower_bound), q2_next)
-
-        random_density = np.log((0.5 / self.actor.max_action) ** action_dim)
-        cat_q1 = torch.cat(
-            (
-                q1_random - random_density,
-                q1_next - next_log_prob.detach(),
-                q1_current - current_log_prob.detach(),
-            ),
-            dim=1,
+        calibrate = (
+            not self.online_phase
+            and self.config.calibration_mask_mode != "disabled"
         )
-        cat_q2 = torch.cat(
-            (
-                q2_random - random_density,
-                q2_next - next_log_prob.detach(),
-                q2_current - current_log_prob.detach(),
-            ),
-            dim=1,
+        result = importance_sampled_cql(
+            policy=self.actor,
+            evaluators=(self.q1, self.q2),
+            states=states,
+            next_states=next_states,
+            data_actions=actions,
+            data_values=(q1_data, q2_data),
+            num_actions=self.config.cql_n_actions,
+            temperature=self.config.cql_temperature,
+            calibration_lower_bound=mc_returns if calibrate else None,
+            calibration_valid=mc_valid if calibrate else None,
         )
-        cql_q1 = torch.logsumexp(cat_q1, dim=1) - q1_data
-        cql_q2 = torch.logsumexp(cat_q2, dim=1) - q2_data
+        cql_q1, cql_q2 = result.differences
         weight = (
             self.config.cql_alpha_online
             if self.online_phase
             else self.config.cql_alpha
         )
-        loss = weight * (cql_q1.mean() + cql_q2.mean())
+        loss = weight * result.loss
         return loss, {
-            "calibration_bound_rate": float(bound_rate.item()),
+            "calibration_bound_rate": float(result.calibration_bound_rate.item()),
             "cql_q1_diff": float(cql_q1.mean().item()),
             "cql_q2_diff": float(cql_q2.mean().item()),
             "mc_calibration_valid_fraction": float(mc_valid.float().mean().item()),
@@ -182,9 +161,15 @@ class CalQLAgent(BaseAgent):
         next_states = batch["next_observations"]
         terminals = batch["terminals"].reshape(-1)
         mc_returns = batch.get("mc_returns", torch.zeros_like(rewards)).reshape(-1)
-        mc_valid = batch.get(
+        oracle_valid = batch.get(
             "mc_calibration_valid", torch.ones_like(rewards)
         ).reshape(-1)
+        if self.config.calibration_mask_mode == "all":
+            mc_valid = torch.ones_like(oracle_valid)
+        elif self.config.calibration_mask_mode == "oracle_exclude_corrupted":
+            mc_valid = oracle_valid
+        else:
+            mc_valid = torch.zeros_like(oracle_valid)
 
         new_actions, log_prob, _, policy_std = self.actor(
             states, need_log_prob=True
@@ -196,7 +181,10 @@ class CalQLAgent(BaseAgent):
         alpha_loss.backward()
         self.alpha_optimizer.step()
 
-        if not self.online_phase and self.total_updates <= self.config.bc_steps:
+        if (
+            not self.online_phase
+            and self.total_updates < self.config.calql_bc_warmup_steps
+        ):
             actor_loss = (
                 self.alpha.detach() * log_prob
                 - self.actor.log_prob(states, actions)
@@ -208,19 +196,34 @@ class CalQLAgent(BaseAgent):
             actor_loss = (self.alpha.detach() * log_prob - q_new).mean()
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
-        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.actor.parameters(), float("inf")
+        actor_grad_norm = (
+            gradient_norm(self.actor.parameters())
+            if self.config.max_grad_norm is None
+            else torch.nn.utils.clip_grad_norm_(
+                self.actor.parameters(), self.config.max_grad_norm
+            )
         )
+        actor_grad_norm_after = gradient_norm(self.actor.parameters())
         self.actor_optimizer.step()
 
         with torch.no_grad():
-            next_actions, next_log_prob, _, _ = self.actor(
-                next_states, need_log_prob=True
-            )
-            next_q = torch.minimum(
-                self.target_q1(next_states, next_actions),
-                self.target_q2(next_states, next_actions),
-            )
+            if self.config.cql_max_target_backup:
+                next_actions, next_log_probs = self._sample_many(
+                    next_states, self.config.cql_n_actions
+                )
+                next_q, next_log_prob = calql_max_target_backup(
+                    self.target_q1(next_states, next_actions),
+                    self.target_q2(next_states, next_actions),
+                    next_log_probs,
+                )
+            else:
+                next_actions, next_log_prob, _, _ = self.actor(
+                    next_states, need_log_prob=True
+                )
+                next_q = torch.minimum(
+                    self.target_q1(next_states, next_actions),
+                    self.target_q2(next_states, next_actions),
+                )
             td_target = calql_td_target(
                 rewards,
                 terminals,
@@ -246,8 +249,16 @@ class CalQLAgent(BaseAgent):
         self.q1_optimizer.zero_grad(set_to_none=True)
         self.q2_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
-        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-            list(self.q1.parameters()) + list(self.q2.parameters()), float("inf")
+        critic_parameters = list(self.q1.parameters()) + list(self.q2.parameters())
+        critic_grad_norm = (
+            gradient_norm(critic_parameters)
+            if self.config.max_grad_norm is None
+            else torch.nn.utils.clip_grad_norm_(
+                critic_parameters, self.config.max_grad_norm
+            )
+        )
+        critic_grad_norm_after = gradient_norm(
+            critic_parameters
         )
         self.q1_optimizer.step()
         self.q2_optimizer.step()
@@ -258,6 +269,9 @@ class CalQLAgent(BaseAgent):
             self.target_q2, self.q2, self.config.target_update_rate
         )
         self.total_updates += 1
+        self.actor_updates += 1
+        self.critic_updates += 1
+        self.temperature_updates += 1
         return {
             "critic_loss": float(critic_loss.item()),
             "td_loss": float(td_loss.item()),
@@ -274,8 +288,21 @@ class CalQLAgent(BaseAgent):
             "entropy": float((-log_prob.detach()).mean().item()),
             "gradient_norm_actor": float(actor_grad_norm.item()),
             "gradient_norm_critic": float(critic_grad_norm.item()),
+            "actor_grad_norm": float(actor_grad_norm.item()),
+            "critic_grad_norm": float(critic_grad_norm.item()),
+            "actor_grad_norm_before_clip": float(actor_grad_norm.item()),
+            "actor_grad_norm_after_clip": float(actor_grad_norm_after.item()),
+            "critic_grad_norm_before_clip": float(critic_grad_norm.item()),
+            "critic_grad_norm_after_clip": float(critic_grad_norm_after.item()),
+            "actor_update_mode_bc_warmup": float(
+                not self.online_phase
+                and self.total_updates <= self.config.calql_bc_warmup_steps
+            ),
             "number_of_actor_updates": 1.0,
             "number_of_critic_updates": 1.0,
+            "total_actor_updates": float(self.actor_updates),
+            "total_critic_updates": float(self.critic_updates),
+            "total_temperature_updates": float(self.temperature_updates),
             "policy_log_std_mean": float(policy_std.log().mean().item()),
             "policy_log_std_min": float(policy_std.log().min().item()),
             "policy_log_std_max": float(policy_std.log().max().item()),
