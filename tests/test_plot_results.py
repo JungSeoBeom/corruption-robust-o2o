@@ -7,11 +7,18 @@ import unittest
 from pathlib import Path
 
 from plot_results import (
+    load_runs,
     plot_aggregate,
     update_comparison_plots,
+    update_live_comparison_plots,
     write_final_score_summary,
+    write_reproduction_summaries,
 )
+from robust_o2o.config import ExperimentConfig
+from robust_o2o.fidelity import canonical_json_sha256
 from robust_o2o.logging_utils import METRIC_FIELDS
+from robust_o2o.manifest import build_experiment_manifest
+from robust_o2o.reporting import ReportingValidationError
 
 
 class AggregateResultsTest(unittest.TestCase):
@@ -22,6 +29,7 @@ class AggregateResultsTest(unittest.TestCase):
         seed: int,
         final_score: float,
         elapsed: float,
+        phase: str = "online",
     ) -> None:
         run_dir = root / algorithm / f"seed_{seed}"
         run_dir.mkdir(parents=True)
@@ -47,7 +55,7 @@ class AggregateResultsTest(unittest.TestCase):
             for step, score in ((100, final_score - 1.0), (200, final_score)):
                 writer.writerow(
                     {
-                        "phase": "online",
+                        "phase": phase,
                         "step": step,
                         "env_steps": step,
                         "updates": step,
@@ -57,6 +65,54 @@ class AggregateResultsTest(unittest.TestCase):
                         "normalized_return_std": 0.5,
                     }
                 )
+
+    def _make_manifested_run(self, root: Path) -> Path:
+        self._make_run(root, "rpex", 0, 80.0, 12.0)
+        run_dir = root / "rpex" / "seed_0"
+        config = ExperimentConfig(
+            "rpex",
+            "hopper-medium-replay-v2",
+            corruption="random",
+            corruption_target="observations",
+            implementation_profile="official_code_reference",
+            offline_steps=40_000,
+            online_steps=40_000,
+            eval_period=10_000,
+        ).to_dict()
+        config.update(
+            dataset_id="hopper-medium-replay-v2",
+            evaluation_env_id="hopper-medium-replay-v2",
+            online_env_id="hopper-medium-replay-v2",
+            environment_protocol="rpex_d4rl_v2_legacy",
+            environment_max_episode_steps=1_000,
+            dataset_sha256="dataset",
+            normalizer_sha256="normalizer",
+            score_semantics="d4rl_normalized_return",
+        )
+        (run_dir / "config.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+        launch = build_experiment_manifest(config)
+        (run_dir / "experiment_manifest.json").write_text(
+            json.dumps(launch), encoding="utf-8"
+        )
+        completion = {
+            **launch,
+            "launch_manifest_sha256": launch["manifest_sha256"],
+            "requested_online_steps": 40_000,
+            "actual_online_steps": 40_001,
+            "episode_boundary_overshoot": 1,
+            "online_budget_semantics": (
+                "rpex_official_episode_boundary_strict_greater_than"
+            ),
+        }
+        completion["completion_manifest_sha256"] = canonical_json_sha256(
+            completion
+        )
+        (run_dir / "completed_experiment_manifest.json").write_text(
+            json.dumps(completion), encoding="utf-8"
+        )
+        return run_dir
 
     def test_plot_and_final_score_csv_cover_all_algorithms(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -83,6 +139,10 @@ class AggregateResultsTest(unittest.TestCase):
                 rows = list(csv.DictReader(stream))
             self.assertEqual([row["algorithm"] for row in rows], ["rpex", "uwmsg"])
             self.assertEqual(float(rows[0]["elapsed_seconds_mean"]), 12.0)
+            self.assertEqual(
+                rows[0]["aggregation_rule"],
+                "common_mean_last_3_online_evaluations_per_seed_then_population_mean_std__partial_2_of_3",
+            )
 
     def test_three_comparison_plots_are_written(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -98,6 +158,122 @@ class AggregateResultsTest(unittest.TestCase):
             for output in outputs.values():
                 self.assertTrue(output.exists())
                 self.assertTrue(output.with_suffix(".csv").exists())
+
+    def test_live_refresh_never_publishes_canonical_plot_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            comparison_dir = Path(directory)
+            self._make_run(comparison_dir / "runs", "rpex", 0, 80.0, 12.0)
+            outputs = update_live_comparison_plots(
+                comparison_dir,
+                "hopper-medium-replay-v2",
+                "random",
+                "mixed",
+            )
+            for output in outputs.values():
+                self.assertTrue(output.name.startswith("diagnostic_running_"))
+                self.assertTrue(output.exists())
+            self.assertFalse((comparison_dir / "comparison_online.png").exists())
+
+    def test_verified_completion_is_source_for_actual_online_steps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._make_manifested_run(root)
+            frame = load_runs(root)
+            self.assertEqual(set(frame["actual_online_steps"]), {40_001})
+
+    def test_manifest_config_and_online_outcome_mismatches_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = self._make_manifested_run(root)
+            config = json.loads((run_dir / "config.json").read_text())
+            config["seed"] = 9
+            (run_dir / "config.json").write_text(json.dumps(config))
+            with self.assertRaisesRegex(RuntimeError, "config/manifest"):
+                load_runs(root)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = self._make_manifested_run(root)
+            (run_dir / "online_corruption_manifest.json").write_text(
+                json.dumps({"actual_online_steps": 40_002})
+            )
+            with self.assertRaisesRegex(RuntimeError, "actual-step mismatch"):
+                load_runs(root)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = self._make_manifested_run(root)
+            completion_path = run_dir / "completed_experiment_manifest.json"
+            completion = json.loads(completion_path.read_text())
+            completion["publication_eligible"] = not bool(
+                completion["publication_eligible"]
+            )
+            completion.pop("completion_manifest_sha256")
+            completion["completion_manifest_sha256"] = canonical_json_sha256(
+                completion
+            )
+            completion_path.write_text(json.dumps(completion))
+            with self.assertRaisesRegex(RuntimeError, "immutable launch fields"):
+                load_runs(root)
+
+    def test_completed_current_run_requires_completion_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = self._make_manifested_run(root)
+            (run_dir / "completed_experiment_manifest.json").unlink()
+            with self.assertRaisesRegex(RuntimeError, "no verified completion"):
+                load_runs(root)
+
+    def test_offline_only_reproduction_summary_does_not_require_online_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._make_run(
+                root / "runs", "rpex", 0, 80.0, 12.0, phase="offline"
+            )
+            outputs = write_reproduction_summaries(
+                root / "runs",
+                root,
+                env_name="hopper-medium-replay-v2",
+                corruption="random",
+                target="mixed",
+                phase="offline",
+            )
+            with outputs["paper_reproduction_summary"].open(
+                newline="", encoding="utf-8"
+            ) as stream:
+                paper_rows = list(csv.DictReader(stream))
+            with outputs["common_benchmark_summary"].open(
+                newline="", encoding="utf-8"
+            ) as stream:
+                common_rows = list(csv.DictReader(stream))
+        self.assertEqual(paper_rows, [])
+        self.assertEqual(len(common_rows), 1)
+        self.assertIn("last_3_offline", common_rows[0]["aggregation_rule"])
+
+    def test_empty_reproduction_summary_is_allowed_only_non_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outputs = write_reproduction_summaries(
+                root / "missing-runs",
+                root,
+                env_name="hopper-medium-replay-v2",
+                corruption="clean",
+                target="none",
+                strict=False,
+            )
+            with outputs["common_benchmark_summary"].open(
+                newline="", encoding="utf-8"
+            ) as stream:
+                self.assertEqual(list(csv.DictReader(stream)), [])
+            with self.assertRaisesRegex(
+                ReportingValidationError, "no evaluation rows"
+            ):
+                write_reproduction_summaries(
+                    root / "missing-runs",
+                    root,
+                    strict=True,
+                    expected_seeds=[0],
+                )
 
 
 if __name__ == "__main__":

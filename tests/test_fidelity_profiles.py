@@ -80,17 +80,26 @@ class FidelityProfileTest(unittest.TestCase):
         calql = ExperimentConfig(
             "cal_ql",
             "hopper-medium-replay-v2",
-            suite_profile="primary_research_benchmark",
+            implementation_profile="locomotion_port",
         )
         self.assertEqual(calql.implementation_profile, "locomotion_port")
         self.assertEqual(calql.implementation_fidelity, "task_port")
+        with self.assertRaisesRegex(ValueError, "Cal-QL locomotion"):
+            ExperimentConfig(
+                "cal_ql",
+                "hopper-medium-replay-v2",
+                suite_profile="primary_research_benchmark",
+            )
         clean_rpex = ExperimentConfig(
             "rpex",
             "hopper-medium-replay-v2",
             suite_profile="primary_research_benchmark",
         )
         self.assertTrue(clean_rpex.riql_config_extension)
-        self.assertEqual(clean_rpex.implementation_fidelity, "task_port")
+        self.assertEqual(
+            clean_rpex.implementation_fidelity, "source_aligned_port"
+        )
+        self.assertEqual(clean_rpex.condition_status, "benchmark_transfer")
         with self.assertRaisesRegex(ValueError, "shared_actor"):
             ExperimentConfig(
                 "pessimistic_q_ensemble",
@@ -226,10 +235,10 @@ class FidelityProfileTest(unittest.TestCase):
             corruption="adversarial",
             corruption_target="rewards",
             implementation_profile="official_code_reference",
-            corruption_seed=19,
+            seed=19,
         )
-        expected_rng = np.random.default_rng(19)
-        actual_rng = np.random.default_rng(19)
+        expected_rng = np.random.RandomState(19)
+        actual_rng = np.random.RandomState(19)
         expected = float(expected_rng.uniform(-1.0, 1.0))
         actual = corrupt_online_reward_value(7.5, config, actual_rng)
         self.assertEqual(actual, expected)
@@ -289,7 +298,7 @@ class FidelityProfileTest(unittest.TestCase):
             self.assertEqual(config.offline_steps, 2_000_001)
             self.assertEqual(config.online_steps, 1_000_001)
 
-    def test_riql_fixed_tensor_golden_and_align_iql_selection(self):
+    def test_riql_fixed_tensor_golden_and_official_awr_selection(self):
         q_ensemble = torch.tensor([[1.0, 4.0], [3.0, 2.0], [5.0, 0.0]])
         q_quantile = torch.quantile(q_ensemble, 0.25, dim=0)
         next_value = torch.tensor([0.5, 2.0])
@@ -324,7 +333,16 @@ class FidelityProfileTest(unittest.TestCase):
             corruption_target="observations",
             suite_profile="method_fidelity",
         )
-        self.assertEqual(observation_config.policy_extraction, "align_iql")
+        self.assertEqual(observation_config.policy_extraction, "awr")
+        with self.assertRaisesRegex(ValueError, "AWR policy extraction"):
+            ExperimentConfig(
+                "rpex",
+                "hopper-medium-replay-v2",
+                corruption="random",
+                corruption_target="observations",
+                implementation_profile="official_code_reference",
+                policy_extraction="align_iql",
+            )
 
         scheduler_config = ExperimentConfig(
             "riql_naive",
@@ -698,6 +716,22 @@ class FidelityProfileTest(unittest.TestCase):
                 f"manifest_{manifest['manifest_sha256'][:16]}",
                 logger.run_dir.parts,
             )
+            completion_path = logger.write_completion_manifest(
+                {
+                    "requested_online_steps": 500_000,
+                    "actual_online_steps": 500_417,
+                    "episode_boundary_overshoot": 417,
+                    "online_budget_semantics": (
+                        "rpex_official_episode_boundary_strict_greater_than"
+                    ),
+                }
+            )
+            completion = json.loads(completion_path.read_text(encoding="utf-8"))
+            self.assertEqual(completion["actual_online_steps"], 500_417)
+            self.assertEqual(
+                completion["launch_manifest_sha256"], manifest["manifest_sha256"]
+            )
+            self.assertIn("completion_manifest_sha256", completion)
             evaluation = {
                 "return_mean": 1.0,
                 "return_std": 0.0,
@@ -727,6 +761,25 @@ class FidelityProfileTest(unittest.TestCase):
                 normalizer_sha256="normalizer",
             )
             resumed_logger.write_config(resumed_resolved)
+            resumed_summary = json.loads(
+                (resumed_logger.run_dir / "summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(resumed_summary["status"], "running")
+            self.assertFalse(
+                (resumed_logger.run_dir / "completed_experiment_manifest.json").exists()
+            )
+            self.assertEqual(
+                len(
+                    list(
+                        resumed_logger.run_dir.glob(
+                            "completed_experiment_manifest.superseded_*.json"
+                        )
+                    )
+                ),
+                1,
+            )
             resumed_logger.log_evaluation("offline", 2, 0, 2, evaluation)
             with resumed_logger.metrics_path.open(
                 newline="", encoding="utf-8"
@@ -751,8 +804,14 @@ class FidelityProfileTest(unittest.TestCase):
             online_env_id="hopper-medium-replay-v2",
             dataset_sha256="abc",
             normalizer_sha256="def",
+            corruption_fixture_id="rpex_random_corruption_v1",
+            corruption_fixture_verified=True,
         )
         first = build_experiment_manifest(config)
+        self.assertEqual(
+            first["corruption_fixture_id"], "rpex_random_corruption_v1"
+        )
+        self.assertTrue(first["corruption_fixture_verified"])
         second = json.loads(json.dumps(first))
         second["learner_seed"] = 99
         second["manifest_sha256"] = canonical_json_sha256(
@@ -762,9 +821,32 @@ class FidelityProfileTest(unittest.TestCase):
         second["selected_transition_count"] = 17
         second["selected_transition_hash"] = "seed-specific-mask"
         second["corruption_value_hash"] = "seed-specific-values"
+        second["corruption_artifact_hash"] = "seed-specific-final-artifact"
+        second["actual_online_steps"] = 500_417
+        second["episode_boundary_overshoot"] = 417
+        second["normalizer_sha256"] = "seed-specific-normalizer"
+        second["launch_manifest_sha256"] = "seed-specific-launch"
+        second["completion_manifest_sha256"] = "seed-specific-completion"
         self.assertEqual(aggregation_signature(first), aggregation_signature(second))
         second["action_clipping"] = not second["action_clipping"]
         self.assertNotEqual(aggregation_signature(first), aggregation_signature(second))
+
+        changed_worktree = json.loads(json.dumps(first))
+        changed_worktree["repository_worktree_sha256"] = "different-dirty-tree"
+        self.assertNotEqual(
+            aggregation_signature(first), aggregation_signature(changed_worktree)
+        )
+
+        for key, value in (
+            ("replay_size", 123),
+            ("max_grad_norm", 9.0),
+            ("policy_extraction", "align_iql"),
+        ):
+            changed = json.loads(json.dumps(first))
+            changed["resolved_hyperparameters"][key] = value
+            self.assertNotEqual(
+                aggregation_signature(first), aggregation_signature(changed), key
+            )
 
         for key, value in (
             ("online_corruption_scale_profile", "rpex_official_code"),

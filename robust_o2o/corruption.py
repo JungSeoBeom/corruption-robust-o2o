@@ -24,7 +24,7 @@ from .environment import Dataset
 from .networks import VectorizedLinear
 
 
-ATTACK_IMPLEMENTATION_VERSION = "corruption_v5_profiled_scale_reward_sha_audit"
+ATTACK_IMPLEMENTATION_VERSION = "corruption_v6_rpex_legacy_rng_and_split_semantics"
 ATTACK_OBJECTIVE = "minimize_edac_ensemble_mean_q"
 
 
@@ -86,15 +86,20 @@ class AttackOracle:
         device: torch.device,
         seed: int = 0,
         implementation_profile: str = "experimental_sign_pgd",
+        *,
+        record_trace: bool = False,
     ):
         if not checkpoint.exists():
             raise FileNotFoundError(f"Adversarial attack checkpoint not found: {checkpoint}")
         self.device = device
         self.checkpoint = checkpoint.resolve()
         self.implementation_profile = implementation_profile
-        generator_device = device if device.type in ("cpu", "cuda") else torch.device("cpu")
-        self.generator_device = generator_device
-        self.generator = torch.Generator(device=generator_device)
+        self.record_trace = record_trace
+        self.attack_traces: list[Dict[str, Any]] = []
+        # Pinned RPEX creates torch.Generator() without a device argument.  It
+        # therefore samples on CPU even when the oracle networks live on CUDA.
+        self.generator_device = torch.device("cpu")
+        self.generator = torch.Generator()
         self.generator.manual_seed(int(seed))
         self.actor = EDACActor(state_dim, action_dim, max_action).to(device).eval()
         self.critic = EDACCritic(state_dim, action_dim).to(device).eval()
@@ -116,6 +121,8 @@ class AttackOracle:
         scale: float,
         steps: int,
         step_size: float,
+        *,
+        online: bool = False,
     ) -> np.ndarray:
         original_tensor = torch.as_tensor(original, dtype=torch.float32, device=self.device)
         observations_tensor = torch.as_tensor(
@@ -123,37 +130,85 @@ class AttackOracle:
         )
         actions_tensor = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
         std_tensor = torch.as_tensor(std, dtype=torch.float32, device=self.device)
+        if self.implementation_profile == "rpex_official_adam":
+            if self.record_trace and target == "dynamics" and online:
+                raise ValueError(
+                    "trajectory recording is unsupported for the stochastic "
+                    "online dynamics objective"
+                )
+            # Offline Attack.sample_para uses one persistent seeded CPU stream;
+            # online adversarial_attack creates a fresh, unseeded CPU generator
+            # on every call. Preserve that public-code quirk verbatim.
+            generator = torch.Generator() if online else self.generator
+            random_values = torch.rand(
+                original_tensor.shape,
+                generator=generator,
+                dtype=torch.float32,
+            ).to(self.device)
+            # Upstream includes std here and multiplies by std again while
+            # constructing the attacked input (and once more on return).
+            para = 2.0 * scale * std_tensor * (random_values - 0.5)
+            initial_para = para.detach().cpu().numpy().astype(np.float32)
+            first_post_objective: float | None = None
+            last_post_objective: float | None = None
+
+            def objective(current_para: torch.Tensor) -> torch.Tensor:
+                attacked = original_tensor + current_para * std_tensor
+                if target == "observations":
+                    return self.critic(attacked, actions_tensor).mean()
+                if target == "actions":
+                    return self.critic(observations_tensor, attacked).mean()
+                if target == "dynamics":
+                    attacked_actions = self.actor(
+                        attacked, deterministic=not online
+                    )
+                    return self.critic(attacked, attacked_actions).mean()
+                raise ValueError(f"Gradient attack is unsupported for {target}")
+
+            for _ in range(steps):
+                para = torch.nn.Parameter(para.clone(), requires_grad=True)
+                optimizer = torch.optim.Adam([para], lr=step_size * scale)
+                loss = objective(para)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+                para = para.clamp(-scale, scale).detach()
+                if self.record_trace:
+                    with torch.no_grad():
+                        post_objective = float(objective(para).item())
+                    if first_post_objective is None:
+                        first_post_objective = post_objective
+                    last_post_objective = post_objective
+            final_perturbation = para * std_tensor
+            attacked_input = original_tensor + final_perturbation
+            result = attacked_input.detach().cpu().numpy().astype(np.float32)
+            if self.record_trace:
+                self.attack_traces.append(
+                    {
+                        "target": target,
+                        "online": online,
+                        "initial_parameter": initial_para,
+                        "initial_effective_perturbation": (
+                            initial_para
+                            * std_tensor.detach().cpu().numpy().astype(np.float32)
+                        ).astype(np.float32),
+                        "first_step_objective": first_post_objective,
+                        "last_step_objective": last_post_objective,
+                        "final_perturbation": final_perturbation.detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32),
+                        "attacked_input": result.copy(),
+                    }
+                )
+            return result
+
         initial = torch.empty(
             original_tensor.shape,
             dtype=torch.float32,
             device=self.generator_device,
         )
         initial.uniform_(-scale, scale, generator=self.generator)
-        if self.implementation_profile == "rpex_official_adam":
-            # Upstream Attack.sample_para includes std here and optimize_para
-            # multiplies by std again when constructing the attacked input.
-            para = initial.to(self.device) * std_tensor
-            for _ in range(steps):
-                para = torch.nn.Parameter(para.detach().clone(), requires_grad=True)
-                optimizer = torch.optim.Adam([para], lr=step_size * scale)
-                attacked = original_tensor + para * std_tensor
-                if target == "observations":
-                    loss = self.critic(attacked, actions_tensor).mean()
-                elif target == "actions":
-                    loss = self.critic(observations_tensor, attacked).mean()
-                elif target == "dynamics":
-                    attacked_actions = self.actor(attacked, deterministic=True)
-                    loss = self.critic(attacked, attacked_actions).mean()
-                else:
-                    raise ValueError(f"Gradient attack is unsupported for {target}")
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
-                para = para.clamp(-scale, scale).detach()
-            return (original_tensor + para * std_tensor).detach().cpu().numpy().astype(
-                np.float32
-            )
-
         noise = initial.to(self.device) * std_tensor
         for _ in range(steps):
             noise.requires_grad_(True)
@@ -270,6 +325,42 @@ def dataset_fingerprint(dataset: Dataset) -> str:
     return digest.hexdigest()
 
 
+def make_numpy_corruption_rng(
+    config: ExperimentConfig,
+) -> np.random.RandomState | np.random.Generator:
+    """Construct the profile-specific NumPy stream without hidden offsets."""
+
+    if config.implementation_profile == "official_code_reference":
+        return np.random.RandomState(int(config.corruption_seed))
+    return np.random.default_rng(int(config.corruption_seed))
+
+
+def numpy_rng_state(
+    rng: np.random.RandomState | np.random.Generator,
+) -> Dict[str, Any]:
+    if isinstance(rng, np.random.RandomState):
+        return {"implementation": "numpy.random.RandomState", "state": rng.get_state()}
+    return {
+        "implementation": "numpy.random.Generator",
+        "state": rng.bit_generator.state,
+    }
+
+
+def restore_numpy_rng_state(
+    rng: np.random.RandomState | np.random.Generator,
+    payload: Dict[str, Any],
+) -> None:
+    implementation = payload.get("implementation")
+    if isinstance(rng, np.random.RandomState):
+        if implementation != "numpy.random.RandomState":
+            raise ValueError("checkpoint corruption RNG implementation mismatch")
+        rng.set_state(payload["state"])
+        return
+    if implementation != "numpy.random.Generator":
+        raise ValueError("checkpoint corruption RNG implementation mismatch")
+    rng.bit_generator.state = payload["state"]
+
+
 def corruption_cache_fingerprint(
     dataset: Dataset,
     config: ExperimentConfig,
@@ -284,7 +375,11 @@ def corruption_cache_fingerprint(
     )
     if config.state_normalization == "standard":
         location = states.mean(axis=0)
-        scale_values = np.maximum(states.std(axis=0), 1e-3)
+        scale_values = (
+            states.std(axis=0) + np.float32(1e-3)
+            if config.implementation_profile == "official_code_reference"
+            else np.maximum(states.std(axis=0), 1e-3)
+        )
     elif config.state_normalization == "robust_median_mad":
         location = np.median(states, axis=0)
         scale_values = np.maximum(
@@ -305,6 +400,11 @@ def corruption_cache_fingerprint(
         "offline_corruption_rate": config.offline_corruption_rate,
         "seed": config.corruption_seed,
         "attack_seed": config.corruption_seed,
+        "rng_implementation": (
+            "numpy.random.RandomState"
+            if config.implementation_profile == "official_code_reference"
+            else "numpy.random.Generator(PCG64)"
+        ),
         "offline_attack_steps": config.offline_attack_steps,
         "online_attack_steps": config.online_attack_steps,
         "attack_step_size": config.attack_step_size,
@@ -372,7 +472,12 @@ def reward_corruption_metadata(
             "reward_corruption_high": None,
         }
     if config.corruption == "random":
-        bound = 30.0 * config.corruption_range
+        bound = 30.0 * (
+            1.0
+            if phase == "online"
+            and config.implementation_profile == "official_code_reference"
+            else config.corruption_range
+        )
         return {
             "reward_corruption_distribution": "uniform_replacement",
             "reward_corruption_low": -bound,
@@ -400,14 +505,14 @@ def reward_corruption_metadata(
 def corrupt_offline_reward_values(
     original: np.ndarray,
     config: ExperimentConfig,
-    rng: np.random.Generator,
+    rng: np.random.RandomState | np.random.Generator,
 ) -> np.ndarray:
     if config.corruption == "random":
         return (
-            rng.uniform(-1.0, 1.0, size=original.shape).astype(np.float32)
+            rng.uniform(-1.0, 1.0, size=original.shape)
             * 30.0
             * config.corruption_range
-        )
+        ).astype(np.float32)
     if config.offline_adversarial_reward_rule != "official_sign_flip":
         raise ValueError(
             "Unsupported offline adversarial reward rule: "
@@ -419,10 +524,17 @@ def corrupt_offline_reward_values(
 def corrupt_online_reward_value(
     reward: float,
     config: ExperimentConfig,
-    rng: np.random.Generator,
+    rng: np.random.RandomState | np.random.Generator,
 ) -> float:
     if config.corruption == "random":
-        return float(rng.uniform(-1.0, 1.0) * 30.0 * config.corruption_range)
+        # Pinned RPEX intentionally ignores epsilon in the online random
+        # reward branch, unlike its offline random reward corruption.
+        scale = (
+            1.0
+            if config.implementation_profile == "official_code_reference"
+            else config.corruption_range
+        )
+        return float(rng.uniform(-1.0, 1.0) * 30.0 * scale)
     if config.online_adversarial_reward_rule == "official_uniform_replacement":
         # felix-thu/RPEX attack.py::corrupt_trans online adversarial branch.
         return float(rng.uniform(-1.0, 1.0))
@@ -491,6 +603,12 @@ class OnlineCorruptionAudit:
             "online_corruption_rate": config.online_corruption_rate,
             "corruption_range": config.corruption_range,
             "corruption_seed": config.corruption_seed,
+            "rng_implementation": (
+                "numpy.random.RandomState"
+                if config.implementation_profile == "official_code_reference"
+                else "numpy.random.Generator(PCG64)"
+            ),
+            "upstream_source_commit": "35da71ee5151b6179d21b9a2b4ce1b6408aedd04",
             "attack_semantics": config.random_attack_semantics,
             "attack_timing": config.attack_timing,
             "online_corruption_scale_profile": config.online_corruption_scale_profile,
@@ -739,6 +857,7 @@ def _load_cached_corruption(
     stats["corruption_value_sha256"] = _corruption_value_sha256(
         result, target_indices
     )
+    stats["final_artifact_sha256"] = dataset_fingerprint(result)
     stats.update(_reward_diagnostics(dataset, result))
     return result, stats
 
@@ -796,7 +915,7 @@ def _corrupt_target_values(
     indices: np.ndarray,
     config: ExperimentConfig,
     oracle: Optional[AttackOracle],
-    rng: np.random.Generator,
+    rng: np.random.RandomState | np.random.Generator,
 ) -> np.ndarray:
     key = _target_dataset_key(target)
     original = dataset[key][indices].copy()
@@ -812,7 +931,7 @@ def _corrupt_target_values(
             -config.corruption_range,
             config.corruption_range,
             size=original.shape,
-        ).astype(np.float32)
+        )
         return (original + noise * std).astype(np.float32)
 
     if oracle is None:
@@ -820,9 +939,22 @@ def _corrupt_target_values(
     observations = dataset["observations"][indices]
     actions = dataset["actions"][indices]
     chunks = []
-    # Bound attack memory on CPU/MPS as well as CUDA.
-    for start in range(0, len(indices), 16_384):
-        stop = min(start + 16_384, len(indices))
+    if config.adversarial_attack_profile == "rpex_official_adam":
+        # attack.py::split_gradient_attack makes exactly ten sequential
+        # chunks: floor(M/10) for the first nine and all remainder in the last.
+        base = len(indices) // 10
+        bounds = []
+        pointer = 0
+        for split_index in range(10):
+            count = base if split_index < 9 else len(indices) - pointer
+            bounds.append((pointer, pointer + count))
+            pointer += count
+    else:
+        bounds = [
+            (start, min(start + 16_384, len(indices)))
+            for start in range(0, len(indices), 16_384)
+        ]
+    for start, stop in bounds:
         chunks.append(
             oracle.attack(
                 original[start:stop],
@@ -833,6 +965,7 @@ def _corrupt_target_values(
                 config.corruption_range,
                 config.offline_attack_steps,
                 config.attack_step_size,
+                online=False,
             )
         )
     return np.concatenate(chunks, axis=0) if chunks else original
@@ -865,6 +998,12 @@ def corrupt_offline_dataset(
             **reward_corruption_metadata(config, "offline"),
             "selected_transition_indices_sha256": hashlib.sha256(b"").hexdigest(),
             "corruption_value_sha256": hashlib.sha256(b"").hexdigest(),
+            "final_artifact_sha256": dataset_fingerprint(result),
+            "rng_implementation": (
+                "numpy.random.RandomState"
+                if config.implementation_profile == "official_code_reference"
+                else "numpy.random.Generator(PCG64)"
+            ),
         }
 
     cache_file, cache_key, cache_metadata = _cache_file(
@@ -895,7 +1034,7 @@ def _generate_and_cache_corruption(
     cache_metadata: Dict[str, Any],
 ) -> Tuple[Dataset, Dict[str, Any]]:
 
-    rng = np.random.default_rng(config.corruption_seed)
+    rng = make_numpy_corruption_rng(config)
     selected = rng.random(len(dataset["rewards"])) < config.offline_corruption_rate
     indices = np.flatnonzero(selected)
     result = {key: value.copy() for key, value in dataset.items()}
@@ -945,6 +1084,7 @@ def _generate_and_cache_corruption(
     stats["corruption_value_sha256"] = _corruption_value_sha256(
         result, target_indices
     )
+    stats["final_artifact_sha256"] = dataset_fingerprint(result)
     stats.update(_reward_diagnostics(dataset, result))
     return result, stats
 
@@ -956,7 +1096,7 @@ def corrupt_online_transition(
     raw_next_state: np.ndarray,
     config: ExperimentConfig,
     oracle: Optional[AttackOracle],
-    rng: np.random.Generator,
+    rng: np.random.RandomState | np.random.Generator,
     state_std: np.ndarray,
     action_std: np.ndarray,
     selected_target: Optional[str] = None,
@@ -964,17 +1104,25 @@ def corrupt_online_transition(
 ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]:
     if selected_target is None and not selection_already_sampled:
         selected_target = sample_online_corruption_target(config, rng)
-    if selected_target is None:
+    if selected_target is None and config.corruption == "clean":
         return raw_state, action, reward, raw_next_state, False
 
     state = raw_state.copy()
     stored_action = action.copy()
     stored_reward = float(reward)
     next_state = raw_next_state.copy()
-    target = selected_target
+    target = selected_target or (
+        config.corruption_target
+        if config.corruption_target in INDIVIDUAL_CORRUPTION_TARGETS
+        else None
+    )
+    if target is None:
+        return raw_state, action, reward, raw_next_state, False
     if target == "rewards":
-        stored_reward = corrupt_online_reward_value(reward, config, rng)
-        return state, stored_action, stored_reward, next_state, True
+        candidate_reward = corrupt_online_reward_value(reward, config, rng)
+        if selected_target is None:
+            return state, stored_action, stored_reward, next_state, False
+        return state, stored_action, candidate_reward, next_state, True
 
     original = {
         "observations": state,
@@ -991,6 +1139,8 @@ def corrupt_online_transition(
             size=original.shape,
         ) * std
     else:
+        if selected_target is None:
+            return state, stored_action, stored_reward, next_state, False
         if oracle is None:
             raise RuntimeError("An AttackOracle is required for adversarial corruption")
         attacked = oracle.attack(
@@ -1002,7 +1152,10 @@ def corrupt_online_transition(
             config.corruption_range,
             config.online_attack_steps,
             max(config.online_attack_step_size, config.attack_min_step_size),
+            online=True,
         )[0]
+    if selected_target is None:
+        return state, stored_action, stored_reward, next_state, False
     if target == "observations":
         state = attacked.astype(np.float32)
     elif target == "actions":
@@ -1013,7 +1166,8 @@ def corrupt_online_transition(
 
 
 def sample_online_corruption_target(
-    config: ExperimentConfig, rng: np.random.Generator
+    config: ExperimentConfig,
+    rng: np.random.RandomState | np.random.Generator,
 ) -> Optional[str]:
     if config.corruption == "clean" or rng.random() >= config.online_corruption_rate:
         return None
@@ -1055,7 +1209,7 @@ def corrupt_pre_action_value(
     action: Optional[np.ndarray],
     config: ExperimentConfig,
     oracle: Optional[AttackOracle],
-    rng: np.random.Generator,
+    rng: np.random.RandomState | np.random.Generator,
     state_std: np.ndarray,
     action_std: np.ndarray,
 ) -> np.ndarray:
@@ -1093,4 +1247,5 @@ def corrupt_pre_action_value(
         config.corruption_range,
         config.online_attack_steps,
         max(config.online_attack_step_size, config.attack_min_step_size),
+        online=True,
     )[0]

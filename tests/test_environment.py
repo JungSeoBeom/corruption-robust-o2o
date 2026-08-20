@@ -10,6 +10,8 @@ import numpy as np
 from robust_o2o.config import DEFAULT_PROTOCOL, LOCAL_PROTOCOL, ExperimentConfig
 from robust_o2o.environment import (
     EXPECTED_D4RL_COMMIT,
+    EXPECTED_MUJOCO_PY_VERSION,
+    EXPECTED_MUJOCO_RUNTIME_VERSION_CODE,
     RPEXProtocolError,
     _index_aware_qlearning_dataset,
     environment_metadata,
@@ -22,6 +24,7 @@ from robust_o2o.environment import (
     reset_env,
     step_env,
     validate_dataset,
+    verify_rpex_runtime,
 )
 
 
@@ -85,6 +88,67 @@ def small_raw_dataset() -> dict[str, np.ndarray]:
 
 
 class StrictRPEXEnvironmentTest(unittest.TestCase):
+    def test_strict_runtime_pins_binding_and_native_mujoco(self):
+        versions = {
+            "Python": "3.10.16",
+            "gym": "0.23.1",
+            "numpy": "1.23.5",
+            "mujoco-py": EXPECTED_MUJOCO_PY_VERSION,
+        }
+        identity = {
+            "mujoco_runtime_version_code": (
+                EXPECTED_MUJOCO_RUNTIME_VERSION_CODE
+            ),
+            "mujoco_runtime_error": None,
+        }
+        with (
+            patch(
+                "robust_o2o.environment.runtime_package_versions",
+                return_value=versions,
+            ),
+            patch(
+                "robust_o2o.environment.mujoco_runtime_identity",
+                return_value=identity,
+            ),
+            patch(
+                "robust_o2o.environment.installed_d4rl_commit",
+                return_value=EXPECTED_D4RL_COMMIT,
+            ),
+        ):
+            verify_rpex_runtime.cache_clear()
+            verify_rpex_runtime()
+        verify_rpex_runtime.cache_clear()
+
+    def test_strict_runtime_rejects_wrong_native_mujoco(self):
+        versions = {
+            "Python": "3.10.16",
+            "gym": "0.23.1",
+            "numpy": "1.23.5",
+            "mujoco-py": EXPECTED_MUJOCO_PY_VERSION,
+        }
+        identity = {
+            "mujoco_runtime_version_code": 200,
+            "mujoco_runtime_error": None,
+        }
+        with (
+            patch(
+                "robust_o2o.environment.runtime_package_versions",
+                return_value=versions,
+            ),
+            patch(
+                "robust_o2o.environment.mujoco_runtime_identity",
+                return_value=identity,
+            ),
+            patch(
+                "robust_o2o.environment.installed_d4rl_commit",
+                return_value=EXPECTED_D4RL_COMMIT,
+            ),
+            self.assertRaisesRegex(RPEXProtocolError, "runtime version code"),
+        ):
+            verify_rpex_runtime.cache_clear()
+            verify_rpex_runtime()
+        verify_rpex_runtime.cache_clear()
+
     def test_config_preserves_complete_d4rl_id(self):
         config = ExperimentConfig("rpex", "half-cheetah-medium-replay-v2")
         self.assertEqual(config.env_name, "halfcheetah-medium-replay-v2")
@@ -294,9 +358,23 @@ class StrictRPEXEnvironmentTest(unittest.TestCase):
             "rewards": np.zeros(4, dtype=np.float32),
             "terminals": np.zeros(4, dtype=np.float32),
         }
-        with patch(
-            "robust_o2o.environment.installed_d4rl_commit",
-            return_value=EXPECTED_D4RL_COMMIT,
+        with (
+            patch(
+                "robust_o2o.environment.installed_d4rl_commit",
+                return_value=EXPECTED_D4RL_COMMIT,
+            ),
+            patch(
+                "robust_o2o.environment.mujoco_runtime_identity",
+                return_value={
+                    "mujoco_py_version": EXPECTED_MUJOCO_PY_VERSION,
+                    "mujoco_runtime_version_code": (
+                        EXPECTED_MUJOCO_RUNTIME_VERSION_CODE
+                    ),
+                    "mujoco_runtime_version": "2.1.0",
+                    "mujoco_runtime_path": "/fixture/mujoco210",
+                    "mujoco_runtime_error": None,
+                },
+            ),
         ):
             metadata = environment_metadata(
                 env, "walker2d-medium-replay-v2", dataset, seed=42
@@ -305,7 +383,18 @@ class StrictRPEXEnvironmentTest(unittest.TestCase):
         self.assertEqual(metadata["d4rl_env_id"], "walker2d-medium-replay-v2")
         self.assertEqual(metadata["env_spec_id"], "walker2d-medium-replay-v2")
         self.assertEqual(metadata["expected_d4rl_commit"], EXPECTED_D4RL_COMMIT)
+        self.assertEqual(
+            metadata["mujoco_runtime_version_code"],
+            EXPECTED_MUJOCO_RUNTIME_VERSION_CODE,
+        )
+        self.assertEqual(
+            metadata["environment_fingerprint_payload"][
+                "mujoco_runtime_version_code"
+            ],
+            EXPECTED_MUJOCO_RUNTIME_VERSION_CODE,
+        )
         self.assertEqual(metadata["seed"], 42)
+        self.assertEqual(len(metadata["repository_worktree_sha256"]), 64)
         for package in ("Python", "numpy", "torch", "gym", "d4rl", "mujoco-py", "h5py"):
             self.assertIn(package, metadata["runtime_package_versions"])
 

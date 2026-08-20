@@ -4,12 +4,15 @@ import unittest
 
 from robust_o2o.config import DEFAULT_PROTOCOL
 from run_55_experiment import (
+    ADVERSARIAL_SETTINGS,
     ALGORITHMS,
     ENV_NAME,
     SETTINGS,
+    STRICT_ADVERSARIAL_SETTINGS,
     _validate_args,
     build_parser,
     commands,
+    settings_for_suite,
 )
 
 
@@ -79,17 +82,56 @@ class Run55ExperimentTest(unittest.TestCase):
         for command in generated:
             algorithms = command[command.index("--algorithms") + 1].split(",")
             self.assertNotIn("pessimistic_q_ensemble", algorithms)
-            self.assertEqual(len(algorithms), 4)
+            self.assertEqual(algorithms, ["rpex", "riql_naive"])
             self.assertEqual(
                 command[command.index("--online-corruption-scale-profile") + 1],
                 "rpex_official_code",
             )
+            self.assertNotIn("--offline-steps", command)
+            self.assertNotIn("--online-steps", command)
 
         invalid = parser.parse_args(
             ["--run-purpose", "final_benchmark", "--seeds", "0"]
         )
         with self.assertRaises(SystemExit):
             _validate_args(parser, invalid, ())
+
+    def test_adversarial_and_all_suites_are_explicit(self):
+        parser = build_parser()
+        adversarial = parser.parse_args(["--corruption-suite", "adversarial"])
+        commands_only = list(commands(adversarial, (), "adv_suite"))
+        self.assertEqual(len(commands_only), 4)
+        self.assertEqual(settings_for_suite("adversarial"), ADVERSARIAL_SETTINGS)
+        self.assertEqual(len(settings_for_suite("all")), 9)
+        self.assertEqual(
+            settings_for_suite("adversarial", strict=True),
+            STRICT_ADVERSARIAL_SETTINGS,
+        )
+        self.assertEqual(len(settings_for_suite("all", strict=True)), 6)
+        for command, (mode, target) in zip(commands_only, ADVERSARIAL_SETTINGS):
+            self.assertEqual(command[command.index("--corruption") + 1], mode)
+            self.assertEqual(
+                command[command.index("--corruption-target") + 1], target
+            )
+
+    def test_final_adversarial_suite_rejects_non_hopper_fixture_scope(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--env-name",
+                "halfcheetah-medium-replay-v2",
+                "--corruption-suite",
+                "adversarial",
+                "--suite-profile",
+                "primary_research_benchmark",
+                "--run-purpose",
+                "final_benchmark",
+                "--seeds",
+                "0,1,2,3,4",
+            ]
+        )
+        with self.assertRaises(SystemExit):
+            _validate_args(parser, args, ())
 
 
 if __name__ == "__main__":

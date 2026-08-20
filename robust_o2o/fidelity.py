@@ -13,9 +13,15 @@ IMPLEMENTATION_PROFILES = (
     "experimental_approximation",
 )
 IMPLEMENTATION_FIDELITIES = (
+    # Retained only so historical manifests remain readable. New runs may not
+    # select this label without an automated upstream parity certificate.
     "exact_upstream_port",
+    "source_aligned_port",
+    "framework_port_unverified",
+    "framework_port_verified",
     "paper_code_conflict",
     "task_port",
+    "diagnostic_extension",
     "approximation",
     "legacy_unknown",
 )
@@ -26,7 +32,7 @@ SUITE_PROFILES = (
     "method_fidelity",
     "common_budget_robustness",
 )
-RUN_PURPOSES = ("smoke", "diagnostic", "final_benchmark")
+RUN_PURPOSES = ("smoke", "diagnostic", "paper_reproduction", "final_benchmark")
 
 ONLINE_REPLAY_PROFILES = (
     "official_code_online_only",
@@ -79,10 +85,182 @@ ONLINE_ADVERSARIAL_REWARD_RULES = (
 
 UPSTREAM_COMMITS: Mapping[str, str] = {
     "rpex": "35da71ee5151b6179d21b9a2b4ce1b6408aedd04",
+    "riql_naive": "35da71ee5151b6179d21b9a2b4ce1b6408aedd04",
+    "riql_pex": "35da71ee5151b6179d21b9a2b4ce1b6408aedd04",
     "wsrl": "ad4dc1248a138bc15d6e053f2d1dba1b8cfbaca2",
     "cal_ql": "ac6eafec22e8d60836573e1f488c7f626ce8a77e",
     "pessimistic_q_ensemble": "6f298fa9ef040d725067d0f2775022bd2900d635",
 }
+
+
+@dataclass(frozen=True)
+class BaselineReproductionRecord:
+    paper_title: str
+    upstream_repository: str
+    upstream_commit: str
+    official_task_support: str
+    implementation_type: str
+    reproduction_status: str
+    parity_status: str
+    strict_final_eligible: bool
+    remaining_deviation: str
+
+
+# This registry is deliberately conservative.  A source-aligned handwritten
+# port is not promoted to "exact" merely because its formulas resemble the
+# public implementation.  The strict controller consumes this registry rather
+# than inferring eligibility from a user-facing profile name.
+BASELINE_REPRODUCTION_REGISTRY: Mapping[str, BaselineReproductionRecord] = {
+    "rpex": BaselineReproductionRecord(
+        paper_title=(
+            "RPEX: Robust Policy Expansion for Offline-to-Online RL under Diverse "
+            "Data Corruption"
+        ),
+        upstream_repository="https://github.com/felix-thu/RPEX",
+        upstream_commit=UPSTREAM_COMMITS["rpex"],
+        official_task_support="D4RL MuJoCo locomotion v2",
+        implementation_type="handwritten PyTorch source-aligned port",
+        reproduction_status="source_aligned_port",
+        parity_status="partial_formula_and_corruption_fixture_only",
+        strict_final_eligible=True,
+        remaining_deviation=(
+            "no end-to-end fixed-batch optimizer parity certificate for the "
+            "complete learner"
+        ),
+    ),
+    "riql_naive": BaselineReproductionRecord(
+        paper_title="Towards Robust Offline Reinforcement Learning under Diverse Data Corruption",
+        upstream_repository="https://github.com/felix-thu/RPEX",
+        upstream_commit=UPSTREAM_COMMITS["riql_naive"],
+        official_task_support="D4RL MuJoCo locomotion v2",
+        implementation_type="handwritten PyTorch source-aligned port",
+        reproduction_status="source_aligned_port",
+        parity_status="partial_formula_and_corruption_fixture_only",
+        strict_final_eligible=True,
+        remaining_deviation=(
+            "no end-to-end fixed-batch optimizer parity certificate for the "
+            "complete learner"
+        ),
+    ),
+    "wsrl": BaselineReproductionRecord(
+        paper_title="Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data",
+        upstream_repository="https://github.com/zhouzypaul/wsrl",
+        upstream_commit=UPSTREAM_COMMITS["wsrl"],
+        official_task_support="D4RL MuJoCo locomotion, AntMaze, Adroit, Kitchen",
+        implementation_type="JAX/Flax-to-PyTorch framework port",
+        reproduction_status="framework_port_unverified",
+        parity_status="fixed_batch_numerical_parity_missing",
+        strict_final_eligible=False,
+        remaining_deviation="optimizer-step parity against pinned JAX/Flax output is unverified",
+    ),
+    "cal_ql": BaselineReproductionRecord(
+        paper_title="Cal-QL: Calibrated Offline RL Pre-Training for Efficient Online Fine-Tuning",
+        upstream_repository="https://github.com/nakamotoo/Cal-QL",
+        upstream_commit=UPSTREAM_COMMITS["cal_ql"],
+        official_task_support="official release recipes: AntMaze and Adroit",
+        implementation_type="D4RL locomotion task port",
+        reproduction_status="task_port",
+        parity_status="unsupported_official_task",
+        strict_final_eligible=False,
+        remaining_deviation="Hopper/HalfCheetah/Walker2d recipes are absent upstream",
+    ),
+    "pessimistic_q_ensemble": BaselineReproductionRecord(
+        paper_title="Offline-to-Online Reinforcement Learning via Balanced Replay and Pessimistic Q-Ensemble",
+        upstream_repository="https://github.com/shlee94/Off2OnRL",
+        upstream_commit=UPSTREAM_COMMITS["pessimistic_q_ensemble"],
+        official_task_support="D4RL MuJoCo v0 recipes in the public release",
+        implementation_type="shared-actor approximation",
+        reproduction_status="approximation",
+        parity_status="official_independent_policy_ensemble_missing",
+        strict_final_eligible=False,
+        remaining_deviation="no N=5 independently pretrained actor/twin-critic ensemble",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class ReportingRule:
+    rule_id: str
+    phase: str
+    final_evaluations: int
+    evaluation_episodes: int
+    source: str
+    verified: bool
+
+
+REPORTING_RULES: Mapping[str, ReportingRule] = {
+    "rpex": ReportingRule(
+        "mean_last_3_online_evaluations_per_seed_then_population_mean_std",
+        "online",
+        3,
+        10,
+        "felix-thu/RPEX result protocol",
+        True,
+    ),
+    "riql_naive": ReportingRule(
+        "mean_last_3_online_evaluations_per_seed_then_population_mean_std",
+        "online",
+        3,
+        10,
+        "felix-thu/RPEX result protocol",
+        True,
+    ),
+    # These entries prevent accidental inheritance of the RPEX rule. They are
+    # explicitly unverified and therefore cannot produce a paper-reproduction
+    # summary until a pinned upstream reporting fixture is added.
+    "wsrl": ReportingRule(
+        "terminal_online_evaluation",
+        "online",
+        1,
+        20,
+        "zhouzypaul/wsrl finetune.py terminal evaluation",
+        True,
+    ),
+    "cal_ql": ReportingRule(
+        "upstream_reporting_unverified",
+        "online",
+        1,
+        10,
+        "nakamotoo/Cal-QL (locomotion unsupported)",
+        False,
+    ),
+    "pessimistic_q_ensemble": ReportingRule(
+        "upstream_reporting_unverified",
+        "online",
+        1,
+        10,
+        "shlee94/Off2OnRL (local implementation is an approximation)",
+        False,
+    ),
+}
+
+COMMON_BENCHMARK_REPORTING_RULE = ReportingRule(
+    "common_mean_last_3_online_evaluations_per_seed_then_population_mean_std",
+    "online",
+    3,
+    10,
+    "repository common cross-algorithm benchmark metric",
+    True,
+)
+
+STRICT_FINAL_TASKS = (
+    "hopper-medium-replay-v2",
+    "halfcheetah-medium-replay-v2",
+    "walker2d-medium-replay-v2",
+)
+STRICT_FINAL_SEEDS = (0, 1, 2, 3, 4)
+
+
+class FinalBenchmarkValidationError(ValueError):
+    """Raised before a run that cannot produce publication-eligible output."""
+
+
+def strict_final_algorithms() -> tuple[str, ...]:
+    return tuple(
+        name
+        for name, record in BASELINE_REPRODUCTION_REGISTRY.items()
+        if record.strict_final_eligible
+    )
 
 
 @dataclass(frozen=True)
@@ -178,3 +356,183 @@ def canonical_json_sha256(payload: object) -> str:
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class ReproductionFixtureCertificate:
+    """Reviewed identity for an immutable upstream-generated golden fixture.
+
+    The content digest lives outside the fixture so editing both a fixture value
+    and its in-file provenance cannot make the modified artifact self-certify.
+    """
+
+    fixture_id: str
+    filename: str
+    content_sha256: str
+    upstream_repository: str
+    upstream_commit: str
+    upstream_source_sha256: str
+    python_version: str
+    numpy_version: str
+    pytorch_version: str
+    checkpoint_sha256: str | None = None
+    oracle_source_sha256: str | None = None
+
+
+RPEX_GOLDEN_FIXTURE_CERTIFICATES: Mapping[
+    str, ReproductionFixtureCertificate
+] = {
+    "rpex_random_corruption_v1": ReproductionFixtureCertificate(
+        fixture_id="rpex_random_corruption_v1",
+        filename="rpex_random_corruption_v1.json",
+        content_sha256=(
+            "06ef5d67cb104849cf373923271571f6b5ef69e598d24e16dea8b5f219618bae"
+        ),
+        upstream_repository="https://github.com/felix-thu/RPEX",
+        upstream_commit=UPSTREAM_COMMITS["rpex"],
+        upstream_source_sha256=(
+            "1d854dc964fc40c11881f5aa53d1b3d712b7a27d33c27b0a7786d5d7699597ff"
+        ),
+        python_version="3.10.20",
+        numpy_version="2.2.6",
+        pytorch_version="2.13.0",
+    ),
+    "rpex_adversarial_core_v1": ReproductionFixtureCertificate(
+        fixture_id="rpex_adversarial_core_v1",
+        filename="rpex_adversarial_core_v1.json",
+        content_sha256=(
+            "e34123aada610b9488c832d39dcd3d98c97ecb6da4b4695bd1736c70c88206f3"
+        ),
+        upstream_repository="https://github.com/felix-thu/RPEX",
+        upstream_commit=UPSTREAM_COMMITS["rpex"],
+        upstream_source_sha256=(
+            "1d854dc964fc40c11881f5aa53d1b3d712b7a27d33c27b0a7786d5d7699597ff"
+        ),
+        python_version="3.10.20",
+        numpy_version="2.2.6",
+        pytorch_version="2.13.0",
+        checkpoint_sha256=(
+            "f5c558003cfd3814c4ea6cff4ce5319b61a8e3dc9013cf208c29e37e368680bd"
+        ),
+        oracle_source_sha256=(
+            "ec8c0f4554bab14d68e368403b3f522e69d1691e8e5c562c905d10697dd8d9e7"
+        ),
+    ),
+}
+
+
+def validate_reproduction_fixture(path: object, fixture_id: str) -> dict[str, object]:
+    """Return a certified fixture payload or raise with the exact mismatch."""
+
+    import hashlib
+    import json
+    from pathlib import Path
+
+    certificate = RPEX_GOLDEN_FIXTURE_CERTIFICATES.get(fixture_id)
+    if certificate is None:
+        raise ValueError(f"unknown reproduction fixture certificate: {fixture_id}")
+    candidate = Path(path)
+    if candidate.name != certificate.filename:
+        raise ValueError(
+            "fixture filename mismatch: "
+            f"expected={certificate.filename} actual={candidate.name}"
+        )
+    try:
+        raw = candidate.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"cannot read certified fixture {candidate}: {exc}") from exc
+    actual_content_sha256 = hashlib.sha256(raw).hexdigest()
+    if actual_content_sha256 != certificate.content_sha256:
+        raise ValueError(
+            "fixture content SHA256 mismatch: "
+            f"expected={certificate.content_sha256} actual={actual_content_sha256}"
+        )
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"certified fixture is invalid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("certified fixture root must be a JSON object")
+
+    expected_metadata = {
+        "fixture_id": certificate.fixture_id,
+        "fixture_schema_version": 1,
+        "upstream_repository": certificate.upstream_repository,
+        "upstream_commit": certificate.upstream_commit,
+        "upstream_source_sha256": certificate.upstream_source_sha256,
+        "python_version": certificate.python_version,
+        "numpy_version": certificate.numpy_version,
+        "pytorch_version": certificate.pytorch_version,
+    }
+    if certificate.checkpoint_sha256 is not None:
+        expected_metadata["checkpoint_sha256"] = certificate.checkpoint_sha256
+    if certificate.oracle_source_sha256 is not None:
+        expected_metadata["oracle_source_sha256"] = (
+            certificate.oracle_source_sha256
+        )
+    mismatches = {
+        key: {"expected": expected, "actual": payload.get(key)}
+        for key, expected in expected_metadata.items()
+        if payload.get(key) != expected
+    }
+    if mismatches:
+        raise ValueError(f"fixture provenance metadata mismatch: {mismatches}")
+
+    expected_targets = {"observations", "actions", "rewards", "dynamics"}
+    if fixture_id == "rpex_random_corruption_v1":
+        if payload.get("generator") != (
+            "pinned attack.py Attack.sample_indexs + corrupt_* methods"
+        ):
+            raise ValueError("random fixture generator metadata mismatch")
+        if payload.get("rng_implementation") != (
+            "numpy.random.RandomState(MT19937)"
+        ):
+            raise ValueError("random fixture RNG metadata mismatch")
+        if set(payload.get("targets", {})) != expected_targets or set(
+            payload.get("online_random", {})
+        ) != expected_targets:
+            raise ValueError("random fixture does not cover all four RPEX targets")
+    else:
+        if payload.get("scope") != (
+            "public attack optimizer core; not the broken end-to-end wrapper"
+        ):
+            raise ValueError("adversarial fixture scope metadata mismatch")
+        if payload.get("device") != "cpu" or payload.get("dtype") != "float32":
+            raise ValueError("adversarial fixture device/dtype metadata mismatch")
+        online = payload.get("online")
+        if not isinstance(online, dict) or online.get(
+            "fresh_unseeded_cpu_generator"
+        ) is not True:
+            raise ValueError("adversarial fixture generator semantics mismatch")
+        offline = payload.get("offline")
+        offline_fields = {
+            "selected_indices",
+            "split_sizes",
+            "initial_parameter_hash",
+            "initial_effective_perturbation_hash",
+            "post_first_step_objectives",
+            "post_last_step_objectives",
+            "final_perturbation_hash",
+            "attacked_input_hash",
+        }
+        online_fields = {
+            "input_index",
+            "initial_parameter_hash",
+            "initial_effective_perturbation_hash",
+            "post_first_step_objective",
+            "post_last_step_objective",
+            "final_perturbation_hash",
+            "attacked_input_hash",
+        }
+        if payload.get("synthetic_input_hash_scheme") != (
+            "observations_float32_bytes_then_actions_float32_bytes"
+        ) or not isinstance(payload.get("synthetic_input_hash"), str):
+            raise ValueError("adversarial synthetic input provenance is incomplete")
+        if not isinstance(offline, dict) or not offline_fields.issubset(offline):
+            raise ValueError("adversarial offline trajectory metadata is incomplete")
+        if not online_fields.issubset(online):
+            raise ValueError("adversarial online trajectory metadata is incomplete")
+        blockers = payload.get("known_upstream_wrapper_blockers")
+        if not isinstance(blockers, list) or len(blockers) != 3:
+            raise ValueError("adversarial fixture must preserve upstream blockers")
+    return payload

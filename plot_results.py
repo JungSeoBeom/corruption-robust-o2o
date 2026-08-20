@@ -4,8 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
+from robust_o2o.fidelity import canonical_json_sha256
 from robust_o2o.manifest import aggregation_signature
 
 
@@ -114,8 +115,112 @@ def _load_runs(root: Path):
         with config_path.open(encoding="utf-8") as stream:
             config = json.load(stream)
         manifest_path = metrics_path.parent / "experiment_manifest.json"
+        launch_manifest = None
         if manifest_path.exists():
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            launch_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            recorded_launch_digest = launch_manifest.get("manifest_sha256")
+            unhashed_launch = {
+                key: value
+                for key, value in launch_manifest.items()
+                if key != "manifest_sha256"
+            }
+            actual_launch_digest = canonical_json_sha256(unhashed_launch)
+            if recorded_launch_digest is None and int(
+                launch_manifest.get("manifest_schema_version", 0)
+            ) >= 2:
+                raise RuntimeError(
+                    f"launch manifest SHA256 missing: {manifest_path}"
+                )
+            if (
+                recorded_launch_digest is not None
+                and recorded_launch_digest != actual_launch_digest
+            ):
+                raise RuntimeError(
+                    f"launch manifest SHA256 mismatch: {manifest_path}"
+                )
+        completion_path = metrics_path.parent / "completed_experiment_manifest.json"
+        completion_manifest = None
+        if completion_path.exists():
+            completion_manifest = json.loads(
+                completion_path.read_text(encoding="utf-8")
+            )
+            recorded_digest = completion_manifest.get(
+                "completion_manifest_sha256"
+            )
+            unhashed = {
+                key: value
+                for key, value in completion_manifest.items()
+                if key != "completion_manifest_sha256"
+            }
+            actual_digest = canonical_json_sha256(unhashed)
+            if recorded_digest != actual_digest:
+                raise RuntimeError(
+                    f"completion manifest SHA256 mismatch: {completion_path}"
+                )
+            if launch_manifest is None:
+                raise RuntimeError(
+                    f"completion manifest has no launch manifest: {completion_path}"
+                )
+            if (
+                completion_manifest.get("launch_manifest_sha256")
+                != launch_manifest.get("manifest_sha256")
+            ):
+                raise RuntimeError(
+                    f"completion/launch manifest mismatch: {completion_path}"
+                )
+            immutable_fields = (
+                "algorithm",
+                "dataset_id",
+                "environment_protocol",
+                "corruption",
+                "corruption_target",
+                "learner_seed",
+                "offline_updates",
+                "requested_online_steps",
+                "evaluation_interval",
+                "evaluation_episodes",
+                "implementation_profile",
+                "implementation_fidelity",
+                "upstream_commit",
+                "repository_commit",
+                "repository_dirty",
+                "repository_worktree_sha256",
+                "suite_profile",
+                "run_purpose",
+                "condition_status",
+                "reporting_rule",
+                "reporting_rule_verified",
+                "publication_eligible",
+                "paper_reproduction_eligible",
+                "score_semantics",
+                "evaluation_env_id",
+                "online_env_id",
+                "dataset_sha256",
+                "environment_fingerprint",
+                "benchmark_seed_set",
+                "controller_seed_cohort_attested",
+                "final_audit_context_token",
+                "corruption_rate",
+                "corruption_range",
+            )
+            changed_launch_fields = {
+                key: {
+                    "launch": launch_manifest.get(key),
+                    "completion": completion_manifest.get(key),
+                }
+                for key in immutable_fields
+                if completion_manifest.get(key) != launch_manifest.get(key)
+            }
+            if changed_launch_fields:
+                raise RuntimeError(
+                    "completion manifest changed immutable launch fields at "
+                    f"{completion_path}: {changed_launch_fields}"
+                )
+        if launch_manifest is not None:
+            # The launch manifest is the immutable source of configuration and
+            # provenance.  The completion manifest contributes measured
+            # outcomes only; it must never relabel a run at report time.
+            manifest = launch_manifest
         else:
             manifest = {
                 "algorithm": config.get("algorithm"),
@@ -124,11 +229,65 @@ def _load_runs(root: Path):
                 "suite_profile": "legacy_current",
                 "legacy_source_profile": config.get("algorithm_profile"),
             }
+        current_manifest = int(manifest.get("manifest_schema_version", 0)) >= 2
+        if current_manifest:
+            comparison_contract = {
+                "algorithm": (config.get("algorithm"), manifest.get("algorithm")),
+                "env_name": (config.get("env_name"), manifest.get("dataset_id")),
+                "corruption": (
+                    config.get("corruption"),
+                    manifest.get("corruption"),
+                ),
+                "corruption_target": (
+                    config.get("corruption_target"),
+                    manifest.get("corruption_target"),
+                ),
+                "seed": (config.get("seed"), manifest.get("learner_seed")),
+                "protocol": (
+                    config.get("protocol"),
+                    manifest.get("environment_protocol"),
+                ),
+                "offline_steps": (
+                    config.get("offline_steps"),
+                    manifest.get("offline_updates"),
+                ),
+                "online_steps": (
+                    config.get("online_steps"),
+                    manifest.get("requested_online_steps"),
+                ),
+                "eval_period": (
+                    config.get("eval_period"),
+                    manifest.get("evaluation_interval"),
+                ),
+                "eval_episodes": (
+                    config.get("eval_episodes"),
+                    manifest.get("evaluation_episodes"),
+                ),
+            }
+            mismatches = {
+                name: {"config": left, "manifest": right}
+                for name, (left, right) in comparison_contract.items()
+                if left is not None and right is not None and left != right
+            }
+            if mismatches:
+                raise RuntimeError(
+                    f"config/manifest comparison contract mismatch at "
+                    f"{metrics_path.parent}: {mismatches}"
+                )
         summary_path = metrics_path.parent / "summary.json"
         summary = {}
         if summary_path.exists():
             with summary_path.open(encoding="utf-8") as stream:
                 summary = json.load(stream)
+        if (
+            current_manifest
+            and summary.get("status") == "completed"
+            and not completion_path.exists()
+        ):
+            raise RuntimeError(
+                "completed current-schema run has no verified completion "
+                f"manifest: {metrics_path.parent}"
+            )
         try:
             frame = pd.read_csv(metrics_path)
         except (OSError, pd.errors.ParserError):
@@ -136,21 +295,40 @@ def _load_runs(root: Path):
             continue
         if frame.empty:
             continue
-        for key in (
-            "algorithm",
-            "env_name",
-            "corruption",
-            "corruption_target",
-            "seed",
-        ):
-            frame[key] = config[key]
-        frame["protocol"] = config.get("protocol", "unknown_legacy_protocol")
+        frame["algorithm"] = manifest.get("algorithm", config.get("algorithm"))
+        frame["env_name"] = manifest.get("dataset_id", config.get("env_name"))
+        frame["corruption"] = manifest.get(
+            "corruption", config.get("corruption")
+        )
+        frame["corruption_target"] = manifest.get(
+            "corruption_target", config.get("corruption_target")
+        )
+        frame["seed"] = int(manifest.get("learner_seed", config.get("seed", 0)))
+        frame["protocol"] = manifest.get(
+            "environment_protocol",
+            config.get("protocol", "unknown_legacy_protocol"),
+        )
         frame["algorithm_profile"] = manifest.get(
             "implementation_profile", "legacy_current"
         )
         frame["implementation_profile"] = frame["algorithm_profile"]
         frame["implementation_fidelity"] = manifest.get(
             "implementation_fidelity", "legacy_unknown"
+        )
+        frame["upstream_commit"] = manifest.get(
+            "upstream_commit", "unknown"
+        )
+        frame["reporting_rule"] = manifest.get(
+            "reporting_rule", "unknown"
+        )
+        frame["publication_eligible"] = bool(
+            manifest.get("publication_eligible", False)
+        )
+        frame["paper_reproduction_eligible"] = bool(
+            manifest.get("paper_reproduction_eligible", False)
+        )
+        frame["condition_status"] = manifest.get(
+            "condition_status", "legacy_unknown"
         )
         frame["suite_profile"] = manifest.get("suite_profile", "legacy_current")
         frame["run_purpose"] = manifest.get("run_purpose", "legacy_unknown")
@@ -166,25 +344,41 @@ def _load_runs(root: Path):
             "wsrl_entropy_profile", "legacy_unknown"
         )
         frame["aggregation_signature"] = aggregation_signature(manifest)
-        frame["resolved_algorithm_profile"] = config.get(
-            "resolved_algorithm_profile", "unknown_legacy_profile"
+        frame["resolved_algorithm_profile"] = manifest.get(
+            "algorithm_profile",
+            config.get("resolved_algorithm_profile", "unknown_legacy_profile"),
         )
-        frame["score_semantics"] = config.get(
-            "score_semantics", "unknown_legacy_score"
+        frame["score_semantics"] = manifest.get(
+            "score_semantics",
+            config.get("score_semantics", "unknown_legacy_score"),
         )
-        frame["dataset_id"] = config.get("dataset_id", "unknown_legacy_dataset")
-        frame["evaluation_env_id"] = config.get(
-            "evaluation_env_id", "unknown_legacy_evaluation_env"
+        frame["dataset_id"] = manifest.get(
+            "dataset_id", config.get("dataset_id", "unknown_legacy_dataset")
         )
+        frame["evaluation_env_id"] = manifest.get(
+            "evaluation_env_id",
+            config.get("evaluation_env_id", "unknown_legacy_evaluation_env"),
+        )
+        corruption_rates = manifest.get("corruption_rate") or {}
         frame["offline_corruption_rate"] = float(
-            config.get("offline_corruption_rate", -1.0)
+            corruption_rates.get(
+                "offline", config.get("offline_corruption_rate", -1.0)
+            )
         )
         frame["online_corruption_rate"] = float(
-            config.get("online_corruption_rate", -1.0)
+            corruption_rates.get(
+                "online", config.get("online_corruption_rate", -1.0)
+            )
         )
-        frame["learner_seed"] = int(config.get("learner_seed", config["seed"]))
+        frame["learner_seed"] = int(
+            manifest.get(
+                "learner_seed", config.get("learner_seed", config["seed"])
+            )
+        )
         frame["corruption_seed"] = int(
-            config.get("corruption_seed", config["seed"])
+            manifest.get(
+                "corruption_seed", config.get("corruption_seed", config["seed"])
+            )
         )
         frame["run_dir"] = str(metrics_path.parent)
         frame["run_status"] = summary.get("status", "unknown")
@@ -192,14 +386,96 @@ def _load_runs(root: Path):
         frame["run_elapsed_seconds"] = (
             float(elapsed) if elapsed is not None else float("nan")
         )
-        frame["planned_offline_steps"] = int(config.get("offline_steps", 0))
+        frame["planned_offline_steps"] = int(
+            manifest.get("offline_updates", config.get("offline_steps", 0))
+        )
         offline_rows = frame[frame["phase"] == "offline"]
         frame["completed_offline_steps"] = (
             int(offline_rows["step"].max()) if not offline_rows.empty else 0
         )
-        frame["planned_online_steps"] = int(config.get("online_steps", 0))
+        frame["planned_online_steps"] = int(
+            manifest.get(
+                "requested_online_steps", config.get("online_steps", 0)
+            )
+        )
+        online_manifest_path = (
+            metrics_path.parent / "online_corruption_manifest.json"
+        )
+        online_manifest = (
+            json.loads(online_manifest_path.read_text(encoding="utf-8"))
+            if online_manifest_path.exists()
+            else {}
+        )
+        manifest_actual_steps = (
+            completion_manifest.get("actual_online_steps")
+            if completion_manifest is not None
+            else manifest.get("actual_online_steps")
+        )
+        online_actual_steps = online_manifest.get("actual_online_steps")
+        if (
+            completion_path.exists()
+            and manifest_actual_steps is not None
+            and online_actual_steps is not None
+            and int(manifest_actual_steps) != int(online_actual_steps)
+        ):
+            raise RuntimeError(
+                "completion/online corruption manifest actual-step mismatch: "
+                f"{metrics_path.parent}"
+            )
+        frame["actual_online_steps"] = int(
+            manifest_actual_steps
+            if manifest_actual_steps is not None
+            else online_actual_steps or 0
+        )
+        frame["eval_episodes"] = int(
+            manifest.get("evaluation_episodes", config.get("eval_episodes", 0))
+        )
+        frame["eval_period"] = int(
+            manifest.get("evaluation_interval", config.get("eval_period", 0))
+        )
+        frame["online_budget_semantics"] = (
+            completion_manifest.get("online_budget_semantics")
+            if completion_manifest is not None
+            else manifest.get(
+                "online_budget_semantics", "unknown_legacy_semantics"
+            )
+        )
+        frame["episode_boundary_overshoot"] = int(
+            (
+                completion_manifest.get("episode_boundary_overshoot", 0)
+                if completion_manifest is not None
+                else manifest.get("episode_boundary_overshoot", 0)
+            )
+            or 0
+        )
+        frame["environment_horizon"] = int(
+            manifest.get(
+                "environment_horizon", config.get("max_episode_steps", 0)
+            )
+            or 0
+        )
         frames.append(frame)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def load_runs(root: Path):
+    """Public notebook/API entry point for canonical manifest-aware run loading."""
+
+    return _load_runs(Path(root))
+
+
+def _validate_aggregation_signatures(frame, context: str) -> None:
+    if frame.empty:
+        return
+    signature_counts = frame.groupby("algorithm")[
+        "aggregation_signature"
+    ].nunique()
+    mixed_algorithms = signature_counts[signature_counts > 1]
+    if not mixed_algorithms.empty:
+        raise RuntimeError(
+            f"Manifest mismatch within {context}: "
+            + ", ".join(mixed_algorithms.index.tolist())
+        )
 
 
 def write_final_score_summary(
@@ -210,12 +486,16 @@ def write_final_score_summary(
     target: Optional[str] = None,
     phase: str = "online",
 ) -> Path:
-    """Write one aggregate final-score/runtime row per algorithm."""
+    """Write the declared common last-three metric (never a paper metric)."""
     _, pd = _imports()
+    from robust_o2o.reporting import (
+        aggregate_seed_scores,
+        common_reporting_rule,
+    )
+
     frame = _load_runs(root)
     if frame.empty:
         raise RuntimeError(f"No metrics.csv files found below {root}")
-    frame = frame[frame["phase"] == phase]
     if env_name:
         frame = frame[frame["env_name"] == env_name]
     if corruption:
@@ -225,59 +505,84 @@ def write_final_score_summary(
     frame = frame[frame["run_status"] == "completed"]
     if frame.empty:
         raise RuntimeError("No completed runs match the requested summary filters")
-    signature_counts = frame.groupby("algorithm")["aggregation_signature"].nunique()
-    mixed_algorithms = signature_counts[signature_counts > 1]
-    if not mixed_algorithms.empty:
-        raise RuntimeError(
-            "Manifest mismatch within final-score groups: "
-            + ", ".join(mixed_algorithms.index.tolist())
-        )
+    _validate_aggregation_signatures(frame, "final-score groups")
 
-    x_column = "env_steps" if phase == "online" else "step"
-    final_runs = (
-        frame.sort_values(["run_dir", x_column])
-        .groupby("run_dir", as_index=False)
-        .tail(1)
+    common_rule = common_reporting_rule(phase)
+    rules = {
+        algorithm: common_rule
+        for algorithm in frame["algorithm"].drop_duplicates().tolist()
+    }
+    per_seed, result = aggregate_seed_scores(
+        frame,
+        rule_by_algorithm=rules,
+        strict=False,
     )
-    group_keys = [
-        "algorithm",
-        "aggregation_signature",
-        "protocol",
-        "algorithm_profile",
-        "resolved_algorithm_profile",
-        "dataset_id",
-        "evaluation_env_id",
-        "env_name",
-        "corruption",
-        "corruption_target",
-        "offline_corruption_rate",
-        "online_corruption_rate",
-    ]
-    result = (
-        final_runs.groupby(group_keys)
+    elapsed_by_run = (
+        frame[["run_dir", "run_elapsed_seconds"]]
+        .drop_duplicates("run_dir")
+        .set_index("run_dir")["run_elapsed_seconds"]
+    )
+    per_seed["run_elapsed_seconds"] = per_seed["run_dir"].map(elapsed_by_run)
+    elapsed = (
+        per_seed.groupby(["algorithm", "environment", "condition"])
         .agg(
-            runs=("run_dir", "nunique"),
-            final_normalized_return_mean=("normalized_return_mean", "mean"),
-            final_normalized_return_std=("normalized_return_mean", "std"),
-            final_raw_return_mean=("return_mean", "mean"),
-            final_raw_return_std=("return_mean", "std"),
             elapsed_seconds_mean=("run_elapsed_seconds", "mean"),
-            elapsed_seconds_std=("run_elapsed_seconds", "std"),
+            elapsed_seconds_std=("run_elapsed_seconds", lambda values: values.std(ddof=0)),
         )
         .reset_index()
-        .sort_values(
-            "final_normalized_return_mean", ascending=False, ignore_index=True
-        )
     )
-    for column in (
-        "final_normalized_return_std",
-        "final_raw_return_std",
-        "elapsed_seconds_std",
-    ):
-        result[column] = result[column].fillna(0.0)
+    result = result.merge(
+        elapsed,
+        on=["algorithm", "environment", "condition"],
+        how="left",
+    )
+    result["runs"] = result["num_seeds"]
+    result["final_normalized_return_mean"] = result["mean"]
+    result["final_normalized_return_std"] = result["std"]
+    result["final_raw_return_mean"] = float("nan")
+    result["final_raw_return_std"] = float("nan")
+    result = result.sort_values(
+        "final_normalized_return_mean", ascending=False, ignore_index=True
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output, index=False)
     return output
+
+
+def write_reproduction_summaries(
+    root: Path,
+    output_dir: Path,
+    env_name: Optional[str] = None,
+    corruption: Optional[str] = None,
+    target: Optional[str] = None,
+    *,
+    strict: bool = False,
+    expected_seeds: Optional[Iterable[int]] = None,
+    phase: str = "online",
+) -> dict[str, Path]:
+    from robust_o2o.reporting import write_reporting_outputs
+
+    frame = _load_runs(root)
+    if not frame.empty:
+        if env_name:
+            frame = frame[frame["env_name"] == env_name]
+        if corruption:
+            frame = frame[frame["corruption"] == corruption]
+        if target:
+            frame = frame[frame["corruption_target"] == target]
+    completed = (
+        frame[frame["run_status"] == "completed"]
+        if "run_status" in frame.columns
+        else frame
+    )
+    _validate_aggregation_signatures(completed, "reproduction-summary groups")
+    return write_reporting_outputs(
+        frame,
+        output_dir,
+        strict=strict,
+        expected_seeds=expected_seeds,
+        phase=phase,
+    )
 
 
 def plot_aggregate(
@@ -301,13 +606,7 @@ def plot_aggregate(
         frame = frame[frame["corruption_target"] == target]
     allowed_statuses = ("completed", "running", "unknown") if include_running else ("completed",)
     frame = frame[frame["run_status"].isin(allowed_statuses)]
-    signature_counts = frame.groupby("algorithm")["aggregation_signature"].nunique()
-    mixed_algorithms = signature_counts[signature_counts > 1]
-    if not mixed_algorithms.empty:
-        raise RuntimeError(
-            "Manifest mismatch within algorithm curves: "
-            + ", ".join(mixed_algorithms.index.tolist())
-        )
+    _validate_aggregation_signatures(frame, "algorithm curves")
     identity_columns = [
         "algorithm",
         "algorithm_profile",
@@ -330,6 +629,16 @@ def plot_aggregate(
                 "diagnostic override"
             )
     frame = frame.copy()
+    duplicate_rows = frame[
+        frame.duplicated(
+            ["run_dir", "phase", "step", "env_steps"], keep=False
+        )
+    ]
+    if not duplicate_rows.empty:
+        identity = duplicate_rows[
+            ["run_dir", "phase", "step", "env_steps"]
+        ].drop_duplicates().to_dict("records")
+        raise RuntimeError(f"Duplicate evaluation rows cannot be plotted: {identity}")
     if phase == "offline_online":
         frame = frame[frame["phase"].isin(("offline", "online"))]
         frame["plot_step"] = frame["step"]
@@ -368,7 +677,10 @@ def plot_aggregate(
             group_frame.groupby(x_column)
             .agg(
                 mean=("normalized_return_mean", "mean"),
-                seed_std=("normalized_return_mean", "std"),
+                seed_std=(
+                    "normalized_return_mean",
+                    lambda values: values.std(ddof=0),
+                ),
                 count=("seed", "nunique"),
             )
             .reset_index()
@@ -481,13 +793,37 @@ def plot_aggregate(
     return output
 
 
+def update_live_comparison_plots(
+    comparison_dir: Path,
+    env_name: Optional[str] = None,
+    corruption: Optional[str] = None,
+    target: Optional[str] = None,
+) -> dict[str, Path]:
+    """Refresh only explicitly non-canonical running/partial plots."""
+
+    runs_dir = comparison_dir / "runs"
+    outputs = {}
+    for phase in ("offline_online", "offline", "online"):
+        output = comparison_dir / f"diagnostic_running_{phase}.png"
+        outputs[phase] = plot_aggregate(
+            runs_dir,
+            output,
+            env_name,
+            corruption,
+            target,
+            phase,
+            include_running=True,
+        )
+    return outputs
+
+
 def update_comparison_plots(
     comparison_dir: Path,
     env_name: Optional[str] = None,
     corruption: Optional[str] = None,
     target: Optional[str] = None,
 ) -> dict[str, Path]:
-    """Refresh completed benchmark plots and separate live diagnostics."""
+    """Publish completed canonical plots after suite-level validation."""
     runs_dir = comparison_dir / "runs"
     outputs = {}
     for phase in ("offline_online", "offline", "online"):
@@ -501,15 +837,9 @@ def update_comparison_plots(
             phase,
             include_running=False,
         )
-        plot_aggregate(
-            runs_dir,
-            comparison_dir / f"diagnostic_running_{phase}.png",
-            env_name,
-            corruption,
-            target,
-            phase,
-            include_running=True,
-        )
+    update_live_comparison_plots(
+        comparison_dir, env_name, corruption, target
+    )
     return outputs
 
 

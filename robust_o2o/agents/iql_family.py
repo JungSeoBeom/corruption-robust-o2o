@@ -33,6 +33,41 @@ def robust_huber(diff: torch.Tensor, sigma: float) -> torch.Tensor:
     return torch.where(absolute < beta, 0.5 * absolute.square() / beta, absolute - 0.5 * beta)
 
 
+def official_epsilon_greedy_sample(
+    distribution_or_action: torch.distributions.Distribution | torch.Tensor,
+    epsilon: float,
+) -> torch.Tensor:
+    """Literal port of RPEX ``epsilon_greedy_sample`` RNG semantics."""
+
+    if torch.is_tensor(distribution_or_action):
+        greedy_action = distribution_or_action
+    elif isinstance(distribution_or_action, torch.distributions.Categorical):
+        greedy_action = distribution_or_action.probs.argmax(dim=-1)
+    else:
+        greedy_action = distribution_or_action.mean
+    if epsilon >= 1.0:
+        if torch.is_tensor(distribution_or_action):
+            return distribution_or_action + 0.01 * torch.randn_like(
+                distribution_or_action
+            )
+        return distribution_or_action.sample()
+    if epsilon == 0.0:
+        return greedy_action
+    sample_action = (
+        distribution_or_action
+        if torch.is_tensor(distribution_or_action)
+        else distribution_or_action.sample()
+    )
+    # Pinned upstream draws this mask on the default CPU device after the
+    # distribution sample, then uses it to index the model-device tensor.
+    greedy_mask = torch.rand(sample_action.shape[0]) > epsilon
+    if greedy_mask.device != sample_action.device:
+        greedy_mask = greedy_mask.to(sample_action.device)
+    result = sample_action.clone()
+    result[greedy_mask] = greedy_action[greedy_mask]
+    return result
+
+
 class IQLFamilyAgent(BaseAgent):
     """IQL/RIQL pre-training plus the three RPEX/PEX online adapters."""
 
@@ -145,9 +180,37 @@ class IQLFamilyAgent(BaseAgent):
     def begin_online(self) -> None:
         if self.online_phase:
             return
+        official_phase_transition = (
+            self.config.implementation_profile == "official_code_reference"
+            and self.config.algorithm in ("rpex", "riql_naive", "riql_pex")
+        )
         if self.expansion:
             self.offline_actor = copy.deepcopy(self.actor).eval().requires_grad_(False)
+            if official_phase_transition:
+                # attack_online.py starts a fresh process from args.seed before
+                # constructing RPEX's new online policy. At minimum the active
+                # policy initialization must not inherit the exhausted offline
+                # training RNG stream.
+                torch.manual_seed(self.config.learner_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(self.config.learner_seed)
             self.actor = self._make_online_actor()
+        if official_phase_transition:
+            # The pinned online constructors create fresh Adam instances and
+            # load module weights only; no offline optimizer/scheduler state is
+            # restored. This is especially important because the offline actor
+            # cosine schedule has reached (approximately) zero learning rate.
+            self.q_optimizer = torch.optim.Adam(
+                self.critic.parameters(), lr=self.config.critic_learning_rate
+            )
+            self.value_optimizer = torch.optim.Adam(
+                self.value.parameters(), lr=self.config.critic_learning_rate
+            )
+            self.actor_optimizer = torch.optim.Adam(
+                self.actor.parameters(), lr=self.config.actor_learning_rate
+            )
+            self.actor_scheduler = None
+        elif self.expansion:
             self.actor_optimizer = torch.optim.Adam(
                 self.actor.parameters(), lr=self.config.actor_learning_rate
             )
@@ -183,13 +246,12 @@ class IQLFamilyAgent(BaseAgent):
             and evaluation_mode != "deterministic_diagnostic"
         )
         if method_faithful:
-            online_action = self._actor_action(self.actor, states, True)
-            sampled_online_action = self._actor_action(self.actor, states, False)
-            sample_mask = (
-                torch.rand(states.shape[0], device=states.device) < 0.1
-            ).unsqueeze(-1)
-            online_action = torch.where(
-                sample_mask, sampled_online_action, online_action
+            if isinstance(self.actor, DeterministicPolicy):
+                online_distribution = self.actor(states)
+            else:
+                online_distribution = self.actor.distribution(states)
+            online_action = official_epsilon_greedy_sample(
+                online_distribution, 0.1
             )
         elif evaluate:
             online_action = self._actor_action(self.actor, states, True)
@@ -218,16 +280,15 @@ class IQLFamilyAgent(BaseAgent):
             q_online = q_online + coefficient * online_ipw
 
         logits = torch.stack((q_offline, q_online), dim=-1) * self.config.inv_temperature
-        if evaluate and not method_faithful:
+        choice_distribution = torch.distributions.Categorical(logits=logits)
+        if method_faithful:
+            choice = official_epsilon_greedy_sample(
+                choice_distribution, 0.1
+            )
+        elif evaluate:
             choice = logits.argmax(dim=-1)
-        elif method_faithful:
-            choice = logits.argmax(dim=-1)
-            # RPEX evaluates the policy-expansion categorical with eps=0.1.
-            random_mask = torch.rand(choice.shape, device=choice.device) < 0.1
-            random_choice = torch.randint(0, 2, choice.shape, device=choice.device)
-            choice = torch.where(random_mask, random_choice, choice)
         else:
-            choice = torch.distributions.Categorical(logits=logits).sample()
+            choice = choice_distribution.sample()
         result = torch.where(choice.unsqueeze(-1).bool(), online_action, offline_action)
         if return_components:
             return result, offline_action, online_action, choice.float().mean()

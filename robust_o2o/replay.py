@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from typing import Dict, Optional
 
 import numpy as np
@@ -9,6 +10,8 @@ from .environment import Dataset
 
 
 TensorBatch = Dict[str, torch.Tensor]
+NUMPY_REPLAY_SAMPLING = "private_numpy_default_rng"
+RPEX_OFFICIAL_REPLAY_SAMPLING = "rpex_official_global_rng"
 
 
 def _tensor_batch(dataset: Dataset, indices: np.ndarray, device: torch.device) -> TensorBatch:
@@ -19,9 +22,20 @@ def _tensor_batch(dataset: Dataset, indices: np.ndarray, device: torch.device) -
 
 
 class OfflineDataset:
-    def __init__(self, dataset: Dataset, seed: int):
+    def __init__(
+        self,
+        dataset: Dataset,
+        seed: int,
+        sampling_profile: str = NUMPY_REPLAY_SAMPLING,
+    ):
         self.dataset = dataset
         self.size = len(dataset["rewards"])
+        self.sampling_profile = sampling_profile
+        if sampling_profile not in (
+            NUMPY_REPLAY_SAMPLING,
+            RPEX_OFFICIAL_REPLAY_SAMPLING,
+        ):
+            raise ValueError(f"Unknown offline replay sampling profile {sampling_profile!r}")
         self.rng = np.random.default_rng(seed)
         self.priorities = np.ones(self.size, dtype=np.float64)
         self.priority_updates = 0
@@ -37,9 +51,24 @@ class OfflineDataset:
             return {}
         if prioritized and probabilities is None:
             probabilities = _safe_probabilities(self.priorities)
-        indices = self.rng.choice(
-            self.size, size=batch_size, replace=True, p=probabilities
-        )
+        if self.sampling_profile == RPEX_OFFICIAL_REPLAY_SAMPLING:
+            if prioritized or probabilities is not None:
+                raise ValueError(
+                    "official RPEX offline sampling does not support priorities"
+                )
+            # felix-thu/RPEX pex/utils/util.py::sample_batch uses the global
+            # Torch stream and samples with replacement on the training device.
+            torch_indices = torch.randint(
+                low=0,
+                high=self.size,
+                size=(batch_size,),
+                device=device,
+            )
+            indices = torch_indices.detach().cpu().numpy()
+        else:
+            indices = self.rng.choice(
+                self.size, size=batch_size, replace=True, p=probabilities
+            )
         result = _tensor_batch(self.dataset, indices, device)
         result["_indices"] = torch.as_tensor(indices, dtype=torch.long, device=device)
         result["_source"] = torch.zeros(batch_size, dtype=torch.long, device=device)
@@ -56,13 +85,22 @@ class OfflineDataset:
 
     def state_dict(self) -> Dict[str, object]:
         return {
-            "rng_state": self.rng.bit_generator.state,
+            "sampling_profile": self.sampling_profile,
+            "rng_state": (
+                self.rng.bit_generator.state
+                if self.sampling_profile == NUMPY_REPLAY_SAMPLING
+                else None
+            ),
             "priorities": self.priorities.copy(),
             "priority_updates": self.priority_updates,
         }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
-        self.rng.bit_generator.state = state["rng_state"]
+        saved_profile = state.get("sampling_profile", NUMPY_REPLAY_SAMPLING)
+        if saved_profile != self.sampling_profile:
+            raise ValueError("offline replay sampling profile changed across resume")
+        if state.get("rng_state") is not None:
+            self.rng.bit_generator.state = state["rng_state"]
         self.priorities[...] = np.asarray(state["priorities"], dtype=np.float64)
         self.priority_updates = int(state.get("priority_updates", 0))
 
@@ -74,6 +112,7 @@ class ReplayBuffer:
         action_dim: int,
         capacity: int,
         seed: int,
+        sampling_profile: str = NUMPY_REPLAY_SAMPLING,
     ):
         self.capacity = int(capacity)
         self.states = np.empty((capacity, state_dim), dtype=np.float32)
@@ -85,7 +124,17 @@ class ReplayBuffer:
         self.priorities = np.ones(capacity, dtype=np.float64)
         self.position = 0
         self.size = 0
+        self.sampling_profile = sampling_profile
+        if sampling_profile not in (
+            NUMPY_REPLAY_SAMPLING,
+            RPEX_OFFICIAL_REPLAY_SAMPLING,
+        ):
+            raise ValueError(f"Unknown online replay sampling profile {sampling_profile!r}")
         self.rng = np.random.default_rng(seed)
+        if sampling_profile == RPEX_OFFICIAL_REPLAY_SAMPLING:
+            # Upstream ReplayMemory.__init__ resets the process-global Python
+            # stream to args.seed immediately before online interaction.
+            random.seed(seed)
         self.priority_updates = 0
 
     def add(
@@ -117,9 +166,19 @@ class ReplayBuffer:
         probabilities = None
         if prioritized:
             probabilities = _safe_probabilities(self.priorities[: self.size])
-        indices = self.rng.choice(
-            self.size, size=batch_size, replace=False, p=probabilities
-        )
+        if self.sampling_profile == RPEX_OFFICIAL_REPLAY_SAMPLING:
+            if prioritized:
+                raise ValueError(
+                    "official RPEX online replay sampling does not support priorities"
+                )
+            # ReplayMemory.sample uses random.sample(self.buffer, batch_size).
+            indices = np.asarray(
+                random.sample(range(self.size), batch_size), dtype=np.int64
+            )
+        else:
+            indices = self.rng.choice(
+                self.size, size=batch_size, replace=False, p=probabilities
+            )
         batch = {
             "observations": self.states[indices],
             "actions": self.actions[indices],
@@ -157,7 +216,12 @@ class ReplayBuffer:
             "priorities": self.priorities[:size].copy(),
             "position": self.position,
             "size": size,
-            "rng_state": self.rng.bit_generator.state,
+            "sampling_profile": self.sampling_profile,
+            "rng_state": (
+                self.rng.bit_generator.state
+                if self.sampling_profile == NUMPY_REPLAY_SAMPLING
+                else None
+            ),
             "priority_updates": self.priority_updates,
         }
 
@@ -177,7 +241,11 @@ class ReplayBuffer:
             getattr(self, name)[:size] = np.asarray(state[name])
         self.position = int(state["position"])
         self.size = size
-        self.rng.bit_generator.state = state["rng_state"]
+        saved_profile = state.get("sampling_profile", NUMPY_REPLAY_SAMPLING)
+        if saved_profile != self.sampling_profile:
+            raise ValueError("online replay sampling profile changed across resume")
+        if state.get("rng_state") is not None:
+            self.rng.bit_generator.state = state["rng_state"]
         self.priority_updates = int(state.get("priority_updates", 0))
 
 

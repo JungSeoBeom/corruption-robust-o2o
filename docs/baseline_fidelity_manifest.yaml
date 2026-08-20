@@ -1,5 +1,54 @@
-schema_version: 1
+schema_version: 2
 audit_date: "2026-08-21"
+status_note: >-
+  This manifest records source provenance and conservative implementation
+  status. No run_55 learner currently carries an exact_upstream_port label.
+  Strict eligibility is controlled by BASELINE_REPRODUCTION_REGISTRY, not by
+  an implementation-profile name.
+benchmark_status:
+  complete_five_baseline_final: NOT_READY
+  strict_eligible_subset: [rpex, riql_naive]
+  strict_eligible_subset_current_status: NOT_READY
+  subset_implementation_fidelity: source_aligned_port
+  subset_launch_condition: >-
+    First establish save/resume equivalence for every eligible baseline and
+    certified condition pair, reproduce the fresh-process online-constructor
+    RNG trajectory, match the upstream evaluation environment/RNG schedule,
+    and regenerate/review the golden fixtures under the pinned strict numeric
+    runtime. Then run scripts/audit_reproducibility.py on the intended
+    supported Linux x86_64 host and require ELIGIBLE-SUBSET BENCHMARK STATUS
+    READY before launch. The current macOS host is diagnostic-only.
+strict_execution_contract:
+  run_purpose: final_benchmark
+  exact_seed_set: [0, 1, 2, 3, 4]
+  offline_updates: 2000001
+  requested_online_steps: 1000001
+  environment_protocol: rpex_d4rl_v2_legacy
+  audit_gate_required: true
+diagnostic_contract:
+  run_purpose: diagnostic
+  default_offline_updates: 500000
+  default_online_steps: 500000
+  publication_eligible: false
+paper_reproduction_contract:
+  run_purpose_status: reserved_and_rejected
+  reason: >-
+    No baseline currently has a certified paper-specific task, seed, budget,
+    environment, learner, corruption, and reporting contract.
+  summary_filename_semantics: >-
+    paper_reproduction_summary.csv contains only verified rows with
+    paper_reproduction_eligible=true. Current source_aligned_port rows are
+    excluded and an empty file is intentional.
+save_resume_verification:
+  established_scope: >-
+    RIQL-naive with random observation corruption in the bounded
+    common_budget_diagnostic preflight smoke only, resumed from an offline
+    checkpoint. Online-checkpoint restore and full saved replay/RNG-state
+    equality are not exercised.
+  online_checkpoint_resume_exercised: false
+  full_resume_state_compared: false
+  full_baseline_condition_coverage: false
+  status: blocking_strict_gate
 baselines:
   rpex_riql:
     paper_title: "RPEX: Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption"
@@ -20,6 +69,9 @@ baselines:
       - RIQL.update
       - RIQL.policy_update
       - RPEX.select_action
+      - epsilon_greedy_sample
+      - sample_batch
+      - ReplayMemory.sample
       - ALIGNIQL.policy_update
       - get_config
       - Attack.optimize_para
@@ -31,19 +83,53 @@ baselines:
       - robust_o2o/networks.py
       - robust_o2o/corruption.py
       - robust_o2o/experiment.py
-    fidelity_status: port
-    implementation_status: "official policy/loss/config-table port; explicit paper/code conflict profiles"
+    implementation_type: "handwritten PyTorch source-aligned port"
+    reproduction_status: source_aligned_port
+    parity_status: >-
+      partial_formula_and_random_fixture_plus_adversarial_observation_optimizer_core_only
+    strict_final_eligible: true
+    strict_eligibility_scope: >-
+      Conditional allowlist for RPEX and RIQL-naive only. The strict D4RL
+      preflight and audit gate, required corruption fixtures, official
+      2000001/1000001 budget, exact 0..4 seed set, and reporting checks must all
+      pass before a final run starts. This is not a paper-reproduction or
+      exact-port claim.
+    implementation_status: >-
+      Source-aligned policy/loss/config-table implementation with explicit
+      paper/code conflict profiles. The official profile uses AWR for every
+      target, source-matched offline/online replay samplers, fresh online Adam
+      optimizers without the offline actor scheduler, and literal epsilon-greedy
+      action sampling. It is not a thin wrapper and is not certified by a
+      complete fixed-batch optimizer parity test.
+    condition_status:
+      random_single_target: paper_reproduction_condition
+      adversarial_observations:
+        hopper-medium-replay-v2: paper_reproduction_condition
+        halfcheetah-medium-replay-v2: paper_condition_fixture_unverified_diagnostic_only
+        walker2d-medium-replay-v2: paper_condition_fixture_unverified_diagnostic_only
+      adversarial_actions: paper_condition_fixture_unverified_diagnostic_only
+      adversarial_rewards: paper_condition_fixture_unverified_diagnostic_only
+      adversarial_dynamics: paper_condition_fixture_unverified_diagnostic_only
+      clean: benchmark_transfer
+      mixed: unsupported_or_diagnostic
     known_paper_code_conflicts:
       - "official code fine-tunes from online replay only; paper describes offline/online replay mixing"
       - "official code evaluates epsilon-greedy policy switching; paper describes greedy highest-weight selection"
       - "official code corrupts the stored transition after env.step; sensor/actuator semantics require pre-action corruption"
     local_divergences:
-      - "500k/500k is labelled common_budget_robustness, never paper reproduction"
+      - "500k/500k is labelled common-budget diagnostic, never paper reproduction"
       - "clean and mixed have no RIQL_TRAIN_CONFIG.py row and are explicit extensions or unsupported"
       - "The pinned public code has no mixed-corruption implementation/config; rpex_paper_mixed therefore fails instead of guessing"
+      - "The adversarial golden fixture certifies only the observation-target optimizer core; actions/rewards/dynamics are diagnostic-only"
     remaining_differences:
-      - "PyTorch port rather than the upstream training framework"
+      - "Handwritten unified learner/controller rather than a thin wrapper around the pinned source"
+      - "No end-to-end fixed-batch optimizer parity certificate for the complete learner"
+      - "Online optimizer state is reset, but the complete fresh-process constructor RNG consumption order is not reproduced"
+      - "Action-level epsilon-greedy sampling is matched, but the separate local evaluation environment and per-episode reset seed schedule differ from upstream"
+      - "The adversarial observation fixture is tied to the Hopper EDAC checkpoint and cannot certify HalfCheetah or Walker2d"
+      - "Golden fixtures were generated with NumPy/PyTorch versions different from the pinned strict runtime and must be regenerated there"
       - "Clean/mixed RIQL rows are explicit task extensions, not upstream rows"
+      - "Save/resume equivalence is not yet covered for every strict baseline/condition"
     attacker_checkpoints:
       halfcheetah-medium-replay-v2: "sha256:7334ff2b658e95423ca520e258a15ebb6d32ac044cbb3bde27b352bb41e59beb"
       hopper-medium-replay-v2: "sha256:f5c558003cfd3814c4ea6cff4ce5319b61a8e3dc9013cf208c29e37e368680bd"
@@ -77,8 +163,21 @@ baselines:
       - robust_o2o/networks.py
       - robust_o2o/cql.py
       - robust_o2o/experiment.py
-    fidelity_status: port
-    implementation_status: "locomotion 2x256 LayerNorm, final-hidden scale 1e-2, REDQ-10/2, CQL subset, and high-UTD port"
+    implementation_type: "JAX/Flax-to-PyTorch framework port"
+    reproduction_status: framework_port_unverified
+    parity_status: fixed_batch_numerical_parity_missing
+    strict_final_eligible: false
+    strict_eligibility_scope: >-
+      Excluded until an upstream-exported fixed-batch test verifies TD target,
+      CQL penalty, actor loss, temperature loss, target update, and optimizer
+      parameter deltas.
+    implementation_status: >-
+      Source-aligned locomotion structure (2x256 LayerNorm, final-hidden scale
+      1e-2, REDQ-10/2, CQL subset, and high UTD) without cross-framework
+      numerical parity certification.
+    condition_status:
+      clean: official_clean_condition
+      rpex_corruption: benchmark_transfer
     known_paper_code_conflicts: []
     local_divergences:
       - "PyTorch port; canonical metadata records upstream JAX/Flax commit"
@@ -86,6 +185,7 @@ baselines:
       - "method profile preserves actor/critic/temperature LR 1e-4/3e-4/1e-4, resolved target entropy -action_dim, softplus Geq temperature multiplier, and backup_entropy=False"
     remaining_differences:
       - "PyTorch port rather than upstream JAX/Flax"
+      - "No upstream-exported fixed-batch or optimizer-step parity fixture"
 
   cal_ql:
     paper_title: "Cal-QL: Calibrated Offline RL Pre-Training for Efficient Online Fine-Tuning"
@@ -106,8 +206,14 @@ baselines:
       - robust_o2o/agents/calql.py
       - robust_o2o/cql.py
       - robust_o2o/config.py
-    fidelity_status: port
-    implementation_status: "D4RL locomotion task port"
+    implementation_type: "D4RL locomotion task port"
+    reproduction_status: task_port
+    parity_status: unsupported_official_task
+    strict_final_eligible: false
+    strict_eligibility_scope: "Excluded from strict locomotion runs; diagnostic only"
+    implementation_status: "D4RL locomotion task port; non-publication diagnostic"
+    condition_status:
+      locomotion: non_publication_diagnostic
     known_paper_code_conflicts: []
     local_divergences:
       - "Hopper/HalfCheetah/Walker2d are always labelled d4rl_locomotion_port/task_port"
@@ -134,12 +240,18 @@ baselines:
     local_files:
       - robust_o2o/agents/sac_family.py
       - robust_o2o/replay.py
-    fidelity_status: approximation
-    implementation_status: "pqe_shared_actor_approx only; method_fidelity fail-fast"
+    implementation_type: "shared-actor approximation"
+    reproduction_status: approximation
+    parity_status: official_independent_policy_ensemble_missing
+    strict_final_eligible: false
+    strict_eligibility_scope: "Excluded from strict runs; diagnostic only"
+    implementation_status: "pqe_shared_actor_approx only; strict final fail-fast"
+    condition_status:
+      all_local_conditions: diagnostic_extension
     known_paper_code_conflicts: []
     local_divergences:
       - "Current local actor/critic topology is not the upstream N=5 checkpoint-loaded policy ensemble"
       - "Results are experimental_approximation/approximation and cannot be named PQE reference"
     remaining_differences:
       - "No N=5 independently pretrained policy/twin-critic members"
-      - "No exact policy moment-matching port"
+      - "No upstream-equivalent policy moment-matching implementation"

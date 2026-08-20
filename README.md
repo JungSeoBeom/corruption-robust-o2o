@@ -8,12 +8,27 @@ interface and logging format across all algorithms.
 The default protocol is explicitly `rpex_d4rl_v2_legacy`: Gym 0.23.1, the full
 D4RL-v2 environment ID, `mujoco_py`, and D4RL commit
 `d842aa194b416e564e54b0730d9f934e3e32f854`. See
-[RPEX_D4RL_V2_PROTOCOL.md](docs/RPEX_D4RL_V2_PROTOCOL.md) for the exact protocol,
+[RPEX_D4RL_V2_PROTOCOL.md](docs/RPEX_D4RL_V2_PROTOCOL.md) for the pinned protocol,
 installation, metadata, and platform limitations.
 
 Long training runs were not executed while preparing this repository. Use the
-commands below in the pinned legacy environment; exact reproduction is expected
-to require a Linux x86_64 host rather than an Apple Silicon MacBook.
+commands below in the pinned legacy environment, which requires a Linux x86_64
+host rather than an Apple Silicon MacBook. Passing that environment check does
+not establish numerical parity of a learner implementation.
+
+**Current decision:** the complete five-baseline final benchmark is **NOT
+READY**. The only strict-eligible candidate subset is the conditionally
+allowlisted `rpex,riql_naive` pair, both classified as handwritten
+`source_aligned_port`s rather than exact upstream ports. That subset is also
+currently **NOT READY** because full save/resume equivalence has not been
+verified for every eligible baseline × certified condition, the complete
+fresh-process online-constructor RNG trajectory is not reproduced, and the
+upstream evaluation environment/RNG schedule is not matched. The golden
+fixtures also use NumPy/PyTorch versions different from the strict pins. It may
+start only after all four gaps are closed and `python scripts/audit_reproducibility.py`
+returns an eligible-subset `READY` result on a compatible Linux x86_64 host. A
+local macOS run is diagnostic-only and must not be launched or reported as
+`final_benchmark`.
 
 ### KAIST RL Lab GCP Slurm (CPU only)
 
@@ -31,7 +46,7 @@ sbatch --wait slurm/setup_cpu.sbatch
 # online replay updates, evaluation, and checkpoints.
 sbatch --wait slurm/smoke_cpu.sbatch
 
-# Full default RPEX clean run (500k offline + 500k online).
+# Common-budget RPEX clean diagnostic (500k offline + 500k online).
 sbatch slurm/run_cpu.sbatch
 ```
 
@@ -70,13 +85,16 @@ The generic `reference` profile has been removed. Every run records an
 `implementation_profile`, an `implementation_fidelity`, and a `suite_profile`.
 The default 5×5 suite is `common_budget_diagnostic`, is visibly labelled
 `COMMON-BUDGET PORT / NOT PAPER REPRODUCTION`, and is never reported as paper
-reproduction. `primary_research_benchmark` uses upstream-aligned profiles,
-keeps locomotion Cal-QL explicitly labelled as a task port, and excludes PQE
-because the current implementation is only `pqe_shared_actor_approx`. The old
-`common_budget_robustness` and `method_fidelity` names remain compatibility
-profiles for existing commands and results.
-See [baseline_fidelity_manifest.yaml](docs/baseline_fidelity_manifest.yaml) for
-the pinned upstream commits and file/function provenance.
+reproduction. `primary_research_benchmark` consumes the conservative baseline
+registry and currently selects only the conditionally allowlisted RPEX and
+RIQL-naive source-aligned ports. WSRL is excluded until JAX/PyTorch numerical
+parity is verified; locomotion Cal-QL is a diagnostic task port; and local PQE
+is a shared-actor approximation. The old `common_budget_robustness` and
+`method_fidelity` names remain compatibility profiles for existing commands and
+results. See [reproduction_matrix.md](docs/reproduction_matrix.md) for the
+current strict status and
+[baseline_fidelity_manifest.yaml](docs/baseline_fidelity_manifest.yaml) for
+pinned source provenance.
 
 ## 1. Algorithms
 
@@ -84,7 +102,7 @@ The CLI names and reference papers or configurations are listed below.
 
 | # | `--algorithm` | Paper/configuration | Offline → online behavior |
 |---|---|---|---|
-| 1 | `rpex` | *Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption* | RIQL pretraining followed by IPW-based robust policy expansion |
+| 1 | `rpex` | *RPEX: Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption* | RIQL pretraining followed by IPW-based robust policy expansion |
 | 2 | `riql_pex` | RIQL+PEX ablation from RPEX | RIQL pretraining followed by PEX without IPW |
 | 3 | `riql_naive` | *Towards Robust Offline Reinforcement Learning under Diverse Data Corruption* | Applies the RIQL objective directly to online replay |
 | 4 | `uwmsg` | *Corruption-Robust Offline Reinforcement Learning with General Function Approximation* | Applies the UWMSG objective directly to online replay |
@@ -93,6 +111,12 @@ The CLI names and reference papers or configurations are listed below.
 | 7 | `wsrl` | *Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data* | CQL pretraining, frozen-policy warmup, and online-only SAC |
 | 8 | `ro2o` | *Towards Robust Offline-to-Online Reinforcement Learning via Uncertainty and Smoothness* | Q-ensemble/smoothness pretraining followed by replay-based online reduction |
 | 9 | `pessimistic_q_ensemble` | *Offline-to-Online Reinforcement Learning via Balanced Replay and Pessimistic Q-Ensemble* | Ensemble+CQL pretraining followed by density-ratio-balanced replay |
+
+For the five `run_55` baselines, the current implementation classifications are
+RPEX/RIQL-naive `source_aligned_port`, WSRL
+`framework_port_unverified`, Cal-QL locomotion `task_port`, and PQE
+`approximation`. None is labelled `exact_upstream_port`. The behavioral summary
+above describes the intended algorithm path, not a parity certificate.
 
 As requested, the online stages of `riql_naive` and `uwmsg` store newly collected
 transitions in a replay buffer and train on mini-batches using the same objective
@@ -105,10 +129,11 @@ mass; `--offline-ratio` sets its initial target mass. Use
 
 ## 2. Reproducibility environment
 
-The official RPEX protocol is a legacy stack. Use Linux x86_64 for exact
-reproduction; `mujoco_py` and its transitive PyBullet dependency are often not
-buildable on Apple Silicon. The code intentionally does not fall back to
-Gymnasium v4/v5 on macOS.
+The RPEX environment protocol is a pinned legacy stack. Use Linux x86_64 for
+the strict environment path; `mujoco_py` and its transitive PyBullet dependency
+are often not buildable on Apple Silicon. The code intentionally does not fall
+back to Gymnasium v4/v5 on macOS. Environment fidelity and learner numerical
+parity are recorded and gated separately.
 
 ```bash
 cd /Users/seobeom/programming/project/corruption_robust_o2o
@@ -126,13 +151,16 @@ python scripts/smoke_rpex_d4rl_v2.py \
 ```
 
 The smoke test verifies Gym 0.23.1, NumPy 1.23.5, the exact D4RL commit,
-`mujoco_py`, the complete environment registration, dataset loading, and score
-normalization. `--dataset-dir /path/to/datasets` changes the D4RL cache through
+`mujoco-py==2.1.2.14`, linked native MuJoCo version code `210`, the complete
+environment registration, dataset loading, and score normalization.
+`--dataset-dir /path/to/datasets` changes the D4RL cache through
 `d4rl.set_dataset_path()`.
 
-On a Linux x86_64 strict host, the bounded end-to-end preflight also performs
-10 offline updates, 20 online steps, at most two evaluation episodes, and a
-checkpoint save/load:
+On a Linux x86_64 strict host, the bounded end-to-end preflight loads and hashes
+all three medium-replay-v2 datasets, checks the official qlearning conversion,
+then performs 10 offline updates, 20 online steps, evaluation, checkpoint
+reload, deterministic interrupted/resumed comparison, and corruption-cache
+miss/hit artifact comparison:
 
 ```bash
 python scripts/preflight_strict.py
@@ -140,6 +168,12 @@ python scripts/preflight_strict.py
 
 It fails on unsupported platforms or version mismatches. It never substitutes
 the local Gymnasium diagnostic and reports that substitution as strict success.
+The executable save/resume equivalence exercised by this preflight is narrowly
+scoped to RIQL-naive with random observation corruption under a diagnostic
+common-budget smoke configuration. It resumes an offline checkpoint and does
+not exercise online-checkpoint restore or compare every saved replay/RNG state.
+It is not save/resume coverage for every strict algorithm/condition pair; that
+full-matrix coverage remains a blocker.
 
 The default device option is `--device auto`:
 
@@ -157,7 +191,7 @@ Gym or Gymnasium `Walker2d-v2/v4/v5` task.
 
 ## 3. Running one experiment
 
-The current default benchmark schedule is:
+The current **diagnostic/default CLI** schedule is:
 
 - Offline: `500,000` gradient updates
 - Online: `500,000` environment steps
@@ -167,6 +201,12 @@ The current default benchmark schedule is:
 Use `--offline-steps`, `--online-steps`, and `--updates-per-step` to change these
 values. A single command with `--stage both` runs offline pretraining and online
 fine-tuning sequentially with the same agent:
+
+These `500,000/500,000` defaults are for common-budget diagnostics. An audited
+RPEX/RIQL-naive `final_benchmark` instead locks the pinned public-code budgets
+to exactly `2,000,001` offline updates and `1,000,001` requested online steps,
+and requires the exact seed set `0,1,2,3,4`. Do not override those values in a
+strict command.
 
 ### Clean
 
@@ -207,6 +247,14 @@ python run_experiment.py \
   --stage both \
   --seed 0
 ```
+
+The command above is diagnostic-only because the target is `dynamics`. The
+registered adversarial golden certificate covers only the **Hopper
+observation-target optimizer core**. HalfCheetah/Walker2d observations and all
+adversarial `actions`, `rewards`, and `dynamics` remain executable diagnostic
+conditions but are rejected from strict/final results. Even the certified
+Hopper observation core is not a whole-wrapper or complete learner parity
+certificate.
 
 The following corruption targets are supported:
 
@@ -385,6 +433,12 @@ RNG, environment, counter, and writer state is eligible. The requested
 canonical manifest must equal the original manifest; otherwise the command
 fails and instructs the user to initialize a new run instead.
 
+Current executable equivalence coverage is RIQL-naive plus random observation
+corruption in the diagnostic smoke path only. Save/resume equivalence has not
+been demonstrated for every strict baseline/condition, especially the
+adversarial path, so this section describes the mechanism rather than a
+full-benchmark certificate.
+
 ## Quick training diagnostics
 
 The lightweight runner checks finite updates, action/replay invariants, and
@@ -487,6 +541,10 @@ results/comparisons/<protocol>/<profile>/<env>/<corruption>/<target>/<comparison
 ├── comparison_online.png
 ├── comparison_{offline_online,offline,online}.csv
 ├── final_scores.csv
+├── per_seed_final_scores.csv
+├── paper_reproduction_summary.csv
+├── common_per_seed_final_scores.csv
+├── common_benchmark_summary.csv
 ├── timing.csv
 └── manifest.json
 ```
@@ -496,8 +554,16 @@ results/comparisons/<protocol>/<profile>/<env>/<corruption>/<target>/<comparison
   `diagnostic_running_{offline_online,offline,online}.png` files are refreshed
   after every evaluation and may include the currently running algorithm.
 - The matching CSV files contain mean/std/count at every evaluation step.
-- `final_scores.csv`: final normalized/raw return and runtime mean/std by
-  algorithm
+- `final_scores.csv`: backward-compatible common last-three metric; it is not a
+  paper metric
+- `per_seed_final_scores.csv`: publication-eligible source-primary per-seed
+  outputs with each row's reproduction and condition status preserved
+- `paper_reproduction_summary.csv`: only verified rows with
+  `paper_reproduction_eligible=true`; current source-aligned ports are excluded,
+  so an empty file is an intentional fail-closed result
+- `common_per_seed_final_scores.csv` and `common_benchmark_summary.csv`: one
+  declared common rule for cross-algorithm comparison, never an official-paper
+  score
 - `timing.csv`: start/end time and elapsed time for every algorithm/seed run
 - `manifest.json`: commands, return codes, per-algorithm timing summaries,
   overall timing, and artifact paths
@@ -528,13 +594,65 @@ python run_55_experiment.py \
   --suite-profile common_budget_diagnostic
 ```
 
-This runs 25 experiments for the default seed, with 500,000 offline updates and
-500,000 online environment steps per experiment. Its default protocol is the
-strict `rpex_d4rl_v2_legacy` benchmark. Use
+This runs 25 diagnostic experiments for the default seed, with 500,000 offline
+updates and 500,000 online environment steps per experiment. It uses the pinned
+`rpex_d4rl_v2_legacy` environment backend by default, but the common budget,
+single seed, and non-reference implementations make these results
+non-publication diagnostics. Use
 `--seeds 0,1,2` for a multi-seed suite, `--dry-run` to print all generated
 experiment commands, and `--keep-going` to continue after a failed algorithm or
 setting. Additional experiment options such as `--device cpu` are forwarded to
 every run.
+
+Select suites explicitly with `--corruption-suite clean`, `random`,
+`adversarial`, or `all`. `random` is the historical clean-plus-four-random
+5×5 diagnostic suite. A diagnostic adversarial suite contains all four single
+targets from the pinned RPEX source, but only the Hopper observation-target
+optimizer core has a registered golden certificate. A strict primary suite
+therefore selects adversarial observations only, and its child config accepts
+that condition only for Hopper; other tasks and adversarial
+actions/rewards/dynamics are diagnostic-only. Applying an RPEX corruption
+condition to another baseline is recorded as `benchmark_transfer`.
+
+Before any strict run, on a supported Linux x86_64 host, execute:
+
+```bash
+python scripts/audit_reproducibility.py
+```
+
+The audit prints separate eligible-subset and five-baseline decisions. Its
+compatibility line `FINAL BENCHMARK STATUS` refers to the eligible subset, not
+to all five baselines. At present `FIVE-BASELINE BENCHMARK STATUS` is **NOT
+READY**: WSRL lacks numerical parity, Cal-QL locomotion is a task port, and PQE
+is an approximation. `ELIGIBLE-SUBSET BENCHMARK STATUS` is also currently
+**NOT READY**, because the executable save/resume smoke covers only RIQL-naive
+with random observation corruption rather than every eligible baseline ×
+certified condition. The full fresh-process online-constructor RNG trajectory
+and upstream evaluation environment/RNG schedule are also unmatched. Both
+golden fixtures must also be regenerated under the pinned strict NumPy/PyTorch
+runtime. The strict registry conditionally allowlists RPEX and RIQL-naive as
+candidates, but they may run only after all four gaps are closed and the target
+Linux audit prints `ELIGIBLE-SUBSET BENCHMARK STATUS: READY`. The strict runner also
+enforces an audit gate, exact seeds
+`0,1,2,3,4`, and official budgets `2,000,001/1,000,001`.
+
+Only after the missing save/resume, constructor-RNG, evaluation-RNG, and
+strict-runtime fixture work is implemented and that audit succeeds, the
+eligible-subset command will be:
+
+```bash
+python run_55_experiment.py \
+  --env-name hopper-medium-replay-v2 \
+  --corruption-suite random \
+  --suite-profile primary_research_benchmark \
+  --run-purpose final_benchmark \
+  --seeds 0,1,2,3,4
+```
+
+Do not run this command on the current Mac. It must fail its strict environment
+or audit gate there. Do not run it on Linux while the eligible-subset audit is
+still `NOT READY`, either. The complete five-baseline suite has no authorized
+final command until its three excluded implementations are resolved.
 
 For a local Mac smoke/debug run only:
 
@@ -542,6 +660,9 @@ For a local Mac smoke/debug run only:
 conda activate corruption
 python run_55_experiment.py \
   --env-name halfcheetah-medium-replay-v2 \
+  --corruption-suite random \
+  --suite-profile common_budget_diagnostic \
+  --run-purpose diagnostic \
   --protocol local_gymnasium_v4_diagnostic \
   --allow-diagnostic-protocol
 ```
@@ -563,6 +684,11 @@ python run_matrix.py \
 
 For each algorithm, this runs one `clean` experiment, one `random dynamics`
 experiment, and one `adversarial dynamics` experiment.
+
+This matrix command is diagnostic. In particular, adversarial dynamics has no
+registered strict golden fixture; only the Hopper adversarial
+observation-target optimizer core is certified. Do not relabel this matrix as
+a final or paper reproduction suite.
 
 Print the generated commands without starting experiments:
 
@@ -633,7 +759,7 @@ results/
 - `performance.png`: normalized-return curve for one run
 - `summary.json`: start/end timestamps, total elapsed time, final performance,
   and success/failure status
-- `config.json`: complete arguments, exact protocol and D4RL environment ID,
+- `config.json`: complete arguments, selected protocol and D4RL environment ID,
   registered class, D4RL commit, dataset URL/path/SHA-256 when available, and
   installed Python/NumPy/PyTorch/Gym/D4RL/mujoco-py/h5py versions
 
@@ -680,9 +806,22 @@ ELAPSED: 04:05:05 (14705.000 seconds)
 ## 9. Important points for performance and runtime comparisons
 
 - Use `common_budget_diagnostic` when offline/online budgets must be identical.
-  Use `primary_research_benchmark` for the research-facing suite; it excludes
-  the shared-actor PQE approximation. A `final_benchmark` run requires at least
-  seeds `0,1,2,3,4`. Never combine these suites in one reported curve.
+  `primary_research_benchmark` uses the strict registry and currently retains
+  only conditionally allowlisted candidate implementations RPEX and
+  RIQL-naive. Their subset remains blocked by incomplete save/resume coverage,
+  unmatched online-constructor/evaluation RNG trajectories, and fixture
+  generation-runtime mismatch.
+  WSRL, Cal-QL locomotion, and local PQE are excluded for the reasons in the
+  reproduction matrix. A `final_benchmark` run requires the audit gate, exactly
+  seeds `0,1,2,3,4`, the official RPEX/RIQL-naive budgets
+  `2,000,001/1,000,001`, and full eligible-baseline × certified-condition
+  save/resume equivalence, online-constructor/evaluation RNG parity, fixtures
+  regenerated under the strict pins, plus every other strict gate. Never
+  combine these suites in one reported curve.
+- `paper_reproduction` is a reserved run purpose and currently fails closed:
+  no baseline has a certified paper-specific task, seed, budget, environment,
+  learner, corruption, and reporting contract. Use `diagnostic` for exploratory
+  runs or the narrower audited `final_benchmark` contract where eligible.
 - On supported hardware, RO2O with `--ro2o-sample-size 20` and the 10-critic
   UWMSG/RO2O configurations are particularly slow. Reduce the sample size or
   critic count only during exploratory runs, and restore the original values
@@ -704,14 +843,15 @@ ELAPSED: 04:05:05 (14705.000 seconds)
 
 ## 10. Implementation sources
 
-The provided `RPEX`, `RIQL-main`, and `UWMSG-main` codebases are the primary
-references for the unified objectives and default values. The remaining
-baselines were adapted to the shared PyTorch/replay interface using their
-official public implementations and algorithm descriptions.
+The provided and pinned upstream codebases are source references for the
+unified objectives and default values. A reference URL does not mean that the
+local learner is a thin wrapper or a numerically verified port.
 
-See `docs/baseline_fidelity_manifest.yaml` before treating any adaptation as a
-paper reproduction. In particular, locomotion Cal-QL is a task port and the
-current Pessimistic Q-Ensemble is an approximation.
+See `docs/reproduction_matrix.md` and
+`docs/baseline_fidelity_manifest.yaml` before interpreting any result. RPEX and
+RIQL-naive are source-aligned ports, WSRL is an unverified framework port,
+locomotion Cal-QL is a task port, and the current Pessimistic Q-Ensemble is an
+approximation.
 
 - RPEX: <https://github.com/felix-thu/RPEX>
 - Pinned D4RL environment registry, dataset conversion, and normalization:

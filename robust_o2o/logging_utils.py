@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .paths import resolve_run_layout
-from .manifest import build_experiment_manifest
+from .manifest import (
+    build_experiment_manifest,
+    resume_identity_signature,
+    verify_experiment_manifest,
+)
+from .fidelity import canonical_json_sha256
 
 
 METRIC_FIELDS = (
@@ -35,6 +40,23 @@ METRIC_FIELDS = (
 )
 
 
+def resolve_resume_run_directory(path_value: str) -> Path:
+    """Resolve a run directory without opening or modifying any run artifact."""
+
+    supplied = Path(path_value).expanduser().resolve()
+    run_dir = supplied.parents[2] if supplied.is_file() else supplied
+    if not (run_dir / "metrics.csv").exists():
+        raise ValueError(
+            "--resume-run must name a run directory or one of its checkpoints"
+        )
+    runs_ancestor = next(
+        (parent for parent in run_dir.parents if parent.name == "runs"), None
+    )
+    if runs_ancestor is None:
+        raise ValueError("resume run is not inside a canonical runs directory")
+    return run_dir
+
+
 class RunLogger:
     def __init__(self, config: object):
         self.start_wall = datetime.now().astimezone()
@@ -45,31 +67,25 @@ class RunLogger:
         run_id = f"{stamp}_{short_id}"
         self.run_id = run_id
         self.short_id = short_id
+        self._resume_committed = not bool(config.resume_run)
         if config.resume_run:
-            supplied = Path(config.resume_run).expanduser().resolve()
-            run_dir = supplied
-            if supplied.is_file():
-                # <run>/checkpoints/<phase>/<file>.pt
-                run_dir = supplied.parents[2]
-            if not (run_dir / "metrics.csv").exists():
-                raise ValueError(
-                    "--resume-run must name a run directory or one of its checkpoints"
-                )
+            run_dir = resolve_resume_run_directory(config.resume_run)
             runs_ancestor = next(
                 (parent for parent in run_dir.parents if parent.name == "runs"), None
             )
-            if runs_ancestor is None:
-                raise ValueError("resume run is not inside a canonical runs directory")
+            assert runs_ancestor is not None
             self.comparison_dir = runs_ancestor.parent
             self.run_dir = run_dir
             self.run_id = run_dir.name
             self.metrics_path = run_dir / "metrics.csv"
             self.train_metrics_path = run_dir / "train_metrics.jsonl"
             summary_path = run_dir / "summary.json"
+            previous_last_eval = None
             if summary_path.exists():
                 previous_summary = json.loads(
                     summary_path.read_text(encoding="utf-8")
                 )
+                previous_last_eval = previous_summary.get("last_evaluation")
                 self.elapsed_offset = float(
                     previous_summary.get("elapsed_seconds", 0.0)
                 )
@@ -99,9 +115,12 @@ class RunLogger:
             self.logger = logging.getLogger(f"robust_o2o.{short_id}")
             self.logger.setLevel(logging.INFO)
             self.logger.propagate = False
-            self._configure_handlers()
+            # Do not open result.log until all resume identity and checkpoint
+            # append-position checks have passed.  A rejected resume must be a
+            # read-only operation on the original run directory.
+            self.logger.handlers = []
             self._manifest_written = True
-            self.last_eval = None
+            self.last_eval = previous_last_eval
             self.config = config
             return
 
@@ -166,6 +185,17 @@ class RunLogger:
         self.logger.handlers = [file_handler, stream_handler]
 
     @property
+    def resume_committed(self) -> bool:
+        """Whether this invocation may write failure/completion run state."""
+
+        return self._resume_committed
+
+    def close(self) -> None:
+        for handler in self.logger.handlers:
+            handler.close()
+        self.logger.handlers = []
+
+    @property
     def elapsed(self) -> float:
         return self.elapsed_offset + time.perf_counter() - self.start_monotonic
 
@@ -175,22 +205,72 @@ class RunLogger:
             if not manifest_path.exists():
                 raise ValueError("resume run has no canonical experiment manifest")
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            verify_experiment_manifest(manifest)
             requested_manifest = build_experiment_manifest(config)
-            if requested_manifest["manifest_sha256"] != manifest["manifest_sha256"]:
+            requested_identity = resume_identity_signature(requested_manifest)
+            original_identity = resume_identity_signature(manifest)
+            if requested_identity != original_identity:
                 raise ValueError(
                     "resume configuration does not match the original canonical "
                     "manifest; use --initialize-from-checkpoint for a new run"
                 )
             setattr(self.config, "_manifest_sha256", manifest["manifest_sha256"])
+            summary_path = self.run_dir / "summary.json"
+            previous_summary = (
+                json.loads(summary_path.read_text(encoding="utf-8"))
+                if summary_path.exists()
+                else {}
+            )
+            resume_timestamp = datetime.now().astimezone()
+            completion_path = self.run_dir / "completed_experiment_manifest.json"
+            superseded_completion = None
+            # Every validation above is read-only.  From this point an accepted
+            # resume intentionally transitions the prior run back to running.
+            self._resume_committed = True
+            if completion_path.exists():
+                suffix = resume_timestamp.strftime("%Y%m%d_%H%M%S_%f")
+                superseded_completion = self.run_dir / (
+                    f"completed_experiment_manifest.superseded_{suffix}.json"
+                )
+                completion_path.replace(superseded_completion)
             event = {
-                "timestamp": datetime.now().astimezone().isoformat(),
+                "timestamp": resume_timestamp.isoformat(),
                 "resume_source": str(self.config.resume_run),
                 "resolved_config_sha256": requested_manifest["manifest_sha256"],
+                "resume_identity_sha256": requested_identity,
+                "launch_manifest_sha256": manifest["manifest_sha256"],
+                "resume_final_audit_receipt_sha256": requested_manifest.get(
+                    "final_audit_receipt_sha256"
+                ),
+                "previous_status": previous_summary.get("status"),
+                "superseded_completion_manifest": (
+                    str(superseded_completion)
+                    if superseded_completion is not None
+                    else None
+                ),
             }
             with (self.run_dir / "resume_events.jsonl").open(
                 "a", encoding="utf-8"
             ) as stream:
                 stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+            running_summary = {
+                **previous_summary,
+                "status": "running",
+                "start_time": previous_summary.get(
+                    "start_time", format_timestamp(self.start_wall)
+                ),
+                "end_time": None,
+                "elapsed_seconds": self.elapsed,
+                "elapsed_hms": format_duration(self.elapsed),
+                "error": None,
+                "run_dir": str(self.run_dir),
+                "resume_started_at": format_timestamp(resume_timestamp),
+            }
+            temporary_summary = summary_path.with_suffix(".json.tmp")
+            with temporary_summary.open("w", encoding="utf-8") as stream:
+                json.dump(running_summary, stream, indent=2, ensure_ascii=False)
+            temporary_summary.replace(summary_path)
+            self._configure_handlers()
             return
         if not self._manifest_written:
             manifest = build_experiment_manifest(config)
@@ -224,6 +304,34 @@ class RunLogger:
         for filename in ("config.json", "resolved_config.json"):
             with (self.run_dir / filename).open("w", encoding="utf-8") as stream:
                 json.dump(config, stream, indent=2, ensure_ascii=False, default=str)
+
+    def write_completion_manifest(self, outcomes: Dict[str, Any]) -> Path:
+        """Write immutable launch provenance plus measured run outcomes.
+
+        ``experiment_manifest.json`` remains the launch identity used by exact
+        resume validation.  Runtime-dependent values (for example official
+        episode-boundary overshoot) live in a separately hashed completion
+        manifest so recording them cannot invalidate a checkpoint's launch
+        fingerprint.
+        """
+
+        launch_path = self.run_dir / "experiment_manifest.json"
+        if not launch_path.exists():
+            raise ValueError("cannot complete a run without a launch manifest")
+        launch = json.loads(launch_path.read_text(encoding="utf-8"))
+        payload = {
+            **launch,
+            **outcomes,
+            "launch_manifest_sha256": launch.get("manifest_sha256"),
+        }
+        payload.pop("completion_manifest_sha256", None)
+        payload["completion_manifest_sha256"] = canonical_json_sha256(payload)
+        output = self.run_dir / "completed_experiment_manifest.json"
+        temporary = output.with_suffix(output.suffix + ".tmp")
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, ensure_ascii=False, default=str)
+        temporary.replace(output)
+        return output
 
     def log_train(
         self,
@@ -283,9 +391,9 @@ class RunLogger:
             metrics["normalized_return_std"],
         )
         try:
-            from plot_results import update_comparison_plots
+            from plot_results import update_live_comparison_plots
 
-            update_comparison_plots(
+            update_live_comparison_plots(
                 self.comparison_dir,
                 self.config.env_name,
                 self.config.corruption,
@@ -297,6 +405,10 @@ class RunLogger:
     def finish(
         self, status: str, error: Optional[str] = None
     ) -> Dict[str, Any]:
+        if self.config.resume_run and not self._resume_committed:
+            raise RuntimeError(
+                "refusing to mutate an original run for an uncommitted resume"
+            )
         end = datetime.now().astimezone()
         elapsed = self.elapsed
         summary = {
@@ -314,9 +426,9 @@ class RunLogger:
             json.dump(summary, stream, indent=2, ensure_ascii=False)
         if status == "completed":
             try:
-                from plot_results import update_comparison_plots
+                from plot_results import update_live_comparison_plots
 
-                update_comparison_plots(
+                update_live_comparison_plots(
                     self.comparison_dir,
                     self.config.env_name,
                     self.config.corruption,

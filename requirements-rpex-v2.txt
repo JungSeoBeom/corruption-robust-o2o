@@ -2,6 +2,7 @@
 numpy==1.23.5
 gym==0.23.1
 d4rl @ git+https://github.com/rail-berkeley/d4rl@d842aa194b416e564e54b0730d9f934e3e32f854
+mujoco-py==2.1.2.14
 
 # Build/runtime packages compatible with mujoco_py and Python 3.10.
 Cython==0.29.37

@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from robust_o2o.agents import build_agent
+from robust_o2o.agents.iql_family import official_epsilon_greedy_sample
 from robust_o2o.agents.calql import calql_max_target_backup
 from robust_o2o.cql import importance_sampled_cql
 from robust_o2o.config import (
@@ -44,6 +45,85 @@ class ZeroPolicy:
 
 
 class ReferenceProfileTest(unittest.TestCase):
+    def test_official_epsilon_greedy_sample_matches_upstream_call_order(self):
+        logits = torch.tensor(
+            [[3.0, -1.0], [0.2, 0.7], [-2.0, 2.0], [0.0, 0.0]]
+        )
+        torch.manual_seed(311)
+        expected_distribution = torch.distributions.Categorical(logits=logits)
+        expected = expected_distribution.sample()
+        greedy = expected_distribution.probs.argmax(dim=-1)
+        greedy_mask = torch.rand(expected.shape[0]) > 0.1
+        expected[greedy_mask] = greedy[greedy_mask]
+        expected_state = torch.random.get_rng_state().clone()
+
+        torch.manual_seed(311)
+        actual = official_epsilon_greedy_sample(
+            torch.distributions.Categorical(logits=logits), 0.1
+        )
+        actual_state = torch.random.get_rng_state().clone()
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertTrue(torch.equal(actual_state, expected_state))
+
+    def test_official_online_transition_uses_fresh_adam_optimizers(self):
+        for algorithm in ("rpex", "riql_naive"):
+            with self.subTest(algorithm=algorithm):
+                seed_everything(19)
+                config = ExperimentConfig(
+                    algorithm,
+                    "hopper-medium-replay-v2",
+                    implementation_profile="official_code_reference",
+                    hidden_dim=8,
+                    hidden_layers=1,
+                    batch_size=8,
+                    offline_steps=4,
+                )
+                agent = build_agent(
+                    config, 3, 2, 1.0, torch.device("cpu")
+                )
+                agent.update(tensor_batch())
+                self.assertTrue(agent.q_optimizer.state)
+                self.assertTrue(agent.value_optimizer.state)
+                self.assertTrue(agent.actor_optimizer.state)
+                offline_actor = {
+                    key: value.detach().clone()
+                    for key, value in agent.actor.state_dict().items()
+                }
+
+                agent.begin_online()
+
+                self.assertFalse(agent.q_optimizer.state)
+                self.assertFalse(agent.value_optimizer.state)
+                self.assertFalse(agent.actor_optimizer.state)
+                self.assertIsNone(agent.actor_scheduler)
+                self.assertEqual(
+                    agent.q_optimizer.param_groups[0]["lr"],
+                    config.critic_learning_rate,
+                )
+                self.assertEqual(
+                    agent.actor_optimizer.param_groups[0]["lr"],
+                    config.actor_learning_rate,
+                )
+                if algorithm == "rpex":
+                    self.assertIsNotNone(agent.offline_actor)
+                    for key, value in offline_actor.items():
+                        torch.testing.assert_close(
+                            agent.offline_actor.state_dict()[key], value
+                        )
+                    self.assertTrue(
+                        any(
+                            not torch.equal(
+                                agent.actor.state_dict()[key], value
+                            )
+                            for key, value in offline_actor.items()
+                        )
+                    )
+                else:
+                    for key, value in offline_actor.items():
+                        torch.testing.assert_close(
+                            agent.actor.state_dict()[key], value
+                        )
+
     def test_calql_max_target_backup_uses_clipped_double_q_argmax(self):
         q1 = torch.tensor([[1.0, 5.0, 2.0], [7.0, 2.0, 1.0]])
         q2 = torch.tensor([[2.0, 4.0, 3.0], [6.0, 3.0, 4.0]])

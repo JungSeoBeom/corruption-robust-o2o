@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -16,7 +17,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-from plot_results import update_comparison_plots, write_final_score_summary
+from plot_results import (
+    update_comparison_plots,
+    write_final_score_summary,
+    write_reproduction_summaries,
+)
 from robust_o2o.config import (
     ALGORITHMS,
     BENCHMARK_ENVS,
@@ -32,9 +37,21 @@ from robust_o2o.fidelity import (
     IMPLEMENTATION_PROFILES,
     ONLINE_CORRUPTION_SCALE_PROFILES,
     RUN_PURPOSES,
+    STRICT_FINAL_SEEDS,
     SUITE_PROFILES,
+    STRICT_FINAL_TASKS,
+    strict_final_algorithms,
 )
 from robust_o2o.environment import preflight_runtime
+from robust_o2o.final_gate import (
+    AUDIT_RECEIPT_ENV,
+    AUDIT_RECEIPT_SHA256_ENV,
+    FinalAuditGateError,
+    ResearchLabelContractError,
+    require_final_benchmark_audit,
+    validate_research_label_contract,
+    write_final_audit_evidence,
+)
 from robust_o2o.logging_utils import format_duration, format_timestamp
 from robust_o2o.paths import comparison_directory
 
@@ -63,6 +80,24 @@ TIMING_FIELDS = (
     "returncode",
 )
 
+RESERVED_PASSTHROUGH_OPTIONS = {
+    "--algorithm",
+    "--benchmark-seed-set",
+    "--comparison-name",
+    "--corruption",
+    "--corruption-target",
+    "--env-name",
+    "--implementation-profile",
+    "--algorithm-profile",
+    "--online-corruption-scale-profile",
+    "--output-dir",
+    "--protocol",
+    "--run-purpose",
+    "--seed",
+    "--stage",
+    "--suite-profile",
+}
+
 
 def _csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
@@ -89,6 +124,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--algorithms", type=_csv, default=list(ALGORITHMS))
     parser.add_argument("--seeds", type=_csv, default=["0"])
+    parser.add_argument(
+        "--benchmark-seed-set",
+        type=int,
+        nargs="+",
+        help="controller-declared strict cohort propagated to child runs",
+    )
     parser.add_argument("--stage", choices=("offline", "both"), default="both")
     parser.add_argument("--protocol", choices=PROTOCOLS, default=DEFAULT_PROTOCOL)
     parser.add_argument("--implementation-profile", choices=IMPLEMENTATION_PROFILES)
@@ -110,7 +151,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+def _validate_args(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    passthrough: Iterable[str] = (),
+) -> None:
     if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
         args.protocol = LOCAL_PROTOCOL
     original_env_name = args.env_name
@@ -137,21 +182,111 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             int(seed)
         except ValueError:
             parser.error(f"invalid seed: {seed!r}")
+    conflicts = sorted(
+        option
+        for option in passthrough
+        if option.split("=", 1)[0] in RESERVED_PASSTHROUGH_OPTIONS
+    )
+    if conflicts:
+        parser.error(
+            "these child identity/provenance options cannot be overridden: "
+            + ", ".join(conflicts)
+        )
+    try:
+        validate_research_label_contract(
+            args.run_purpose,
+            args.suite_profile,
+            args.algorithms,
+        )
+    except ResearchLabelContractError as exc:
+        parser.error(str(exc))
     if args.run_purpose == "final_benchmark":
-        required = {"0", "1", "2", "3", "4"}
-        if not required.issubset(set(args.seeds)):
+        required = {str(seed) for seed in STRICT_FINAL_SEEDS}
+        if set(args.seeds) != required or len(args.seeds) != len(required):
             parser.error(
-                "final_benchmark requires at least seeds 0,1,2,3,4; "
+                "final_benchmark requires exactly seeds 0,1,2,3,4; "
                 "single-seed runs are smoke/diagnostic only"
             )
-    if (
-        args.suite_profile == "primary_research_benchmark"
-        and "pessimistic_q_ensemble" in args.algorithms
-    ):
-        parser.error(
-            "primary_research_benchmark excludes the local PQE shared-actor "
-            "approximation; remove pessimistic_q_ensemble"
+        declared_seed_set = tuple(
+            args.benchmark_seed_set
+            if args.benchmark_seed_set is not None
+            else (int(seed) for seed in args.seeds)
         )
+        if declared_seed_set != STRICT_FINAL_SEEDS:
+            parser.error(
+                "final_benchmark requires --benchmark-seed-set 0 1 2 3 4 "
+                "(it is inferred from --seeds when omitted)"
+            )
+        args.benchmark_seed_set = list(STRICT_FINAL_SEEDS)
+        if args.suite_profile != "primary_research_benchmark":
+            parser.error(
+                "final_benchmark requires "
+                "--suite-profile primary_research_benchmark"
+            )
+        if args.protocol != DEFAULT_PROTOCOL:
+            parser.error(
+                "final_benchmark requires rpex_d4rl_v2_legacy; no local fallback"
+            )
+        if args.stage != "both":
+            parser.error("final_benchmark requires --stage both")
+        if args.env_name not in STRICT_FINAL_TASKS:
+            parser.error(
+                "final_benchmark permits only hopper/halfcheetah/walker2d "
+                "medium-replay-v2 tasks"
+            )
+        forbidden = sorted(
+            set(args.algorithms) - set(strict_final_algorithms())
+        )
+        if forbidden:
+            parser.error(
+                "final_benchmark rejects non-exact/non-allowlisted baselines: "
+                + ", ".join(forbidden)
+            )
+        if args.implementation_profile not in (None, "official_code_reference"):
+            parser.error(
+                "final_benchmark requires --implementation-profile "
+                "official_code_reference"
+            )
+        if args.online_corruption_scale_profile not in (
+            None,
+            "rpex_official_code",
+        ):
+            parser.error(
+                "final_benchmark requires --online-corruption-scale-profile "
+                "rpex_official_code"
+            )
+        if args.corruption not in ("clean", "random", "adversarial"):
+            parser.error(
+                "final_benchmark permits only clean, random, or certified "
+                "adversarial corruption"
+            )
+        if (
+            args.corruption == "adversarial"
+            and args.corruption_target != "observations"
+        ):
+            parser.error(
+                "final_benchmark adversarial corruption is certified only for "
+                "the observations target"
+            )
+        if (
+            args.corruption == "adversarial"
+            and args.env_name != "hopper-medium-replay-v2"
+        ):
+            parser.error(
+                "final_benchmark adversarial observations currently require "
+                "hopper-medium-replay-v2: the registered optimizer-core "
+                "fixture is bound to the Hopper EDAC checkpoint"
+            )
+    if args.suite_profile == "primary_research_benchmark":
+        forbidden = sorted(
+            set(args.algorithms) - set(strict_final_algorithms())
+        )
+        if forbidden:
+            parser.error(
+                "primary_research_benchmark excludes non-allowlisted ports: "
+                + ", ".join(forbidden)
+                + "; use common_budget_diagnostic for these algorithms"
+            )
     if args.online_corruption_scale_profile is None:
         args.online_corruption_scale_profile = (
             "rpex_official_code"
@@ -250,6 +385,16 @@ def commands(
                 command.append("--allow-diagnostic-protocol")
             if args.dataset_dir:
                 command.extend(("--dataset-dir", args.dataset_dir))
+            if args.run_purpose == "final_benchmark":
+                declared_seed_set = (
+                    args.benchmark_seed_set or list(STRICT_FINAL_SEEDS)
+                )
+                command.extend(
+                    (
+                        "--benchmark-seed-set",
+                        *(str(seed) for seed in declared_seed_set),
+                    )
+                )
             command.extend(passthrough)
             yield command
 
@@ -303,10 +448,35 @@ def _print_algorithm_summary(summary: dict, prefix: str) -> None:
     )
 
 
+def _remove_invalid_canonical_artifacts(comparison_dir: Path) -> None:
+    """Remove canonical-looking outputs after any incomplete aggregation."""
+
+    names = {
+        "final_scores.csv",
+        "per_seed_final_scores.csv",
+        "paper_reproduction_summary.csv",
+        "common_per_seed_final_scores.csv",
+        "common_benchmark_summary.csv",
+    }
+    for phase in ("offline_online", "offline", "online"):
+        names.add(f"comparison_{phase}.png")
+        names.add(f"comparison_{phase}.csv")
+    for name in names:
+        (comparison_dir / name).unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = build_parser()
     args, passthrough = parser.parse_known_args()
-    _validate_args(parser, args)
+    _validate_args(parser, args, passthrough)
+    try:
+        audit_receipt = require_final_benchmark_audit(
+            args.run_purpose,
+            dry_run=args.dry_run,
+        )
+    except FinalAuditGateError as exc:
+        print(f"FINAL_BENCHMARK_AUDIT_GATE_FAILED: {exc}", file=sys.stderr)
+        return 2
     comparison_dir = _comparison_directory(args)
     runs_dir = comparison_dir / "runs"
     generated_commands = list(commands(args, passthrough, runs_dir))
@@ -348,12 +518,18 @@ def main() -> int:
         )
 
     print(f"COMPARISON_DIR: {comparison_dir}", flush=True)
+    if args.run_purpose in ("smoke", "diagnostic"):
+        print("NOT A PAPER REPRODUCTION RUN", flush=True)
+        print("NOT PUBLICATION-ELIGIBLE", flush=True)
     for index, command in enumerate(generated_commands, start=1):
         print(f"[{index}/{len(generated_commands)}] {shlex.join(command)}", flush=True)
     if args.dry_run:
         return 0
 
     comparison_dir.mkdir(parents=True, exist_ok=False)
+    audit_evidence_path = write_final_audit_evidence(
+        comparison_dir, audit_receipt
+    )
     start_wall = datetime.now().astimezone()
     start_monotonic = time.perf_counter()
     run_records = []
@@ -405,33 +581,64 @@ def main() -> int:
     phase = "online" if args.stage == "both" else "offline"
     artifacts = {"timing_csv": str(timing_path)}
     aggregation_error = None
-    try:
-        plot_paths = update_comparison_plots(
-            comparison_dir,
-            args.env_name,
-            args.corruption,
-            args.corruption_target,
+    failures = sum(record["returncode"] != 0 for record in run_records)
+    incomplete_runs = len(run_records) != len(generated_commands)
+    if failures or incomplete_runs:
+        aggregation_error = (
+            f"suite is incomplete: completed controller records="
+            f"{len(run_records)}/{len(generated_commands)}, failed={failures}; "
+            "canonical result artifacts were not published"
         )
-        final_scores_path = write_final_score_summary(
-            runs_dir,
-            comparison_dir / "final_scores.csv",
-            args.env_name,
-            args.corruption,
-            args.corruption_target,
-            phase,
-        )
-        artifacts = {
-            **artifacts,
-            "plots": {name: str(path) for name, path in plot_paths.items()},
-            "curve_csvs": {
-                name: str(path.with_suffix(".csv"))
-                for name, path in plot_paths.items()
-            },
-            "final_scores_csv": str(final_scores_path),
-        }
-    except Exception as exc:
-        aggregation_error = f"{type(exc).__name__}: {exc}"
+    else:
+        try:
+            # Validate reporting first. In strict mode this catches missing or
+            # duplicate seeds/evaluations before canonical plots or the common
+            # final_scores alias are published.
+            reporting_paths = write_reproduction_summaries(
+                runs_dir,
+                comparison_dir,
+                args.env_name,
+                args.corruption,
+                args.corruption_target,
+                strict=args.run_purpose == "final_benchmark",
+                expected_seeds=(
+                    [int(seed) for seed in args.seeds]
+                    if args.run_purpose == "final_benchmark"
+                    else None
+                ),
+                phase=phase,
+            )
+            plot_paths = update_comparison_plots(
+                comparison_dir,
+                args.env_name,
+                args.corruption,
+                args.corruption_target,
+            )
+            final_scores_path = write_final_score_summary(
+                runs_dir,
+                comparison_dir / "final_scores.csv",
+                args.env_name,
+                args.corruption,
+                args.corruption_target,
+                phase,
+            )
+            artifacts = {
+                **artifacts,
+                "plots": {name: str(path) for name, path in plot_paths.items()},
+                "curve_csvs": {
+                    name: str(path.with_suffix(".csv"))
+                    for name, path in plot_paths.items()
+                },
+                "final_scores_csv": str(final_scores_path),
+                "reporting_csvs": {
+                    name: str(path) for name, path in reporting_paths.items()
+                },
+            }
+        except Exception as exc:
+            aggregation_error = f"{type(exc).__name__}: {exc}"
+    if aggregation_error:
         print(f"Aggregation skipped: {aggregation_error}", file=sys.stderr)
+        _remove_invalid_canonical_artifacts(comparison_dir)
 
     end_wall = datetime.now().astimezone()
     elapsed = time.perf_counter() - start_monotonic
@@ -440,6 +647,18 @@ def main() -> int:
         "implementation_profile": args.implementation_profile or "auto",
         "suite_profile": args.suite_profile,
         "run_purpose": args.run_purpose,
+        "final_audit": (
+            None
+            if audit_receipt is None
+            else {
+                "context_token": audit_receipt["context_token"],
+                "issued_at_utc": audit_receipt["issued_at_utc"],
+                "receipt_source": os.environ.get(AUDIT_RECEIPT_ENV),
+                "receipt_sha256": os.environ.get(AUDIT_RECEIPT_SHA256_ENV),
+                "evidence_path": str(audit_evidence_path),
+                "audit_result": audit_receipt["audit_result"],
+            }
+        ),
         "online_corruption_scale_profile": args.online_corruption_scale_profile,
         "environment": args.env_name,
         "corruption": args.corruption,
@@ -461,11 +680,11 @@ def main() -> int:
         "algorithm_timings": algorithm_timings,
         "artifacts": artifacts,
         "aggregation_error": aggregation_error,
+        "benchmark_valid": not failures and aggregation_error is None,
     }
     with (comparison_dir / "manifest.json").open("w", encoding="utf-8") as stream:
         json.dump(manifest, stream, indent=2, ensure_ascii=False)
 
-    failures = sum(record["returncode"] != 0 for record in run_records)
     print(f"COMPARISON_DIR: {comparison_dir}", flush=True)
     print("ALGORITHM_TIMING_SUMMARY:", flush=True)
     for algorithm_summary in algorithm_timings:

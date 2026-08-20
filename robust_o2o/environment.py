@@ -29,6 +29,11 @@ EXPECTED_D4RL_COMMIT = "d842aa194b416e564e54b0730d9f934e3e32f854"
 EXPECTED_GYM_VERSION = "0.23.1"
 EXPECTED_NUMPY_VERSION = "1.23.5"
 EXPECTED_PYTHON_SERIES = "3.10"
+EXPECTED_MUJOCO_PY_VERSION = "2.1.2.14"
+# ``mujoco_py`` reports the linked MuJoCo C library as an integer.  The
+# official 2.1 binary is 210; checking the binding package alone cannot detect
+# a mismatched simulator installation.
+EXPECTED_MUJOCO_RUNTIME_VERSION_CODE = 210
 STANDARD_DATASET_KEYS = (
     "observations",
     "actions",
@@ -93,6 +98,35 @@ def installed_d4rl_commit() -> str | None:
     return vcs.get("commit_id") or vcs.get("requested_revision")
 
 
+def mujoco_runtime_identity() -> Dict[str, Any]:
+    """Return both Python-binding and linked native MuJoCo identities."""
+
+    identity: Dict[str, Any] = {
+        "mujoco_py_version": runtime_package_versions()["mujoco-py"],
+        "mujoco_runtime_version_code": None,
+        "mujoco_runtime_version": None,
+        "mujoco_runtime_path": None,
+        "mujoco_runtime_error": None,
+    }
+    try:
+        import mujoco_py
+
+        version_code = int(mujoco_py.functions.mj_version())
+        identity["mujoco_runtime_version_code"] = version_code
+        identity["mujoco_runtime_version"] = (
+            f"{version_code // 100}.{(version_code // 10) % 10}."
+            f"{version_code % 10}"
+        )
+        discover = getattr(
+            getattr(mujoco_py, "utils", None), "discover_mujoco", None
+        )
+        if discover is not None:
+            identity["mujoco_runtime_path"] = str(Path(discover()).resolve())
+    except BaseException as exc:
+        identity["mujoco_runtime_error"] = f"{type(exc).__name__}: {exc}"
+    return identity
+
+
 @lru_cache(maxsize=1)
 def verify_rpex_runtime() -> None:
     versions = runtime_package_versions()
@@ -109,8 +143,26 @@ def verify_rpex_runtime() -> None:
         errors.append(
             f"numpy=={EXPECTED_NUMPY_VERSION} is required, found {versions['numpy']}"
         )
-    if versions["mujoco-py"] == "not-installed":
-        errors.append("mujoco-py is required but is not installed")
+    if versions["mujoco-py"] != EXPECTED_MUJOCO_PY_VERSION:
+        errors.append(
+            f"mujoco-py=={EXPECTED_MUJOCO_PY_VERSION} is required, "
+            f"found {versions['mujoco-py']}"
+        )
+    mujoco_identity = mujoco_runtime_identity()
+    if (
+        mujoco_identity["mujoco_runtime_version_code"]
+        != EXPECTED_MUJOCO_RUNTIME_VERSION_CODE
+    ):
+        found = (
+            mujoco_identity["mujoco_runtime_version_code"]
+            if mujoco_identity["mujoco_runtime_version_code"] is not None
+            else mujoco_identity["mujoco_runtime_error"] or "unavailable"
+        )
+        errors.append(
+            "linked MuJoCo runtime version code "
+            f"{EXPECTED_MUJOCO_RUNTIME_VERSION_CODE} (2.1.0) is required, "
+            f"found {found}"
+        )
     commit = installed_d4rl_commit()
     if commit != EXPECTED_D4RL_COMMIT:
         found = commit or "unavailable (direct_url.json missing)"
@@ -620,16 +672,59 @@ def environment_metadata(
     else:
         raise ValueError(f"Unknown metadata protocol {protocol!r}")
     versions = runtime_package_versions()
+    mujoco_identity = (
+        mujoco_runtime_identity()
+        if protocol == LEGACY_PROTOCOL
+        else {
+            "mujoco_py_version": versions["mujoco-py"],
+            "mujoco_runtime_version_code": None,
+            "mujoco_runtime_version": versions["mujoco"],
+            "mujoco_runtime_path": None,
+            "mujoco_runtime_error": None,
+        }
+    )
+    repository_worktree_sha256 = None
     try:
+        repository_root = Path(__file__).resolve().parents[1]
         git_commit = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=Path(__file__).resolve().parents[1],
+            cwd=repository_root,
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+        git_dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repository_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        from .final_gate import audit_context
+
+        repository_context = audit_context()
+        worktree_payload = {
+            key: repository_context[key]
+            for key in (
+                "git_head",
+                "git_status_sha256",
+                "git_worktree_diff_sha256",
+                "git_untracked_content_sha256",
+            )
+        }
+        repository_worktree_sha256 = hashlib.sha256(
+            json.dumps(
+                worktree_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    except (OSError, RuntimeError, subprocess.SubprocessError):
         git_commit = "unknown"
+        git_dirty = None
+        repository_worktree_sha256 = None
     action_space = env.action_space
     action_low = np.asarray(
         getattr(action_space, "low", np.full(action_space.shape, np.nan)),
@@ -660,8 +755,12 @@ def environment_metadata(
         "mujoco_backend": (
             "mujoco_py" if protocol == LEGACY_PROTOCOL else "native_mujoco"
         ),
+        **mujoco_identity,
         "d4rl_version_or_commit": installed_commit or versions["d4rl"],
         "git_commit": git_commit,
+        "repository_commit": git_commit,
+        "repository_dirty": git_dirty,
+        "repository_worktree_sha256": repository_worktree_sha256,
         "benchmark_comparable": protocol == LEGACY_PROTOCOL,
         "diagnostic_reason": (
             None
@@ -709,6 +808,9 @@ def environment_metadata(
             "gymnasium_version",
             "numpy_version",
             "mujoco_backend",
+            "mujoco_py_version",
+            "mujoco_runtime_version_code",
+            "mujoco_runtime_version",
             "d4rl_version_or_commit",
         )
     }
@@ -769,6 +871,7 @@ class StateNormalizer:
         dataset: Dataset,
         enabled: bool = True,
         mode: str = "standard",
+        additive_epsilon: bool = False,
     ) -> "StateNormalizer":
         state_dim = dataset["observations"].shape[-1]
         if not enabled or mode == "none":
@@ -790,7 +893,11 @@ class StateNormalizer:
             raise ValueError(f"Unknown normalization mode {mode!r}")
         return cls(
             mean=np.asarray(location, dtype=np.float32),
-            std=np.maximum(np.asarray(scale, dtype=np.float32), 1e-3),
+            std=(
+                np.asarray(scale, dtype=np.float32) + np.float32(1e-3)
+                if additive_epsilon and mode == "standard"
+                else np.maximum(np.asarray(scale, dtype=np.float32), 1e-3)
+            ),
             mode=mode,
         )
 

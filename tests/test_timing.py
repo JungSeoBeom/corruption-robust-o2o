@@ -12,10 +12,41 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from robust_o2o.logging_utils import format_duration, format_timestamp
-from run_all_algorithms import main, summarize_algorithm_timings, write_timing_csv
+from run_all_algorithms import (
+    _validate_args as validate_run_all_args,
+    build_parser as build_run_all_parser,
+    main,
+    summarize_algorithm_timings,
+    write_timing_csv,
+)
 
 
 class TimingTest(unittest.TestCase):
+    def test_final_adversarial_controller_rejects_non_hopper_fixture(self):
+        parser = build_run_all_parser()
+        args = parser.parse_args(
+            [
+                "--env-name",
+                "halfcheetah-medium-replay-v2",
+                "--corruption",
+                "adversarial",
+                "--corruption-target",
+                "observations",
+                "--algorithms",
+                "rpex,riql_naive",
+                "--seeds",
+                "0,1,2,3,4",
+                "--stage",
+                "both",
+                "--suite-profile",
+                "primary_research_benchmark",
+                "--run-purpose",
+                "final_benchmark",
+            ]
+        )
+        with self.assertRaises(SystemExit):
+            validate_run_all_args(parser, args, ())
+
     def test_timestamp_is_clean_to_seconds(self):
         value = datetime(
             2026,
@@ -80,6 +111,8 @@ class TimingTest(unittest.TestCase):
                 "rpex,riql_pex",
                 "--seeds",
                 "0",
+                "--stage",
+                "offline",
                 "--output-root",
                 directory,
             ]
@@ -107,11 +140,16 @@ class TimingTest(unittest.TestCase):
                     "run_all_algorithms.write_final_score_summary",
                     side_effect=lambda _root, path, *_args: path,
                 ),
+                patch(
+                    "run_all_algorithms.write_reproduction_summaries",
+                    return_value={},
+                ) as reporting_mock,
                 redirect_stdout(output),
             ):
                 returncode = main()
 
             self.assertEqual(returncode, 0)
+            self.assertEqual(reporting_mock.call_args.kwargs["phase"], "offline")
             text = output.getvalue()
             self.assertIn("ALGORITHM_FINISHED: RPEX (rpex)", text)
             self.assertIn("ALGORITHM_FINISHED: RIQL+PEX (riql_pex)", text)
@@ -132,6 +170,58 @@ class TimingTest(unittest.TestCase):
             self.assertEqual(
                 manifest["environment_backend"],
                 "gym-0.23.1+d4rl-v2+mujoco_py",
+            )
+
+    def test_failed_diagnostic_suite_does_not_publish_canonical_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            arguments = [
+                "run_all_algorithms.py",
+                "--env-name",
+                "hopper-medium-replay-v2",
+                "--corruption",
+                "clean",
+                "--algorithms",
+                "rpex",
+                "--seeds",
+                "0",
+                "--stage",
+                "offline",
+                "--output-root",
+                directory,
+            ]
+            preflight = {
+                "protocol": "rpex_d4rl_v2_legacy",
+                "d4rl_env_id": "hopper-medium-replay-v2",
+                "environment_backend": "gym-0.23.1+d4rl-v2+mujoco_py",
+                "dataset_backend": "d4rl.qlearning_dataset(terminate_on_end=False)",
+                "dataset_path": str(Path(directory) / "dataset.hdf5"),
+            }
+            with (
+                patch.object(sys, "argv", arguments),
+                patch(
+                    "run_all_algorithms.subprocess.run",
+                    return_value=Mock(returncode=1),
+                ),
+                patch(
+                    "run_all_algorithms.preflight_runtime",
+                    return_value=preflight,
+                ),
+                patch("run_all_algorithms.update_comparison_plots") as plots,
+                patch("run_all_algorithms.write_final_score_summary") as scores,
+                patch("run_all_algorithms.write_reproduction_summaries") as reports,
+            ):
+                returncode = main()
+
+            self.assertEqual(returncode, 1)
+            plots.assert_not_called()
+            scores.assert_not_called()
+            reports.assert_not_called()
+            manifest_path = next(Path(directory).rglob("manifest.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertFalse(manifest["benchmark_valid"])
+            self.assertIn("suite is incomplete", manifest["aggregation_error"])
+            self.assertEqual(
+                list(manifest_path.parent.glob("comparison_*")), []
             )
 
 

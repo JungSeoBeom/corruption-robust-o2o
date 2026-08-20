@@ -19,7 +19,10 @@ from .corruption import (
     corrupt_pre_action_value,
     corrupt_offline_dataset,
     corrupt_online_transition,
+    make_numpy_corruption_rng,
     make_attack_oracle,
+    numpy_rng_state,
+    restore_numpy_rng_state,
     sample_online_corruption_target,
 )
 from .device import resolve_device, seed_env_only, seed_everything
@@ -36,9 +39,12 @@ from .environment import (
     reset_env,
     step_env,
 )
-from .logging_utils import RunLogger
+from .logging_utils import RunLogger, resolve_resume_run_directory
+from .manifest import verify_experiment_manifest
 from .paths import results_root_from_output
 from .replay import (
+    NUMPY_REPLAY_SAMPLING,
+    RPEX_OFFICIAL_REPLAY_SAMPLING,
     OfflineDataset,
     ReplayBuffer,
     mixed_batch,
@@ -74,6 +80,22 @@ def bounded_executed_action(
     action_high: np.ndarray,
 ) -> np.ndarray:
     return np.clip(raw_policy_action, action_low, action_high).astype(np.float32)
+
+
+def _replay_transition_coordinates(
+    stored_state: np.ndarray,
+    stored_next_state: np.ndarray,
+    normalizer: StateNormalizer,
+    already_normalized: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return one replay transition in exactly one normalized coordinate pass."""
+
+    if already_normalized:
+        return stored_state, stored_next_state
+    return (
+        normalizer.transform(stored_state),
+        normalizer.transform(stored_next_state),
+    )
 
 
 def normalizer_sha256(normalizer: StateNormalizer) -> str:
@@ -150,7 +172,17 @@ def _torch_load(path: Path, device: torch.device) -> Dict[str, Any]:
 
 def resolve_resume_checkpoint(path_value: str, device: torch.device) -> tuple[Path, Dict[str, Any]]:
     path = Path(path_value).expanduser().resolve()
-    candidates = [path] if path.is_file() else list(path.glob("checkpoints/*/*.pt"))
+    run_dir = resolve_resume_run_directory(path_value)
+    manifest_path = run_dir / "experiment_manifest.json"
+    if not manifest_path.exists():
+        raise ValueError("exact resume source has no canonical launch manifest")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    launch_manifest_sha256 = verify_experiment_manifest(manifest)
+    candidates = (
+        [path]
+        if path.is_file()
+        else list(run_dir.glob("checkpoints/*/*.pt"))
+    )
     exact = []
     for candidate in candidates:
         payload = _torch_load(candidate, device)
@@ -162,11 +194,25 @@ def resolve_resume_checkpoint(path_value: str, device: torch.device) -> tuple[Pa
             "initialization checkpoints must use --initialize-from-checkpoint"
         )
     _, _, candidate, payload = max(exact, key=lambda item: (item[0], item[1]))
+    checkpoint_manifest_sha256 = payload.get("manifest_sha256")
+    if checkpoint_manifest_sha256 is None:
+        raise ValueError(
+            "exact resume checkpoint has no launch manifest SHA256; legacy "
+            "checkpoints may only initialize a new run"
+        )
+    if checkpoint_manifest_sha256 != launch_manifest_sha256:
+        raise ValueError(
+            "exact resume checkpoint belongs to a different run manifest: "
+            f"checkpoint={checkpoint_manifest_sha256}, "
+            f"target={launch_manifest_sha256}"
+        )
     return candidate, payload
 
 
 def capture_global_rng_state(
-    corruption_rng: Optional[np.random.Generator] = None,
+    corruption_rng: Optional[
+        np.random.RandomState | np.random.Generator
+    ] = None,
     oracle: Optional[AttackOracle] = None,
 ) -> Dict[str, Any]:
     state: Dict[str, Any] = {
@@ -175,7 +221,9 @@ def capture_global_rng_state(
         "torch_cpu": torch.random.get_rng_state(),
         "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         "corruption_rng": (
-            corruption_rng.bit_generator.state if corruption_rng is not None else None
+            numpy_rng_state(corruption_rng)
+            if corruption_rng is not None
+            else None
         ),
         "attack_rng": (
             oracle.generator.get_state() if oracle is not None else None
@@ -191,7 +239,9 @@ def capture_global_rng_state(
 
 def restore_global_rng_state(
     state: Dict[str, Any],
-    corruption_rng: Optional[np.random.Generator] = None,
+    corruption_rng: Optional[
+        np.random.RandomState | np.random.Generator
+    ] = None,
     oracle: Optional[AttackOracle] = None,
 ) -> None:
     random.setstate(state["python"])
@@ -202,7 +252,7 @@ def restore_global_rng_state(
     if state.get("torch_mps") is not None and hasattr(torch, "mps"):
         torch.mps.set_rng_state(state["torch_mps"])
     if corruption_rng is not None and state.get("corruption_rng") is not None:
-        corruption_rng.bit_generator.state = state["corruption_rng"]
+        restore_numpy_rng_state(corruption_rng, state["corruption_rng"])
     if oracle is not None and state.get("attack_rng") is not None:
         oracle.generator.set_state(state["attack_rng"])
 
@@ -325,6 +375,25 @@ def _validate_writer_positions(
             "resume log position mismatch; refusing to duplicate or overwrite "
             f"metrics: {mismatches}"
         )
+
+
+def _validate_resume_precommit(
+    config: ExperimentConfig,
+    logger: RunLogger,
+    resume_state: Optional[Dict[str, Any]],
+) -> None:
+    """Reject unsafe exact-resume state before changing original run files."""
+
+    if resume_state is None:
+        return
+    phase = resume_state.get("phase")
+    if phase not in ("offline", "online"):
+        raise ValueError(f"exact resume checkpoint has invalid phase {phase!r}")
+    if config.stage == "offline" and phase != "offline":
+        raise ValueError("offline-only run cannot resume an online-phase checkpoint")
+    if phase == "online" and not resume_state.get("episode_boundary"):
+        raise ValueError("exact online resume is only supported at episode boundaries")
+    _validate_writer_positions(logger, resume_state)
 
 
 def _prune_periodic_checkpoints(directory: Path, keep_last: int) -> None:
@@ -553,7 +622,12 @@ def _evaluate(
     )
 
 
-def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
+def run_experiment(
+    config: ExperimentConfig,
+    logger: RunLogger,
+    *,
+    final_audit_receipt: Optional[Dict[str, Any]] = None,
+) -> Path:
     device = resolve_device(config.device, config.cuda_device)
     seed_everything(config.learner_seed)
     dataset_env = make_env(config.env_name, config.protocol)
@@ -650,6 +724,8 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
             _, checkpoint_payload = resolve_resume_checkpoint(config.resume_run, device)
             _validate_checkpoint(checkpoint_payload, config, state_dim, action_dim)
             _restore_agent_config(config, checkpoint_payload)
+            if config.run_purpose == "final_benchmark":
+                config._validate_final_benchmark()
             resume_payload = checkpoint_payload["resume_state"]
         if config.initialize_from_checkpoint:
             checkpoint_path = Path(
@@ -658,6 +734,8 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
             checkpoint_payload = _torch_load(checkpoint_path, device)
             _validate_checkpoint(checkpoint_payload, config, state_dim, action_dim)
             _restore_agent_config(config, checkpoint_payload)
+            if config.run_purpose == "final_benchmark":
+                config._validate_final_benchmark()
 
         oracle: Optional[AttackOracle] = make_attack_oracle(
             config, state_dim, action_dim, max_action, device
@@ -682,9 +760,22 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
                 corrupted_dataset,
                 enabled=config.normalize_states,
                 mode=config.state_normalization,
+                additive_epsilon=(
+                    config.implementation_profile == "official_code_reference"
+                ),
             )
         normalized_dataset = apply_normalizer(corrupted_dataset, normalizer)
-        offline = OfflineDataset(normalized_dataset, config.replay_seed)
+        replay_sampling_profile = (
+            RPEX_OFFICIAL_REPLAY_SAMPLING
+            if config.implementation_profile == "official_code_reference"
+            and config.algorithm in ("rpex", "riql_naive", "riql_pex")
+            else NUMPY_REPLAY_SAMPLING
+        )
+        offline = OfflineDataset(
+            normalized_dataset,
+            config.replay_seed,
+            sampling_profile=replay_sampling_profile,
+        )
         if resume_payload is not None and resume_payload.get("offline_dataset"):
             offline.load_state_dict(resume_payload["offline_dataset"])
 
@@ -696,6 +787,11 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
             agent.load_checkpoint_state(checkpoint_payload["agent"])
         if resume_payload is not None:
             restore_global_rng_state(resume_payload["global_rng"], oracle=oracle)
+
+        # RunLogger.write_config intentionally commits a resume by superseding
+        # any completion marker and transitioning summary.json to `running`.
+        # Validate append safety first so a rejected checkpoint is read-only.
+        _validate_resume_precommit(config, logger, resume_payload)
 
         diagnostic_snapshot = (
             _parameter_snapshot(agent) if config.diagnostic_mode else None
@@ -723,6 +819,19 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
                 ),
             }
         )
+        if final_audit_receipt is not None:
+            from .final_gate import write_final_audit_evidence
+
+            evidence_dir = logger.run_dir
+            if config.resume_run:
+                receipt_sha256 = str(
+                    getattr(config, "_final_audit_receipt_sha256", "unknown")
+                )
+                evidence_dir = (
+                    logger.run_dir / "resume_audit_evidence" / receipt_sha256
+                )
+                evidence_dir.mkdir(parents=True, exist_ok=True)
+            write_final_audit_evidence(evidence_dir, final_audit_receipt)
         logger.logger.info(
             "protocol=%s algorithm=%s env=%s corruption=%s/%s device=%s",
             config.protocol,
@@ -804,6 +913,15 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
                 action_dim,
                 resume_state=resume_payload,
             )
+        else:
+            logger.write_completion_manifest(
+                {
+                    "online_budget_semantics": "online_phase_not_run",
+                    "requested_online_steps": config.online_steps,
+                    "actual_online_steps": 0,
+                    "episode_boundary_overshoot": 0,
+                }
+            )
         if diagnostic_snapshot is not None:
             parameter_deltas, _ = _parameter_deltas(agent, diagnostic_snapshot)
             final_metrics = evaluate_agent(
@@ -856,6 +974,18 @@ def _run_offline(
     if resume_state is not None and resume_state.get("phase") == "offline":
         _validate_writer_positions(logger, resume_state)
         start_step = int(resume_state["phase_step"])
+        if start_step > config.offline_steps:
+            raise ValueError(
+                "offline resume checkpoint exceeds the configured update budget: "
+                f"checkpoint={start_step}, configured={config.offline_steps}"
+            )
+        if start_step == config.offline_steps:
+            logger.logger.info(
+                "offline resume is already complete at update=%d; no new "
+                "evaluation, optimizer update, or checkpoint write was executed",
+                start_step,
+            )
+            return
         accumulator.values = {
             key: list(values)
             for key, values in resume_state.get("metric_accumulator", {}).items()
@@ -923,7 +1053,13 @@ def _run_offline(
                     "writer_append_position": _writer_positions(logger),
                 },
             )
-    if config.offline_steps == 0 or config.offline_steps % config.eval_period != 0:
+    if (
+        config.implementation_profile != "official_code_reference"
+        and (
+            config.offline_steps == 0
+            or config.offline_steps % config.eval_period != 0
+        )
+    ):
         _evaluate(
             logger,
             env,
@@ -976,17 +1112,66 @@ def _run_online(
 ) -> None:
     logger.logger.info("online fine-tuning started")
     replay = ReplayBuffer(
-        state_dim, action_dim, config.replay_size, config.replay_seed
+        state_dim,
+        action_dim,
+        config.replay_size,
+        config.replay_seed,
+        sampling_profile=offline.sampling_profile,
     )
-    rng = np.random.default_rng(config.corruption_seed)
-    state_std = raw_dataset["observations"].std(axis=0).astype(np.float32) + 1e-6
-    action_std = raw_dataset["actions"].std(axis=0).astype(np.float32) + 1e-6
+    rng = make_numpy_corruption_rng(config)
+    state_std = raw_dataset["observations"].std(axis=0).astype(np.float32)
+    action_std = raw_dataset["actions"].std(axis=0).astype(np.float32)
     online_resume = resume_state is not None and resume_state.get("phase") == "online"
     start_env_step = int(resume_state["phase_step"]) if online_resume else 0
+    rpex_episode_boundary_budget = (
+        config.implementation_profile == "official_code_reference"
+        and config.algorithm in ("rpex", "riql_naive", "riql_pex")
+    )
     if online_resume:
         _validate_writer_positions(logger, resume_state)
         if not resume_state.get("episode_boundary"):
             raise ValueError("exact online resume is only supported at episode boundaries")
+        already_complete = (
+            start_env_step > config.online_steps
+            if rpex_episode_boundary_budget
+            else start_env_step >= config.online_steps
+        )
+        if already_complete:
+            corruption_audit = OnlineCorruptionAudit(
+                resume_state.get("online_corruption_audit")
+            )
+            online_corruption_metadata = corruption_audit.metadata(config)
+            online_corruption_metadata.update(
+                {
+                    "online_budget_semantics": (
+                        "rpex_official_episode_boundary_strict_greater_than"
+                        if rpex_episode_boundary_budget
+                        else "exact_environment_steps"
+                    ),
+                    "requested_online_steps": config.online_steps,
+                    "actual_online_steps": start_env_step,
+                    "episode_boundary_overshoot": max(
+                        start_env_step - config.online_steps, 0
+                    ),
+                    "resume_noop_already_complete": True,
+                }
+            )
+            with (logger.run_dir / "online_corruption_manifest.json").open(
+                "w", encoding="utf-8"
+            ) as stream:
+                json.dump(
+                    online_corruption_metadata,
+                    stream,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            logger.write_completion_manifest(online_corruption_metadata)
+            logger.logger.info(
+                "online resume is already complete at env_step=%d; no new "
+                "environment transition or optimizer update was executed",
+                start_env_step,
+            )
+            return
         replay.load_state_dict(resume_state["online_replay"])
         restore_global_rng_state(resume_state["global_rng"], rng, oracle)
         restore_environment_rng_state(env, resume_state["environment_rng"])
@@ -1057,7 +1242,123 @@ def _run_online(
 
     pending_checkpoint = False
     episode_boundary = True
-    for env_step in range(start_env_step + 1, config.online_steps + 1):
+    if rpex_episode_boundary_budget:
+        import itertools
+
+        online_step_iterator = itertools.count(start_env_step + 1)
+    else:
+        online_step_iterator = range(
+            start_env_step + 1, config.online_steps + 1
+        )
+
+    # The pinned RPEX loop samples the policy action, updates from the replay
+    # already present in memory, and only then calls env.step/adds the new
+    # transition.  Keeping that ordering is observable because both replay
+    # membership and the Torch RNG state affect the update.  Other profiles
+    # retain this repository's post-transition update schedule.
+    official_pre_transition_updates = rpex_episode_boundary_budget
+    is_pqe = config.algorithm == "pessimistic_q_ensemble"
+    update_batch_size = (
+        config.wsrl_per_critic_batch_size
+        if config.algorithm == "wsrl"
+        else config.batch_size
+    )
+    required_online_samples = (
+        config.batch_size
+        if is_pqe
+        else max(
+            update_batch_size - int(round(update_batch_size * offline_ratio)),
+            1,
+        )
+    )
+
+    def perform_online_updates(env_step: int, *, before_transition: bool) -> None:
+        nonlocal last_metrics, priority_metrics
+
+        if before_transition:
+            can_update = (
+                replay.size > warmup
+                and replay.size >= required_online_samples
+            )
+        else:
+            can_update = (
+                env_step > warmup
+                and replay.size >= required_online_samples
+            )
+        if not can_update:
+            return
+
+        update_repeats = (
+            config.wsrl_utd_ratio
+            if config.algorithm == "wsrl"
+            else config.updates_per_step
+        )
+        wsrl_batches: list[Dict[str, torch.Tensor]] = []
+        for _ in range(update_repeats):
+            prioritized = (
+                is_pqe and config.pqe_replay_mode == "balanced_density"
+            )
+            if is_pqe:
+                (
+                    batch,
+                    density_offline_batch,
+                    density_online_batch,
+                ) = sample_pqe_update_batches(
+                    offline,
+                    replay,
+                    config.batch_size,
+                    offline_ratio,
+                    device,
+                    prioritized_rl=prioritized,
+                )
+                last_metrics = agent.update(
+                    rl_batch=batch,
+                    density_offline_batch=density_offline_batch,
+                    density_online_batch=density_online_batch,
+                    rl_batch_prioritized=prioritized,
+                )
+            else:
+                batch = mixed_batch(
+                    offline,
+                    replay,
+                    update_batch_size,
+                    offline_ratio,
+                    device,
+                )
+                if config.algorithm == "wsrl":
+                    wsrl_batches.append(batch)
+                    last_metrics = agent.update(
+                        batch,
+                        update_actor_temperature=False,
+                        update_critic=True,
+                    )
+                else:
+                    last_metrics = agent.update(batch)
+            accumulator.add(last_metrics)
+            if is_pqe:
+                priorities = agent.consume_priority_values()
+                if priorities is None:
+                    raise RuntimeError(
+                        "Pessimistic Q-Ensemble skipped a required priority update"
+                    )
+                priority_metrics = update_sample_priorities(
+                    offline, replay, batch, priorities
+                )
+        if config.algorithm == "wsrl":
+            actor_batch = {
+                key: torch.cat([batch[key] for batch in wsrl_batches], dim=0)
+                for key in wsrl_batches[0]
+            }
+            last_metrics = agent.update(
+                actor_batch,
+                update_actor_temperature=True,
+                update_critic=False,
+            )
+            accumulator.add(last_metrics)
+
+    actual_online_steps = start_env_step
+    for env_step in online_step_iterator:
+        actual_online_steps = env_step
         if raw_state is None:
             raw_state = reset_env(env, protocol=config.protocol)
         episode_boundary = False
@@ -1111,6 +1412,8 @@ def _run_online(
         executed_oob += int(
             np.any(executed_action < action_low) or np.any(executed_action > action_high)
         )
+        if official_pre_transition_updates:
+            perform_online_updates(env_step, before_transition=True)
         raw_next_state, reward, terminated, truncated, _ = step_env(
             env, executed_action, protocol=config.protocol
         )
@@ -1121,12 +1424,28 @@ def _run_online(
             selected_target = sample_online_corruption_target(config, rng)
 
         if pre_action and selected_target in ("observations", "actions"):
+            normalized_replay_poisoning = False
             stored_state = policy_state.copy()
             stored_action = executed_action.copy()
             stored_reward = float(reward)
             stored_next_state = raw_next_state.copy()
             was_corrupted = True
         else:
+            normalized_replay_poisoning = (
+                config.implementation_profile == "official_code_reference"
+                and config.attack_timing
+                == "official_code_post_transition_replay_poisoning"
+            )
+            corruption_state = (
+                normalizer.transform(raw_state)
+                if normalized_replay_poisoning
+                else raw_state
+            )
+            corruption_next_state = (
+                normalizer.transform(raw_next_state)
+                if normalized_replay_poisoning
+                else raw_next_state
+            )
             (
                 stored_state,
                 stored_action,
@@ -1134,10 +1453,10 @@ def _run_online(
                 stored_next_state,
                 was_corrupted,
             ) = corrupt_online_transition(
-                raw_state,
+                corruption_state,
                 executed_action,
                 reward,
-                raw_next_state,
+                corruption_next_state,
                 config,
                 oracle,
                 rng,
@@ -1159,11 +1478,17 @@ def _run_online(
         replay_mismatch += int(
             not np.allclose(stored_action, executed_action, rtol=1e-6, atol=1e-6)
         )
+        replay_state, replay_next_state = _replay_transition_coordinates(
+            stored_state,
+            stored_next_state,
+            normalizer,
+            normalized_replay_poisoning,
+        )
         replay.add(
-            normalizer.transform(stored_state),
+            replay_state,
             stored_action,
             stored_reward,
-            normalizer.transform(stored_next_state),
+            replay_next_state,
             float(terminated),
             priority=initial_online_priority,
         )
@@ -1174,88 +1499,8 @@ def _run_online(
             episode_return = 0.0
             episode_boundary = True
 
-        is_pqe = config.algorithm == "pessimistic_q_ensemble"
-        update_batch_size = (
-            config.wsrl_per_critic_batch_size
-            if config.algorithm == "wsrl"
-            else config.batch_size
-        )
-        required_online_samples = (
-            config.batch_size if is_pqe else max(
-                update_batch_size - int(round(update_batch_size * offline_ratio)),
-                1,
-            )
-        )
-        can_update = env_step > warmup and replay.size >= required_online_samples
-        if can_update:
-            update_repeats = (
-                config.wsrl_utd_ratio
-                if config.algorithm == "wsrl"
-                else config.updates_per_step
-            )
-            wsrl_batches: list[Dict[str, torch.Tensor]] = []
-            for _ in range(update_repeats):
-                prioritized = (
-                    is_pqe
-                    and config.pqe_replay_mode == "balanced_density"
-                )
-                if is_pqe:
-                    (
-                        batch,
-                        density_offline_batch,
-                        density_online_batch,
-                    ) = sample_pqe_update_batches(
-                        offline,
-                        replay,
-                        config.batch_size,
-                        offline_ratio,
-                        device,
-                        prioritized_rl=prioritized,
-                    )
-                    last_metrics = agent.update(
-                        rl_batch=batch,
-                        density_offline_batch=density_offline_batch,
-                        density_online_batch=density_online_batch,
-                        rl_batch_prioritized=prioritized,
-                    )
-                else:
-                    batch = mixed_batch(
-                        offline,
-                        replay,
-                        update_batch_size,
-                        offline_ratio,
-                        device,
-                    )
-                    if config.algorithm == "wsrl":
-                        wsrl_batches.append(batch)
-                        last_metrics = agent.update(
-                            batch,
-                            update_actor_temperature=False,
-                            update_critic=True,
-                        )
-                    else:
-                        last_metrics = agent.update(batch)
-                accumulator.add(last_metrics)
-                if is_pqe:
-                    priorities = agent.consume_priority_values()
-                    if priorities is None:
-                        raise RuntimeError(
-                            "Pessimistic Q-Ensemble skipped a required priority update"
-                        )
-                    priority_metrics = update_sample_priorities(
-                        offline, replay, batch, priorities
-                    )
-            if config.algorithm == "wsrl":
-                actor_batch = {
-                    key: torch.cat([batch[key] for batch in wsrl_batches], dim=0)
-                    for key in wsrl_batches[0]
-                }
-                last_metrics = agent.update(
-                    actor_batch,
-                    update_actor_temperature=True,
-                    update_critic=False,
-                )
-                accumulator.add(last_metrics)
+        if not official_pre_transition_updates:
+            perform_online_updates(env_step, before_transition=False)
         if env_step % config.train_log_period == 0:
             parameter_deltas, parameter_snapshot = _parameter_deltas(
                 agent, parameter_snapshot
@@ -1323,7 +1568,20 @@ def _run_online(
             )
             pending_checkpoint = False
 
-    if config.online_steps == 0 or config.online_steps % config.eval_period != 0:
+        if (
+            rpex_episode_boundary_budget
+            and episode_boundary
+            and env_step > config.online_steps
+        ):
+            break
+
+    if (
+        config.implementation_profile != "official_code_reference"
+        and (
+            actual_online_steps == 0
+            or actual_online_steps % config.eval_period != 0
+        )
+    ):
         _evaluate(
             logger,
             eval_env,
@@ -1332,8 +1590,8 @@ def _run_online(
             normalizer,
             device,
             "online",
-            config.online_steps,
-            config.online_steps,
+            actual_online_steps,
+            actual_online_steps,
         )
     _save_phase_checkpoint(
         logger,
@@ -1341,22 +1599,37 @@ def _run_online(
         config,
         normalizer,
         "online",
-        config.online_steps,
-        config.online_steps,
+        actual_online_steps,
+        actual_online_steps,
         state_dim,
         action_dim,
         final=True,
         resume_state=(
-            online_resume_snapshot(config.online_steps) if episode_boundary else None
+            online_resume_snapshot(actual_online_steps) if episode_boundary else None
         ),
     )
     logger.logger.info(
         "online fine-tuning completed; corrupted=%d/%d",
         corrupted_online,
-        config.online_steps,
+        actual_online_steps,
     )
     online_corruption_metadata = corruption_audit.metadata(config)
+    online_corruption_metadata.update(
+        {
+            "online_budget_semantics": (
+                "rpex_official_episode_boundary_strict_greater_than"
+                if rpex_episode_boundary_budget
+                else "exact_environment_steps"
+            ),
+            "requested_online_steps": config.online_steps,
+            "actual_online_steps": actual_online_steps,
+            "episode_boundary_overshoot": max(
+                actual_online_steps - config.online_steps, 0
+            ),
+        }
+    )
     with (logger.run_dir / "online_corruption_manifest.json").open(
         "w", encoding="utf-8"
     ) as stream:
         json.dump(online_corruption_metadata, stream, indent=2, ensure_ascii=False)
+    logger.write_completion_manifest(online_corruption_metadata)

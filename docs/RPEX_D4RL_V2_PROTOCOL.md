@@ -49,7 +49,10 @@ conda activate corruption-rpex-v2
 
 Install MuJoCo 2.1 under `~/.mujoco/mujoco210` according to the
 [`mujoco-py` installation instructions](https://github.com/openai/mujoco-py#install-mujoco),
-then expose its libraries on Linux:
+using the repository-pinned `mujoco-py==2.1.2.14`. Strict preflight verifies
+both that package version and the linked native MuJoCo version code `210`
+(`2.1.0`); merely having an importable binding is not sufficient. Then expose
+its libraries on Linux:
 
 ```bash
 export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/.mujoco/mujoco210/bin:/usr/lib/nvidia"
@@ -71,6 +74,12 @@ python -m pip install --force-reinstall torch==2.5.1 \
 
 Do not install Gymnasium or the native `mujoco` Python package into this legacy
 environment as replacements for Gym/mujoco_py.
+
+The checked-in golden fixtures currently record NumPy `2.2.6` and PyTorch
+`2.13.0`, not the strict pins NumPy `1.23.5` and PyTorch `2.5.1`. The
+reproducibility audit therefore remains blocked until both upstream fixture
+generators are rerun in this strict environment and their external certificate
+hashes are reviewed.
 
 ## Dataset and MC returns
 

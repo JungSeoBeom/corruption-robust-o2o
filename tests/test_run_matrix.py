@@ -2,10 +2,31 @@ from __future__ import annotations
 
 import unittest
 
-from run_matrix import build_parser, commands
+from run_matrix import _validate_args, build_parser, commands
 
 
 class RunMatrixTest(unittest.TestCase):
+    def test_non_clean_matrix_rejects_empty_corruption_ranges(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--algorithms",
+                "riql_naive",
+                "--envs",
+                "hopper-medium-replay-v2",
+                "--corruptions",
+                "random",
+                "--targets",
+                "observations",
+                "--corruption-ranges",
+                ",",
+                "--suite-profile",
+                "common_budget_diagnostic",
+            ]
+        )
+        with self.assertRaises(SystemExit):
+            _validate_args(parser, args, [])
+
     def test_reward_severity_sweep_propagates_each_range(self):
         parser = build_parser()
         args = parser.parse_args(
