@@ -472,7 +472,7 @@ class PQEBatchRoutingRegressionTest(unittest.TestCase):
             "pqe_shared_actor", "hopper-medium-replay-v2"
         )
         self.assertEqual(config.algorithm, "pessimistic_q_ensemble")
-        self.assertEqual(config.to_dict()["implementation_variant"], "shared_actor_approx")
+        self.assertEqual(config.to_dict()["implementation_variant"], "pqe_shared_actor_approx")
 
 
 if __name__ == "__main__":

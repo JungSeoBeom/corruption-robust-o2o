@@ -14,6 +14,7 @@ from ..networks import (
     EnsembleQNetwork,
     ExpansionGaussianPolicy,
     LegacyExpansionGaussianPolicy,
+    OfficialRPEXGaussianPolicy,
     TanhGaussianPolicy,
     ValueNetwork,
 )
@@ -59,6 +60,7 @@ class IQLFamilyAgent(BaseAgent):
                 config.hidden_dim,
                 config.hidden_layers,
                 config.num_critics,
+                rpex_profile=config.implementation_profile != "legacy_current",
             )
         else:
             self.critic = DoubleQNetwork(
@@ -77,6 +79,14 @@ class IQLFamilyAgent(BaseAgent):
     def _make_offline_actor(self) -> nn.Module:
         if self.config.deterministic_policy:
             return DeterministicPolicy(
+                self.state_dim,
+                self.action_dim,
+                self.config.hidden_dim,
+                self.config.hidden_layers,
+                self.max_action,
+            )
+        if self.config.action_distribution == "official_unsquashed_gaussian":
+            return OfficialRPEXGaussianPolicy(
                 self.state_dim,
                 self.action_dim,
                 self.config.hidden_dim,
@@ -105,11 +115,11 @@ class IQLFamilyAgent(BaseAgent):
         )
 
     def _make_online_actor(self) -> nn.Module:
-        policy_class = (
-            ExpansionGaussianPolicy
-            if self.config.action_distribution == "tanh_gaussian"
-            else LegacyExpansionGaussianPolicy
-        )
+        policy_class = {
+            "tanh_gaussian": ExpansionGaussianPolicy,
+            "legacy_gaussian": LegacyExpansionGaussianPolicy,
+            "official_unsquashed_gaussian": OfficialRPEXGaussianPolicy,
+        }[self.config.action_distribution]
         return policy_class(
             self.state_dim,
             self.action_dim,
@@ -119,10 +129,18 @@ class IQLFamilyAgent(BaseAgent):
         ).to(self.device)
 
     def _make_optimizers(self) -> None:
-        learning_rate = self.config.learning_rate
-        self.q_optimizer = torch.optim.Adam(self.critic.parameters(), lr=learning_rate)
-        self.value_optimizer = torch.optim.Adam(self.value.parameters(), lr=learning_rate)
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=learning_rate)
+        self.q_optimizer = torch.optim.Adam(
+            self.critic.parameters(), lr=self.config.critic_learning_rate
+        )
+        self.value_optimizer = torch.optim.Adam(
+            self.value.parameters(), lr=self.config.critic_learning_rate
+        )
+        self.actor_optimizer = torch.optim.Adam(
+            self.actor.parameters(), lr=self.config.actor_learning_rate
+        )
+        self.actor_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.actor_optimizer, T_max=max(self.config.offline_steps, 1)
+        )
 
     def begin_online(self) -> None:
         if self.online_phase:
@@ -131,8 +149,9 @@ class IQLFamilyAgent(BaseAgent):
             self.offline_actor = copy.deepcopy(self.actor).eval().requires_grad_(False)
             self.actor = self._make_online_actor()
             self.actor_optimizer = torch.optim.Adam(
-                self.actor.parameters(), lr=self.config.learning_rate
+                self.actor.parameters(), lr=self.config.actor_learning_rate
             )
+            self.actor_scheduler = None
         self.online_phase = True
 
     def _aggregate_q(self, critic: nn.Module, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -158,7 +177,11 @@ class IQLFamilyAgent(BaseAgent):
         if self.offline_actor is None:
             raise RuntimeError("begin_online() must be called before policy expansion")
         offline_action = self._actor_action(self.offline_actor, states, True)
-        method_faithful = evaluate and evaluation_mode == "method_faithful"
+        evaluation_profile = self.config.evaluation_policy_profile
+        method_faithful = evaluate and (
+            evaluation_profile == "official_code_epsilon_switching"
+            and evaluation_mode != "deterministic_diagnostic"
+        )
         if method_faithful:
             online_action = self._actor_action(self.actor, states, True)
             sampled_online_action = self._actor_action(self.actor, states, False)
@@ -287,7 +310,10 @@ class IQLFamilyAgent(BaseAgent):
                 )
                 advantage = target_for_actor - self.value(states)
 
-        weights = torch.exp(self.config.beta * advantage.detach()).clamp(max=100.0)
+        if self.config.policy_extraction == "align_iql":
+            weights = torch.exp(-self.config.beta * advantage.detach().square())
+        else:
+            weights = torch.exp(self.config.beta * advantage.detach()).clamp(max=100.0)
         if isinstance(self.actor, DeterministicPolicy):
             bc_loss = (self.actor(states) - policy_actions.detach()).square().sum(dim=-1)
         else:
@@ -299,6 +325,8 @@ class IQLFamilyAgent(BaseAgent):
             self.actor.parameters(), float("inf")
         )
         self.actor_optimizer.step()
+        if self.actor_scheduler is not None and not self.online_phase:
+            self.actor_scheduler.step()
         self.total_updates += 1
         absolute_td = (targets.unsqueeze(0) - predicted).detach().abs().reshape(-1)
         threshold = 1.0 / (self.config.riql_sigma**2)
@@ -342,6 +370,11 @@ class IQLFamilyAgent(BaseAgent):
             "q": self.q_optimizer.state_dict(),
             "value": self.value_optimizer.state_dict(),
             "actor": self.actor_optimizer.state_dict(),
+            "actor_scheduler": (
+                self.actor_scheduler.state_dict()
+                if self.actor_scheduler is not None
+                else None
+            ),
         }
 
     def load_checkpoint_state(self, state: Dict[str, object]) -> None:
@@ -350,8 +383,9 @@ class IQLFamilyAgent(BaseAgent):
             self.offline_actor = copy.deepcopy(self.actor).eval().requires_grad_(False)
             self.actor = self._make_online_actor()
             self.actor_optimizer = torch.optim.Adam(
-                self.actor.parameters(), lr=self.config.learning_rate
+                self.actor.parameters(), lr=self.config.actor_learning_rate
             )
+            self.actor_scheduler = None
         super().load_checkpoint_state(state)
 
     def load_optimizer_state(self, state: Dict[str, object]) -> None:
@@ -361,3 +395,5 @@ class IQLFamilyAgent(BaseAgent):
             self.value_optimizer.load_state_dict(state["value"])
         if "actor" in state:
             self.actor_optimizer.load_state_dict(state["actor"])
+        if self.actor_scheduler is not None and state.get("actor_scheduler") is not None:
+            self.actor_scheduler.load_state_dict(state["actor_scheduler"])

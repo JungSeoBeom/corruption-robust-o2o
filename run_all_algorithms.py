@@ -23,12 +23,12 @@ from robust_o2o.config import (
     CORRUPTION_MODES,
     CORRUPTION_TARGETS,
     DEFAULT_PROTOCOL,
-    ALGORITHM_PROFILES,
     LOCAL_PROTOCOL,
     LEGACY_LOCAL_PROTOCOL_ALIAS,
     PROTOCOLS,
     normalize_env_name,
 )
+from robust_o2o.fidelity import IMPLEMENTATION_PROFILES, SUITE_PROFILES
 from robust_o2o.environment import preflight_runtime
 from robust_o2o.logging_utils import format_duration, format_timestamp
 from robust_o2o.paths import comparison_directory
@@ -86,8 +86,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seeds", type=_csv, default=["0"])
     parser.add_argument("--stage", choices=("offline", "both"), default="both")
     parser.add_argument("--protocol", choices=PROTOCOLS, default=DEFAULT_PROTOCOL)
+    parser.add_argument("--implementation-profile", choices=IMPLEMENTATION_PROFILES)
     parser.add_argument(
-        "--algorithm-profile", choices=ALGORITHM_PROFILES, default="reference"
+        "--suite-profile", choices=SUITE_PROFILES,
+        default="common_budget_robustness",
     )
     parser.add_argument("--allow-diagnostic-protocol", action="store_true")
     parser.add_argument("--output-root", default="results")
@@ -161,7 +163,7 @@ def _comparison_directory(args: argparse.Namespace) -> Path:
         args.corruption_target,
         name,
         args.protocol,
-        args.algorithm_profile,
+        f"{args.suite_profile}__{args.implementation_profile or 'auto'}",
     )
 
 
@@ -192,11 +194,15 @@ def commands(
                 args.stage,
                 "--protocol",
                 args.protocol,
-                "--algorithm-profile",
-                args.algorithm_profile,
+                "--suite-profile",
+                args.suite_profile,
                 "--output-dir",
                 str(runs_dir),
             ]
+            if args.implementation_profile:
+                command.extend(
+                    ("--implementation-profile", args.implementation_profile)
+                )
             if args.allow_diagnostic_protocol:
                 command.append("--allow-diagnostic-protocol")
             if args.dataset_dir:
@@ -388,7 +394,8 @@ def main() -> int:
     elapsed = time.perf_counter() - start_monotonic
     manifest = {
         "protocol": args.protocol,
-        "algorithm_profile": args.algorithm_profile,
+        "implementation_profile": args.implementation_profile or "auto",
+        "suite_profile": args.suite_profile,
         "environment": args.env_name,
         "corruption": args.corruption,
         "corruption_target": args.corruption_target,

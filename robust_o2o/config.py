@@ -5,6 +5,24 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from .fidelity import (
+    ACTION_EXECUTION_PROFILES,
+    ADVERSARIAL_ATTACK_PROFILES,
+    ATTACK_TIMINGS,
+    EVALUATION_POLICY_PROFILES,
+    IMPLEMENTATION_FIDELITIES,
+    IMPLEMENTATION_PROFILES,
+    LEGACY_ACTION_EXECUTION_PROFILE_ALIASES,
+    MIXED_CORRUPTION_PROFILES,
+    ONLINE_REPLAY_PROFILES,
+    POLICY_EXTRACTIONS,
+    RANDOM_ATTACK_SEMANTICS,
+    SUITE_PROFILES,
+    TASK_PROFILES,
+    UPSTREAM_COMMITS,
+    resolve_riql_reference_row,
+)
+
 
 ALGORITHMS = (
     "rpex",
@@ -23,7 +41,7 @@ LOCAL_PROTOCOL = "local_gymnasium_v4_diagnostic"
 LEGACY_LOCAL_PROTOCOL_ALIAS = "local_gymnasium_v4"
 DEFAULT_PROTOCOL = LEGACY_PROTOCOL
 PROTOCOLS = (LEGACY_PROTOCOL, LOCAL_PROTOCOL, LEGACY_LOCAL_PROTOCOL_ALIAS)
-ALGORITHM_PROFILES = ("reference", "legacy_current")
+ALGORITHM_PROFILES = IMPLEMENTATION_PROFILES
 CALIBRATION_MASK_MODES = ("all", "oracle_exclude_corrupted", "disabled")
 
 ALGORITHM_TITLES = {
@@ -94,7 +112,13 @@ class ExperimentConfig:
     stage: str = "both"
     seed: int = 0
     protocol: str = DEFAULT_PROTOCOL
-    algorithm_profile: str = "reference"
+    implementation_profile: Optional[str] = None
+    implementation_fidelity: Optional[str] = None
+    suite_profile: str = "common_budget_robustness"
+    # Input-only compatibility shim.  ``reference`` is accepted only so old
+    # commands fail with a precise migration message instead of being silently
+    # promoted to a paper reference.
+    algorithm_profile: Optional[str] = None
     allow_diagnostic_protocol: bool = False
     allow_legacy_checkpoint_without_fingerprint: bool = False
 
@@ -110,6 +134,8 @@ class ExperimentConfig:
     output_dir: str = "results"
     dataset_dir: Optional[str] = None
     checkpoint: Optional[str] = None
+    initialize_from_checkpoint: Optional[str] = None
+    resume_run: Optional[str] = None
     attack_checkpoint: Optional[str] = None
     comparison_name: Optional[str] = None
     device: str = "auto"
@@ -145,7 +171,16 @@ class ExperimentConfig:
     state_normalization: str = "standard"
     deterministic_policy: bool = False
     action_distribution: str = "tanh_gaussian"
-    evaluation_mode: str = "deterministic_diagnostic"
+    evaluation_mode: Optional[str] = None
+    online_replay_profile: str = "official_code_online_only"
+    evaluation_policy_profile: str = "official_code_epsilon_switching"
+    attack_timing: str = "official_code_post_transition_replay_poisoning"
+    random_attack_semantics: str = "post_transition_replay_poisoning"
+    mixed_corruption_profile: str = "generic_partitioned_mixed"
+    action_execution_profile: str = "clip_to_action_space"
+    policy_extraction: Optional[str] = None
+    task_profile: Optional[str] = None
+    adversarial_attack_profile: str = "experimental_sign_pgd"
 
     # IQL / RIQL / PEX / RPEX
     expectile: float = 0.7
@@ -155,6 +190,8 @@ class ExperimentConfig:
     num_critics: int = 5
     inv_temperature: float = 3.0
     kappa: float = 0.1
+    riql_config_row: Optional[str] = None
+    riql_config_extension: bool = False
 
     # SAC ensemble / UWMSG / RO2O / Pessimistic Q Ensemble
     sac_num_critics: int = 10
@@ -190,6 +227,7 @@ class ExperimentConfig:
     balanced_replay_temperature: float = 5.0
     priority_floor: float = 1e-3
     implementation_variant: Optional[str] = None
+    pqe_member_checkpoints: Tuple[str, ...] = ()
 
     # RO2O
     ro2o_beta_policy: float = 1.0
@@ -209,6 +247,7 @@ class ExperimentConfig:
     offline_attack_steps: int = 100
     online_attack_steps: int = 2
     attack_step_size: float = 0.01
+    online_attack_step_size: Optional[float] = None
     attack_min_step_size: float = 0.0
     attack_norm: str = "linf"
     force_regenerate_attack: bool = False
@@ -226,23 +265,59 @@ class ExperimentConfig:
         self.protocol = self.protocol.lower()
         if self.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
             self.protocol = LOCAL_PROTOCOL
-        self.algorithm_profile = self.algorithm_profile.lower()
+        if self.implementation_profile is not None:
+            self.implementation_profile = self.implementation_profile.lower()
+        if self.algorithm_profile is not None:
+            self.algorithm_profile = self.algorithm_profile.lower()
+        self.suite_profile = self.suite_profile.lower()
         self.state_normalization = self.state_normalization.lower()
         self.action_distribution = self.action_distribution.lower()
-        self.evaluation_mode = self.evaluation_mode.lower()
+        self.evaluation_mode = (
+            self.evaluation_mode.lower() if self.evaluation_mode else None
+        )
+        self.online_replay_profile = self.online_replay_profile.lower()
+        self.evaluation_policy_profile = self.evaluation_policy_profile.lower()
+        self.attack_timing = self.attack_timing.lower()
+        self.random_attack_semantics = self.random_attack_semantics.lower()
+        self.mixed_corruption_profile = self.mixed_corruption_profile.lower()
+        self.action_execution_profile = LEGACY_ACTION_EXECUTION_PROFILE_ALIASES.get(
+            self.action_execution_profile.lower(), self.action_execution_profile.lower()
+        )
+        self.policy_extraction = (
+            self.policy_extraction.lower() if self.policy_extraction else None
+        )
+        self.task_profile = self.task_profile.lower() if self.task_profile else None
+        self.adversarial_attack_profile = self.adversarial_attack_profile.lower()
+        if self.adversarial_attack_profile == "official_adam":
+            self.adversarial_attack_profile = "rpex_official_adam"
         self.mc_return_source = self.mc_return_source.lower()
         self.calibration_mask_mode = self.calibration_mask_mode.lower()
         self.pqe_replay_mode = self.pqe_replay_mode.lower()
         self.implementation_variant = (
-            "shared_actor_approx"
+            "pqe_shared_actor_approx"
             if self.algorithm == "pessimistic_q_ensemble"
             else None
         )
+        self.pqe_member_checkpoints = tuple(self.pqe_member_checkpoints)
         self.attack_norm = self.attack_norm.lower()
         self.mixed_ratios = tuple(float(value) for value in self.mixed_ratios)
 
         self._resolve_role_seeds()
+        self._resolve_implementation_profile()
         self._resolve_algorithm_profile()
+        if self.online_attack_step_size is None:
+            self.online_attack_step_size = (
+                0.1
+                if self.adversarial_attack_profile == "rpex_official_adam"
+                else self.attack_step_size
+            )
+        if self.evaluation_mode is None:
+            self.evaluation_mode = (
+                "method_faithful"
+                if self.implementation_profile
+                in ("official_code_reference", "paper_reference")
+                else "deterministic_diagnostic"
+            )
 
         if not self.normalize_states:
             self.state_normalization = "none"
@@ -265,11 +340,28 @@ class ExperimentConfig:
             raise ValueError(
                 f"Unknown protocol {self.protocol!r}; choose from {PROTOCOLS}"
             )
-        if self.algorithm_profile not in ALGORITHM_PROFILES:
+        if self.implementation_profile not in IMPLEMENTATION_PROFILES:
             raise ValueError(
-                f"Unknown algorithm_profile {self.algorithm_profile!r}; "
-                f"choose from {ALGORITHM_PROFILES}"
+                f"Unknown implementation_profile {self.implementation_profile!r}; "
+                f"choose from {IMPLEMENTATION_PROFILES}"
             )
+        if self.implementation_fidelity not in IMPLEMENTATION_FIDELITIES:
+            raise ValueError(f"Unknown implementation_fidelity {self.implementation_fidelity!r}")
+        if self.suite_profile not in SUITE_PROFILES:
+            raise ValueError(f"Unknown suite_profile {self.suite_profile!r}")
+        for value, choices, label in (
+            (self.online_replay_profile, ONLINE_REPLAY_PROFILES, "online_replay_profile"),
+            (self.evaluation_policy_profile, EVALUATION_POLICY_PROFILES, "evaluation_policy_profile"),
+            (self.attack_timing, ATTACK_TIMINGS, "attack_timing"),
+            (self.random_attack_semantics, RANDOM_ATTACK_SEMANTICS, "random_attack_semantics"),
+            (self.mixed_corruption_profile, MIXED_CORRUPTION_PROFILES, "mixed_corruption_profile"),
+            (self.action_execution_profile, ACTION_EXECUTION_PROFILES, "action_execution_profile"),
+            (self.policy_extraction, POLICY_EXTRACTIONS, "policy_extraction"),
+            (self.task_profile, TASK_PROFILES, "task_profile"),
+            (self.adversarial_attack_profile, ADVERSARIAL_ATTACK_PROFILES, "adversarial_attack_profile"),
+        ):
+            if value not in choices:
+                raise ValueError(f"Unknown {label} {value!r}; choose from {choices}")
         if self.calibration_mask_mode not in CALIBRATION_MASK_MODES:
             raise ValueError(
                 "calibration_mask_mode must be all, oracle_exclude_corrupted, "
@@ -279,9 +371,14 @@ class ExperimentConfig:
             raise ValueError(
                 "state_normalization must be standard, robust_median_mad, or none"
             )
-        if self.action_distribution not in ("tanh_gaussian", "legacy_gaussian"):
+        if self.action_distribution not in (
+            "tanh_gaussian",
+            "legacy_gaussian",
+            "official_unsquashed_gaussian",
+        ):
             raise ValueError(
-                "action_distribution must be tanh_gaussian or legacy_gaussian"
+                "action_distribution must be tanh_gaussian, legacy_gaussian, "
+                "or official_unsquashed_gaussian"
             )
         if self.evaluation_mode not in (
             "deterministic_diagnostic",
@@ -316,8 +413,19 @@ class ExperimentConfig:
             raise ValueError("mixed_ratios cannot contain negative values")
         if abs(sum(self.mixed_ratios) - 1.0) > 1e-6:
             raise ValueError("mixed_ratios must sum to 1.0")
-        if self.stage == "online" and not self.checkpoint:
-            raise ValueError("--stage online requires --checkpoint")
+        if self.checkpoint and self.initialize_from_checkpoint:
+            raise ValueError("use only --initialize-from-checkpoint; --checkpoint is deprecated")
+        if self.checkpoint:
+            self.initialize_from_checkpoint = self.checkpoint
+        if self.initialize_from_checkpoint and self.resume_run:
+            raise ValueError(
+                "--initialize-from-checkpoint and --resume-run have different semantics "
+                "and are mutually exclusive"
+            )
+        if self.stage == "online" and not self.initialize_from_checkpoint and not self.resume_run:
+            raise ValueError(
+                "--stage online requires --initialize-from-checkpoint or --resume-run"
+            )
         for name in ("offline_corruption_rate", "online_corruption_rate"):
             value = getattr(self, name)
             if not 0.0 <= value <= 1.0:
@@ -328,7 +436,11 @@ class ExperimentConfig:
             raise ValueError("balanced_replay_temperature must be positive")
         if self.priority_floor <= 0.0:
             raise ValueError("priority_floor must be positive")
-        if self.attack_step_size < 0.0 or self.attack_min_step_size < 0.0:
+        if (
+            self.attack_step_size < 0.0
+            or self.online_attack_step_size < 0.0
+            or self.attack_min_step_size < 0.0
+        ):
             raise ValueError("attack step sizes cannot be negative")
         if self.batch_size < 2:
             raise ValueError("batch_size must be at least 2")
@@ -387,10 +499,157 @@ class ExperimentConfig:
             if getattr(self, name) is None:
                 setattr(self, name, int((self.seed + offset) % modulus))
 
+    def _resolve_implementation_profile(self) -> None:
+        if self.algorithm_profile == "reference":
+            raise ValueError(
+                "The generic algorithm_profile='reference' was removed because it "
+                "mixed paper reproduction, upstream code, and task ports. Use "
+                "--implementation-profile and --suite-profile explicitly."
+            )
+        if (
+            self.algorithm_profile is not None
+            and self.implementation_profile is not None
+            and self.algorithm_profile != self.implementation_profile
+        ):
+            raise ValueError(
+                "algorithm_profile and implementation_profile disagree; use only "
+                "implementation_profile"
+            )
+        if self.implementation_profile is None:
+            self.implementation_profile = self.algorithm_profile
+
+        if self.suite_profile == "method_fidelity":
+            if self.algorithm == "pessimistic_q_ensemble":
+                raise ValueError(
+                    "method_fidelity is unavailable for Pessimistic Q-Ensemble: "
+                    "the local implementation is pqe_shared_actor_approx, not the "
+                    "official N=5 independently pretrained ensemble"
+                )
+            if self.algorithm == "cal_ql":
+                raise ValueError(
+                    "method_fidelity is unavailable for Cal-QL on D4RL locomotion: "
+                    "the official Cal-QL repository supports AntMaze/Adroit; select "
+                    "locomotion_port or common_budget_robustness and report task_port"
+                )
+            expected = "official_code_reference"
+            if self.implementation_profile is None:
+                self.implementation_profile = expected
+            if self.implementation_profile not in (
+                "official_code_reference",
+                "paper_reference",
+            ):
+                raise ValueError(
+                    "method_fidelity requires official_code_reference or "
+                    "paper_reference"
+                )
+            if self.algorithm in ("rpex", "riql_naive", "riql_pex"):
+                self.offline_steps = 2_000_001
+                self.online_steps = 1_000_001
+            elif self.algorithm == "wsrl":
+                self.offline_steps = 250_000
+                self.online_steps = 500_000
+        else:
+            if self.implementation_profile is None:
+                self.implementation_profile = "common_budget_robustness"
+            if self.algorithm == "pessimistic_q_ensemble":
+                self.implementation_profile = "experimental_approximation"
+
+        fidelity = {
+            "official_code_reference": "exact_upstream_port",
+            "paper_reference": "paper_code_conflict",
+            "common_budget_robustness": "task_port",
+            "locomotion_port": "task_port",
+            "legacy_current": "legacy_unknown",
+            "experimental_approximation": "approximation",
+        }[self.implementation_profile]
+        if (
+            self.suite_profile == "common_budget_robustness"
+            and fidelity not in ("approximation", "legacy_unknown")
+        ):
+            fidelity = "task_port"
+        if self.algorithm == "cal_ql" and fidelity == "exact_upstream_port":
+            fidelity = "task_port"
+        if self.implementation_fidelity not in (None, fidelity):
+            raise ValueError(
+                "implementation_fidelity is resolved from implementation_profile; "
+                f"expected {fidelity!r}"
+            )
+        self.implementation_fidelity = fidelity
+        self.algorithm_profile = self.implementation_profile
+
+        if self.implementation_profile == "official_code_reference":
+            self.action_execution_profile = "official_algorithm_behavior"
+            if self.corruption == "adversarial":
+                self.adversarial_attack_profile = "rpex_official_adam"
+        elif self.implementation_profile == "paper_reference":
+            if (
+                self.algorithm in ("rpex", "riql_naive", "riql_pex")
+                and self.corruption_target == "mixed"
+            ):
+                raise ValueError(
+                    "rpex_paper_mixed is not executable: the pinned public RPEX "
+                    "repository contains no mixed-corruption configuration or "
+                    "implementation to port without guessing"
+                )
+            self.online_replay_profile = "paper_offline_online_mixture"
+            self.evaluation_policy_profile = "paper_greedy_highest_weight"
+            self.attack_timing = "paper_pre_action_sensor_actuator"
+            self.random_attack_semantics = "pre_action_sensor_actuator_corruption"
+            if self.corruption_target == "mixed":
+                self.mixed_corruption_profile = "rpex_paper_mixed"
+        if (
+            self.algorithm in ("rpex", "riql_naive", "riql_pex")
+            and self.implementation_profile not in ("legacy_current",)
+        ):
+            self.action_distribution = "official_unsquashed_gaussian"
+        if self.algorithm == "cal_ql":
+            self.task_profile = "d4rl_locomotion_port"
+        elif self.task_profile is None:
+            self.task_profile = "official_supported_task"
+        if self.policy_extraction is None:
+            self.policy_extraction = (
+                "align_iql"
+                if self.algorithm in ("rpex", "riql_naive", "riql_pex")
+                and self.corruption_target == "observations"
+                else "awr"
+            )
+
+        if self.algorithm in ("rpex", "riql_naive", "riql_pex"):
+            row_key, row = resolve_riql_reference_row(
+                self.env_name,
+                self.corruption,
+                self.corruption_target,
+                allow_extension=self.suite_profile == "common_budget_robustness",
+            )
+            self.riql_config_row = row_key
+            self.riql_config_extension = row.extension
+            self.riql_sigma = row.sigma
+            self.riql_quantile = row.quantile
+            self.num_critics = row.num_critics
+            self.inv_temperature = row.inverse_temperature
+            self.kappa = row.kappa
+            if self.suite_profile == "method_fidelity":
+                self.updates_per_step = row.utd_ratio
+                self.actor_learning_rate = row.actor_lr
+                self.critic_learning_rate = row.critic_lr
+        else:
+            self.riql_config_row = None
+            self.riql_config_extension = False
+
     def _resolve_algorithm_profile(self) -> None:
-        reference = self.algorithm_profile == "reference"
+        reference = self.implementation_profile in (
+            "official_code_reference",
+            "paper_reference",
+            "locomotion_port",
+            "common_budget_robustness",
+        )
+        reference_actor_lr = (
+            1e-4
+            if self.algorithm in ("cal_ql", "wsrl") and reference
+            else self.learning_rate
+        )
         self.actor_learning_rate = (
-            (1e-4 if self.algorithm == "cal_ql" and reference else self.learning_rate)
+            reference_actor_lr
             if self.actor_learning_rate is None
             else self.actor_learning_rate
         )
@@ -399,8 +658,11 @@ class ExperimentConfig:
             if self.critic_learning_rate is None
             else self.critic_learning_rate
         )
+        reference_temperature_lr = (
+            1e-4 if self.algorithm == "wsrl" and reference else self.entropy_lr
+        )
         self.temperature_learning_rate = (
-            self.entropy_lr
+            reference_temperature_lr
             if self.temperature_learning_rate is None
             else self.temperature_learning_rate
         )
@@ -435,13 +697,23 @@ class ExperimentConfig:
                 self.wsrl_layer_norm = False
             if self.wsrl_utd_ratio is None:
                 self.wsrl_utd_ratio = self.updates_per_step
+        if self.algorithm not in ("rpex", "riql_pex"):
+            self.evaluation_policy_profile = "deterministic_diagnostic"
+        if self.algorithm in ("pex", "cal_ql"):
+            self.online_replay_profile = "fixed_offline_online_mixture"
+        elif self.algorithm == "pessimistic_q_ensemble":
+            self.online_replay_profile = (
+                "balanced_density_replay"
+                if self.pqe_replay_mode == "balanced_density"
+                else "fixed_offline_online_mixture"
+            )
 
     @property
     def resolved_algorithm_profile(self) -> str:
         if self.algorithm == "cal_ql":
             base = (
-                "calql_reference"
-                if self.algorithm_profile == "reference"
+                "calql_locomotion_port"
+                if self.implementation_profile != "legacy_current"
                 else "calql_legacy_bc100k"
             )
             if self.calibration_mask_mode == "oracle_exclude_corrupted":
@@ -451,11 +723,13 @@ class ExperimentConfig:
             return base
         if self.algorithm == "wsrl":
             return (
-                "wsrl_reference_redq10x2"
-                if self.algorithm_profile == "reference"
+                "wsrl_official_locomotion_redq10x2"
+                if self.implementation_profile != "legacy_current"
                 else "wsrl_legacy_min10"
             )
-        return f"{self.algorithm}_{self.algorithm_profile}"
+        if self.algorithm == "pessimistic_q_ensemble":
+            return "pqe_shared_actor_approx"
+        return f"{self.algorithm}_{self.implementation_profile}"
 
     @property
     def effective_offline_checkpoint_period(self) -> int:
@@ -473,6 +747,11 @@ class ExperimentConfig:
     def effective_offline_ratio(self) -> float:
         if self.offline_ratio is not None:
             return self.offline_ratio
+        if (
+            self.algorithm in ("rpex", "riql_pex")
+            and self.online_replay_profile == "paper_offline_online_mixture"
+        ):
+            return 0.5
         # Mirrors RPEX: robust IQL variants reduce online replay as an offline
         # problem; PEX and Cal-QL keep balanced offline samples.
         return {
@@ -499,6 +778,27 @@ class ExperimentConfig:
         result["paper_title"] = ALGORITHM_TITLES[self.algorithm]
         result["base_seed"] = self.seed
         result["resolved_algorithm_profile"] = self.resolved_algorithm_profile
+        result["implementation_profile"] = self.implementation_profile
+        result["implementation_fidelity"] = self.implementation_fidelity
+        result["suite_profile"] = self.suite_profile
+        result["budget_profile"] = self.suite_profile
+        result["offline_update_budget"] = self.offline_steps
+        result["online_environment_step_budget"] = self.online_steps
+        result["utd_ratio"] = (
+            self.wsrl_utd_ratio if self.algorithm == "wsrl" else self.updates_per_step
+        )
+        result["not_paper_reproduction"] = (
+            self.suite_profile == "common_budget_robustness"
+            or self.implementation_fidelity in ("task_port", "approximation")
+        )
+        result["paper_reproduction_eligible"] = (
+            self.implementation_fidelity == "exact_upstream_port"
+            and self.suite_profile == "method_fidelity"
+        )
+        result["oracle_information"] = (
+            self.calibration_mask_mode == "oracle_exclude_corrupted"
+        )
+        result["upstream_commit"] = UPSTREAM_COMMITS.get(self.algorithm)
         result["score_semantics"] = (
             "d4rl_normalized_return"
             if self.protocol == LEGACY_PROTOCOL
@@ -538,7 +838,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-env-seed", type=int)
     parser.add_argument("--eval-seed", type=int)
     parser.add_argument(
-        "--algorithm-profile", choices=ALGORITHM_PROFILES, default="reference"
+        "--implementation-profile",
+        "--algorithm-profile",
+        dest="implementation_profile",
+        choices=IMPLEMENTATION_PROFILES,
+        help="method-specific implementation provenance (generic reference was removed)",
+    )
+    parser.add_argument(
+        "--suite-profile",
+        choices=SUITE_PROFILES,
+        default="common_budget_robustness",
     )
     parser.add_argument(
         "--protocol",
@@ -566,7 +875,15 @@ def build_parser() -> argparse.ArgumentParser:
             "read directly in local Gymnasium mode"
         ),
     )
-    parser.add_argument("--checkpoint")
+    parser.add_argument("--checkpoint", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--initialize-from-checkpoint",
+        help="initialize model/normalizer for a new run; does not restore run position",
+    )
+    parser.add_argument(
+        "--resume-run",
+        help="resume an interrupted run from its full run-state checkpoint",
+    )
     parser.add_argument("--attack-checkpoint")
     parser.add_argument(
         "--comparison-name",
@@ -627,14 +944,47 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deterministic-policy", action="store_true")
     parser.add_argument(
         "--action-distribution",
-        choices=("tanh_gaussian", "legacy_gaussian"),
+        choices=(
+            "tanh_gaussian",
+            "legacy_gaussian",
+            "official_unsquashed_gaussian",
+        ),
         default="tanh_gaussian",
         help="bounded default, or unsafe reproduction-only PEX/RPEX Gaussian",
     )
     parser.add_argument(
         "--evaluation-mode",
         choices=("deterministic_diagnostic", "method_faithful", "both"),
-        default="deterministic_diagnostic",
+    )
+    parser.add_argument(
+        "--online-replay-profile", choices=ONLINE_REPLAY_PROFILES,
+        default="official_code_online_only",
+    )
+    parser.add_argument(
+        "--evaluation-policy-profile", choices=EVALUATION_POLICY_PROFILES,
+        default="official_code_epsilon_switching",
+    )
+    parser.add_argument(
+        "--attack-timing", choices=ATTACK_TIMINGS,
+        default="official_code_post_transition_replay_poisoning",
+    )
+    parser.add_argument(
+        "--random-attack-semantics", choices=RANDOM_ATTACK_SEMANTICS,
+        default="post_transition_replay_poisoning",
+    )
+    parser.add_argument(
+        "--mixed-corruption-profile", choices=MIXED_CORRUPTION_PROFILES,
+        default="generic_partitioned_mixed",
+    )
+    parser.add_argument(
+        "--action-execution-profile", choices=ACTION_EXECUTION_PROFILES,
+        default="clip_to_action_space",
+    )
+    parser.add_argument("--policy-extraction", choices=POLICY_EXTRACTIONS)
+    parser.add_argument("--task-profile", choices=TASK_PROFILES)
+    parser.add_argument(
+        "--adversarial-attack-profile", choices=ADVERSARIAL_ATTACK_PROFILES,
+        default="experimental_sign_pgd",
     )
 
     parser.add_argument("--expectile", type=float, default=0.7)
@@ -683,6 +1033,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--balanced-replay-temperature", type=float, default=5.0)
     parser.add_argument("--priority-floor", type=float, default=1e-3)
+    parser.add_argument("--pqe-member-checkpoints", nargs="*", default=())
 
     parser.add_argument("--ro2o-beta-policy", type=float, default=1.0)
     parser.add_argument("--ro2o-beta-ood", type=float, default=0.1)
@@ -700,6 +1051,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--offline-attack-steps", type=int, default=100)
     parser.add_argument("--online-attack-steps", type=int, default=2)
     parser.add_argument("--attack-step-size", type=float, default=0.01)
+    parser.add_argument("--online-attack-step-size", type=float)
     parser.add_argument("--attack-min-step-size", type=float, default=0.0)
     parser.add_argument("--attack-norm", choices=("linf",), default="linf")
     parser.add_argument("--force-regenerate-attack", action="store_true")

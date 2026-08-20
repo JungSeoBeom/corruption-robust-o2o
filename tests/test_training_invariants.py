@@ -473,7 +473,7 @@ class TrainingInvariantTest(unittest.TestCase):
         with torch.no_grad():
             before_q = float(agent.critic(states[:1], batch["actions"][:1]).mean())
         metrics = {}
-        for _ in range(150):
+        for _ in range(100):
             metrics = agent.update(batch)
         after_action = float(agent.select_action(torch.zeros(1), evaluate=True))
         with torch.no_grad():

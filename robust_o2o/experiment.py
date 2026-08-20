@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import random
 import warnings
 from contextlib import ExitStack
 from pathlib import Path
@@ -13,9 +15,11 @@ from .agents import build_agent
 from .config import LEGACY_PROTOCOL, ExperimentConfig
 from .corruption import (
     AttackOracle,
+    corrupt_pre_action_value,
     corrupt_offline_dataset,
     corrupt_online_transition,
     make_attack_oracle,
+    sample_online_corruption_target,
 )
 from .device import resolve_device, seed_env_only, seed_everything
 from .environment import (
@@ -69,6 +73,16 @@ def bounded_executed_action(
     action_high: np.ndarray,
 ) -> np.ndarray:
     return np.clip(raw_policy_action, action_low, action_high).astype(np.float32)
+
+
+def normalizer_sha256(normalizer: StateNormalizer) -> str:
+    digest = hashlib.sha256(normalizer.mode.encode("utf-8"))
+    for value in (normalizer.mean, normalizer.std):
+        array = np.ascontiguousarray(value)
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(str(array.shape).encode("ascii"))
+        digest.update(memoryview(array).cast("B"))
+    return digest.hexdigest()
 
 
 def _make_evaluation_env(
@@ -133,6 +147,96 @@ def _torch_load(path: Path, device: torch.device) -> Dict[str, Any]:
         return torch.load(path, map_location=device)
 
 
+def resolve_resume_checkpoint(path_value: str, device: torch.device) -> tuple[Path, Dict[str, Any]]:
+    path = Path(path_value).expanduser().resolve()
+    candidates = [path] if path.is_file() else list(path.glob("checkpoints/*/*.pt"))
+    exact = []
+    for candidate in candidates:
+        payload = _torch_load(candidate, device)
+        if payload.get("exact_resume_available"):
+            exact.append((int(payload.get("env_steps", 0)), int(payload.get("step", 0)), candidate, payload))
+    if not exact:
+        raise ValueError(
+            "--resume-run found no exact episode-boundary resume checkpoint; "
+            "initialization checkpoints must use --initialize-from-checkpoint"
+        )
+    _, _, candidate, payload = max(exact, key=lambda item: (item[0], item[1]))
+    return candidate, payload
+
+
+def capture_global_rng_state(
+    corruption_rng: Optional[np.random.Generator] = None,
+    oracle: Optional[AttackOracle] = None,
+) -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy_global": np.random.get_state(),
+        "torch_cpu": torch.random.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "corruption_rng": (
+            corruption_rng.bit_generator.state if corruption_rng is not None else None
+        ),
+        "attack_rng": (
+            oracle.generator.get_state() if oracle is not None else None
+        ),
+    }
+    if hasattr(torch, "mps") and hasattr(torch.mps, "get_rng_state"):
+        try:
+            state["torch_mps"] = torch.mps.get_rng_state()
+        except RuntimeError:
+            state["torch_mps"] = None
+    return state
+
+
+def restore_global_rng_state(
+    state: Dict[str, Any],
+    corruption_rng: Optional[np.random.Generator] = None,
+    oracle: Optional[AttackOracle] = None,
+) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy_global"])
+    torch.random.set_rng_state(state["torch_cpu"])
+    if state.get("torch_cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+    if state.get("torch_mps") is not None and hasattr(torch, "mps"):
+        torch.mps.set_rng_state(state["torch_mps"])
+    if corruption_rng is not None and state.get("corruption_rng") is not None:
+        corruption_rng.bit_generator.state = state["corruption_rng"]
+    if oracle is not None and state.get("attack_rng") is not None:
+        oracle.generator.set_state(state["attack_rng"])
+
+
+def capture_environment_rng_state(env: object) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for label, owner in (
+        ("environment", getattr(env, "unwrapped", env)),
+        ("action_space", getattr(env, "action_space", None)),
+    ):
+        rng = getattr(owner, "np_random", None)
+        if rng is None:
+            continue
+        if hasattr(rng, "bit_generator"):
+            result[label] = ("generator", rng.bit_generator.state)
+        elif hasattr(rng, "get_state"):
+            result[label] = ("random_state", rng.get_state())
+    return result
+
+
+def restore_environment_rng_state(env: object, state: Dict[str, Any]) -> None:
+    for label, owner in (
+        ("environment", getattr(env, "unwrapped", env)),
+        ("action_space", getattr(env, "action_space", None)),
+    ):
+        if label not in state:
+            continue
+        rng = getattr(owner, "np_random", None)
+        kind, value = state[label]
+        if kind == "generator":
+            rng.bit_generator.state = value
+        else:
+            rng.set_state(value)
+
+
 def save_checkpoint(
     path: Path,
     agent: object,
@@ -143,14 +247,19 @@ def save_checkpoint(
     env_steps: int,
     state_dim: int,
     action_dim: int,
+    resume_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     payload = {
-        "format_version": 3,
+        "format_version": 4,
         "algorithm": config.algorithm,
         "env_name": config.env_name,
         "protocol": config.protocol,
         "algorithm_profile": config.algorithm_profile,
         "resolved_algorithm_profile": config.resolved_algorithm_profile,
+        "implementation_profile": config.implementation_profile,
+        "implementation_fidelity": config.implementation_fidelity,
+        "suite_profile": config.suite_profile,
+        "manifest_sha256": getattr(config, "_manifest_sha256", None),
         "config": config.to_dict(),
         "normalizer": normalizer.state_dict(),
         "agent": agent.checkpoint_state(),
@@ -165,6 +274,10 @@ def save_checkpoint(
         "environment_fingerprint_payload": getattr(
             config, "_environment_fingerprint_payload", None
         ),
+        "resume_state": resume_state,
+        "exact_resume_available": bool(
+            resume_state is not None and resume_state.get("episode_boundary", False)
+        ),
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
@@ -175,6 +288,42 @@ def _checkpoint_directory(logger: RunLogger, phase: str) -> Path:
     directory = logger.run_dir / "checkpoints" / phase
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def _writer_positions(logger: RunLogger) -> Dict[str, int]:
+    return {
+        "metrics_csv": (
+            logger.metrics_path.stat().st_size if logger.metrics_path.exists() else 0
+        ),
+        "train_metrics_jsonl": (
+            logger.train_metrics_path.stat().st_size
+            if logger.train_metrics_path.exists()
+            else 0
+        ),
+    }
+
+
+def _validate_writer_positions(
+    logger: RunLogger, resume_state: Optional[Dict[str, Any]]
+) -> None:
+    if resume_state is None:
+        return
+    expected = resume_state.get("writer_append_position")
+    if expected is None:
+        raise ValueError("exact resume checkpoint has no writer append position")
+    if isinstance(expected, int):
+        expected = {"train_metrics_jsonl": expected}
+    actual = _writer_positions(logger)
+    mismatches = {
+        key: (value, actual.get(key))
+        for key, value in expected.items()
+        if actual.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            "resume log position mismatch; refusing to duplicate or overwrite "
+            f"metrics: {mismatches}"
+        )
 
 
 def _prune_periodic_checkpoints(directory: Path, keep_last: int) -> None:
@@ -198,9 +347,15 @@ def _save_phase_checkpoint(
     action_dim: int,
     *,
     final: bool,
+    resume_state: Optional[Dict[str, Any]] = None,
 ) -> Path:
     directory = _checkpoint_directory(logger, phase)
-    path = directory / ("final.pt" if final else f"step_{step:09d}.pt")
+    manifest_tag = str(getattr(config, "_manifest_sha256", "unresolved"))[:16]
+    path = directory / (
+        f"final_manifest_{manifest_tag}.pt"
+        if final
+        else f"step_{step:09d}_manifest_{manifest_tag}.pt"
+    )
     save_checkpoint(
         path,
         agent,
@@ -211,6 +366,7 @@ def _save_phase_checkpoint(
         env_steps,
         state_dim,
         action_dim,
+        resume_state,
     )
     if not final:
         _prune_periodic_checkpoints(directory, config.keep_last_checkpoints)
@@ -239,11 +395,13 @@ def _validate_checkpoint(
             f"requested={config.protocol!r}; checkpoints from different "
             "environment backends cannot be mixed"
         )
-    saved_profile = payload.get("algorithm_profile")
-    if saved_profile is not None and saved_profile != config.algorithm_profile:
+    saved_profile = payload.get(
+        "implementation_profile", payload.get("algorithm_profile")
+    )
+    if saved_profile is not None and saved_profile != config.implementation_profile:
         raise ValueError(
-            f"Checkpoint algorithm_profile={saved_profile!r}, "
-            f"requested={config.algorithm_profile!r}"
+            f"Checkpoint implementation_profile={saved_profile!r}, "
+            f"requested={config.implementation_profile!r}"
         )
     if payload.get("state_dim") != state_dim or payload.get("action_dim") != action_dim:
         raise ValueError("Checkpoint observation/action dimensions do not match the env")
@@ -372,6 +530,7 @@ def _evaluate(
             config.eval_seed,
             config.protocol,
             mode,
+            config.action_execution_profile,
         )
         for mode in modes
     }
@@ -485,8 +644,16 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
         ]
 
         checkpoint_payload: Optional[Dict[str, Any]] = None
-        if config.checkpoint:
-            checkpoint_path = Path(config.checkpoint).expanduser().resolve()
+        resume_payload: Optional[Dict[str, Any]] = None
+        if config.resume_run:
+            _, checkpoint_payload = resolve_resume_checkpoint(config.resume_run, device)
+            _validate_checkpoint(checkpoint_payload, config, state_dim, action_dim)
+            _restore_agent_config(config, checkpoint_payload)
+            resume_payload = checkpoint_payload["resume_state"]
+        if config.initialize_from_checkpoint:
+            checkpoint_path = Path(
+                config.initialize_from_checkpoint
+            ).expanduser().resolve()
             checkpoint_payload = _torch_load(checkpoint_path, device)
             _validate_checkpoint(checkpoint_payload, config, state_dim, action_dim)
             _restore_agent_config(config, checkpoint_payload)
@@ -505,7 +672,7 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
             raw_dataset, config, oracle, cache_root
         )
 
-        if checkpoint_payload is not None and config.stage == "online":
+        if checkpoint_payload is not None:
             normalizer = StateNormalizer.from_state_dict(
                 checkpoint_payload["normalizer"]
             )
@@ -517,6 +684,8 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
             )
         normalized_dataset = apply_normalizer(corrupted_dataset, normalizer)
         offline = OfflineDataset(normalized_dataset, config.replay_seed)
+        if resume_payload is not None and resume_payload.get("offline_dataset"):
+            offline.load_state_dict(resume_payload["offline_dataset"])
 
         # Decouple learner initialization and subsequent training randomness
         # from preprocessing, adversarial attacks, and cache hit/miss state.
@@ -524,6 +693,8 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
         agent = build_agent(config, state_dim, action_dim, max_action, device)
         if checkpoint_payload is not None:
             agent.load_checkpoint_state(checkpoint_payload["agent"])
+        if resume_payload is not None:
+            restore_global_rng_state(resume_payload["global_rng"], oracle=oracle)
 
         diagnostic_snapshot = (
             _parameter_snapshot(agent) if config.diagnostic_mode else None
@@ -541,6 +712,7 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
                 "action_dim": action_dim,
                 "offline_corruption": corruption_stats,
                 "normalizer": normalizer.diagnostics(corrupted_dataset),
+                "normalizer_sha256": normalizer_sha256(normalizer),
                 "legacy_checkpoint_without_fingerprint_loaded": bool(
                     getattr(
                         config,
@@ -586,6 +758,7 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
                 config.eval_seed,
                 config.protocol,
                 "deterministic_diagnostic",
+                config.action_execution_profile,
             )
             diagnostic_initial_return = initial_metrics["return_mean"]
             logger.log_evaluation(
@@ -597,17 +770,21 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
             )
 
         if config.stage in ("offline", "both"):
-            _run_offline(
-                eval_env,
-                config,
-                agent,
-                offline,
-                normalizer,
-                device,
-                logger,
-                state_dim,
-                action_dim,
-            )
+            if resume_payload is not None and resume_payload.get("phase") != "offline":
+                pass
+            else:
+                _run_offline(
+                    eval_env,
+                    config,
+                    agent,
+                    offline,
+                    normalizer,
+                    device,
+                    logger,
+                    state_dim,
+                    action_dim,
+                    resume_state=resume_payload,
+                )
         if config.stage in ("online", "both"):
             if not agent.online_phase:
                 agent.begin_online()
@@ -624,6 +801,7 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
                 logger,
                 state_dim,
                 action_dim,
+                resume_state=resume_payload,
             )
         if diagnostic_snapshot is not None:
             parameter_deltas, _ = _parameter_deltas(agent, diagnostic_snapshot)
@@ -638,6 +816,7 @@ def run_experiment(config: ExperimentConfig, logger: RunLogger) -> Path:
                 config.eval_seed,
                 config.protocol,
                 "deterministic_diagnostic",
+                config.action_execution_profile,
             )
             final_return = final_metrics["return_mean"]
             evidence = {
@@ -667,12 +846,21 @@ def _run_offline(
     logger: RunLogger,
     state_dim: int,
     action_dim: int,
+    resume_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     logger.logger.info("offline pre-training started")
     last_metrics: Dict[str, float] = {}
     accumulator = MetricAccumulator()
+    start_step = 0
+    if resume_state is not None and resume_state.get("phase") == "offline":
+        _validate_writer_positions(logger, resume_state)
+        start_step = int(resume_state["phase_step"])
+        accumulator.values = {
+            key: list(values)
+            for key, values in resume_state.get("metric_accumulator", {}).items()
+        }
     parameter_snapshot = _parameter_snapshot(agent)
-    for step in range(1, config.offline_steps + 1):
+    for step in range(start_step + 1, config.offline_steps + 1):
         batch = offline.sample(config.batch_size, device)
         last_metrics = agent.update(batch)
         accumulator.add(last_metrics)
@@ -724,6 +912,15 @@ def _run_offline(
                 state_dim,
                 action_dim,
                 final=False,
+                resume_state={
+                    "phase": "offline",
+                    "phase_step": step,
+                    "episode_boundary": True,
+                    "offline_dataset": offline.state_dict(),
+                    "global_rng": capture_global_rng_state(),
+                    "metric_accumulator": accumulator.values,
+                    "writer_append_position": _writer_positions(logger),
+                },
             )
     if config.offline_steps == 0 or config.offline_steps % config.eval_period != 0:
         _evaluate(
@@ -748,6 +945,15 @@ def _run_offline(
         state_dim,
         action_dim,
         final=True,
+        resume_state={
+            "phase": "offline",
+            "phase_step": config.offline_steps,
+            "episode_boundary": True,
+            "offline_dataset": offline.state_dict(),
+            "global_rng": capture_global_rng_state(),
+            "metric_accumulator": accumulator.values,
+            "writer_append_position": _writer_positions(logger),
+        },
     )
     logger.logger.info("offline pre-training completed")
 
@@ -765,6 +971,7 @@ def _run_online(
     logger: RunLogger,
     state_dim: int,
     action_dim: int,
+    resume_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     logger.logger.info("online fine-tuning started")
     replay = ReplayBuffer(
@@ -773,16 +980,30 @@ def _run_online(
     rng = np.random.default_rng(config.corruption_seed)
     state_std = raw_dataset["observations"].std(axis=0).astype(np.float32) + 1e-6
     action_std = raw_dataset["actions"].std(axis=0).astype(np.float32) + 1e-6
-    raw_state = reset_env(env, seed=config.train_env_seed, protocol=config.protocol)
+    online_resume = resume_state is not None and resume_state.get("phase") == "online"
+    start_env_step = int(resume_state["phase_step"]) if online_resume else 0
+    if online_resume:
+        _validate_writer_positions(logger, resume_state)
+        if not resume_state.get("episode_boundary"):
+            raise ValueError("exact online resume is only supported at episode boundaries")
+        replay.load_state_dict(resume_state["online_replay"])
+        restore_global_rng_state(resume_state["global_rng"], rng, oracle)
+        restore_environment_rng_state(env, resume_state["environment_rng"])
+        raw_state = None
+    else:
+        raw_state = reset_env(env, seed=config.train_env_seed, protocol=config.protocol)
     episode_steps = 0
-    corrupted_online = 0
+    episode_return = 0.0
+    corrupted_online = int(resume_state.get("corrupted_online", 0)) if online_resume else 0
     last_metrics: Dict[str, float] = {}
     accumulator = MetricAccumulator()
+    if online_resume:
+        accumulator.values = {
+            key: list(values)
+            for key, values in resume_state.get("metric_accumulator", {}).items()
+        }
     parameter_snapshot = _parameter_snapshot(agent)
     offline_ratio = config.effective_offline_ratio
-    online_batch_count = config.batch_size - int(
-        round(config.batch_size * offline_ratio)
-    )
     warmup = (
         max(config.initial_collection_steps, config.warmup_steps)
         if config.algorithm == "wsrl"
@@ -790,10 +1011,10 @@ def _run_online(
     )
     action_low = np.asarray(env.action_space.low, dtype=np.float32)
     action_high = np.asarray(env.action_space.high, dtype=np.float32)
-    raw_action_abs_max = 0.0
-    executed_action_abs_max = 0.0
-    executed_oob = 0
-    replay_mismatch = 0
+    raw_action_abs_max = float(resume_state.get("raw_action_abs_max", 0.0)) if online_resume else 0.0
+    executed_action_abs_max = float(resume_state.get("executed_action_abs_max", 0.0)) if online_resume else 0.0
+    executed_oob = int(resume_state.get("executed_oob", 0)) if online_resume else 0
+    replay_mismatch = int(resume_state.get("replay_mismatch", 0)) if online_resume else 0
     priority_metrics: Dict[str, float] = {}
     desired_online_fraction = 1.0 - offline_ratio
     initial_online_priority = (
@@ -806,15 +1027,77 @@ def _run_online(
         else 1.0
     )
 
-    for env_step in range(1, config.online_steps + 1):
+    def online_resume_snapshot(step: int) -> Dict[str, Any]:
+        if not episode_boundary or raw_state is not None:
+            raise RuntimeError("online exact-resume snapshots require an episode boundary")
+        return {
+            "phase": "online",
+            "phase_step": step,
+            "episode_boundary": True,
+            "current_observation": None,
+            "episode_step": 0,
+            "episode_return": 0.0,
+            "online_replay": replay.state_dict(),
+            "offline_dataset": offline.state_dict(),
+            "global_rng": capture_global_rng_state(rng, oracle),
+            "environment_rng": capture_environment_rng_state(env),
+            "corrupted_online": corrupted_online,
+            "raw_action_abs_max": raw_action_abs_max,
+            "executed_action_abs_max": executed_action_abs_max,
+            "executed_oob": executed_oob,
+            "replay_mismatch": replay_mismatch,
+            "metric_accumulator": accumulator.values,
+            "writer_append_position": _writer_positions(logger),
+        }
+
+    pending_checkpoint = False
+    episode_boundary = True
+    for env_step in range(start_env_step + 1, config.online_steps + 1):
+        if raw_state is None:
+            raw_state = reset_env(env, protocol=config.protocol)
+        episode_boundary = False
+        pre_action = (
+            config.random_attack_semantics
+            == "pre_action_sensor_actuator_corruption"
+        )
+        selected_target = (
+            sample_online_corruption_target(config, rng) if pre_action else None
+        )
+        policy_state = raw_state
+        if pre_action and selected_target == "observations":
+            policy_state = corrupt_pre_action_value(
+                raw_state,
+                "observations",
+                raw_state,
+                None,
+                config,
+                oracle,
+                rng,
+                state_std,
+                action_std,
+            )
         state_tensor = torch.as_tensor(
-            normalizer.transform(raw_state), dtype=torch.float32, device=device
+            normalizer.transform(policy_state), dtype=torch.float32, device=device
         )
         with torch.no_grad():
             raw_policy_action = agent.select_action(state_tensor, evaluate=False)
         raw_action_np = raw_policy_action.detach().cpu().numpy().astype(np.float32)
-        executed_action = bounded_executed_action(
-            raw_action_np, action_low, action_high
+        if pre_action and selected_target == "actions":
+            raw_action_np = corrupt_pre_action_value(
+                raw_action_np,
+                "actions",
+                raw_state,
+                raw_action_np,
+                config,
+                oracle,
+                rng,
+                state_std,
+                action_std,
+            )
+        executed_action = (
+            bounded_executed_action(raw_action_np, action_low, action_high)
+            if config.action_execution_profile == "clip_to_action_space"
+            else raw_action_np.copy()
         )
         raw_action_abs_max = max(raw_action_abs_max, float(np.abs(raw_action_np).max()))
         executed_action_abs_max = max(
@@ -827,24 +1110,34 @@ def _run_online(
             env, executed_action, protocol=config.protocol
         )
         episode_steps += 1
+        episode_return += reward
 
-        (
-            stored_state,
-            stored_action,
-            stored_reward,
-            stored_next_state,
-            was_corrupted,
-        ) = corrupt_online_transition(
-            raw_state,
-            executed_action,
-            reward,
-            raw_next_state,
-            config,
-            oracle,
-            rng,
-            state_std,
-            action_std,
-        )
+        if pre_action and selected_target in ("observations", "actions"):
+            stored_state = policy_state.copy()
+            stored_action = executed_action.copy()
+            stored_reward = float(reward)
+            stored_next_state = raw_next_state.copy()
+            was_corrupted = True
+        else:
+            (
+                stored_state,
+                stored_action,
+                stored_reward,
+                stored_next_state,
+                was_corrupted,
+            ) = corrupt_online_transition(
+                raw_state,
+                executed_action,
+                reward,
+                raw_next_state,
+                config,
+                oracle,
+                rng,
+                state_std,
+                action_std,
+                selected_target=selected_target,
+                selection_already_sampled=pre_action,
+            )
         corrupted_online += int(was_corrupted)
         replay_mismatch += int(
             not np.allclose(stored_action, executed_action, rtol=1e-6, atol=1e-6)
@@ -859,8 +1152,10 @@ def _run_online(
         )
         raw_state = raw_next_state
         if terminated or truncated or episode_steps >= config.max_episode_steps:
-            raw_state = reset_env(env, protocol=config.protocol)
+            raw_state = None
             episode_steps = 0
+            episode_return = 0.0
+            episode_boundary = True
 
         is_pqe = config.algorithm == "pessimistic_q_ensemble"
         update_batch_size = (
@@ -993,11 +1288,9 @@ def _run_online(
                 env_step,
             )
         period = config.effective_online_checkpoint_period
-        if (
-            period > 0
-            and env_step % period == 0
-            and env_step != config.online_steps
-        ):
+        if period > 0 and env_step % period == 0 and env_step != config.online_steps:
+            pending_checkpoint = True
+        if pending_checkpoint and episode_boundary and env_step != config.online_steps:
             _save_phase_checkpoint(
                 logger,
                 agent,
@@ -1009,7 +1302,9 @@ def _run_online(
                 state_dim,
                 action_dim,
                 final=False,
+                resume_state=online_resume_snapshot(env_step),
             )
+            pending_checkpoint = False
 
     if config.online_steps == 0 or config.online_steps % config.eval_period != 0:
         _evaluate(
@@ -1034,6 +1329,9 @@ def _run_online(
         state_dim,
         action_dim,
         final=True,
+        resume_state=(
+            online_resume_snapshot(config.online_steps) if episode_boundary else None
+        ),
     )
     logger.logger.info(
         "online fine-tuning completed; corrupted=%d/%d",

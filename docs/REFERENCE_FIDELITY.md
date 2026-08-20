@@ -1,4 +1,8 @@
-# Cal-QL and WSRL reference-fidelity audit
+# Historical Cal-QL and WSRL audit (superseded)
+
+This document records the earlier two-baseline audit. The active, method-level
+source-of-truth is `docs/baseline_fidelity_manifest.yaml`; generic `reference`
+is no longer a valid profile.
 
 This audit was performed against repository `HEAD` `b203477` before the
 reference-profile changes. No long reinforcement-learning run was used.
@@ -40,10 +44,12 @@ reference-profile changes. No long reinforcement-learning run was used.
 
 ## Resolved behavior
 
-`reference` is the new default; `legacy_current` retains the previous Cal-QL
-BC-100k and WSRL min-all-10 behavior. Resolved names, all role seeds, optimizer
-rates, CQL/REDQ settings, network architecture flags, environment provenance,
-and checkpoint fingerprints are serialized in every new run.
+The later fidelity overhaul replaced `reference` with explicit implementation
+and suite profiles. Existing results from this period are read as
+`legacy_current`/`legacy_unknown`; they are never silently promoted. Resolved
+names, all role seeds, optimizer rates, CQL/REDQ settings, network architecture
+flags, environment provenance, and manifest hashes are serialized in every new
+run.
 
 The strict benchmark remains a fail-fast Gym 0.23.1/D4RL-v2/mujoco_py path with
 no Gymnasium fallback. The local Gymnasium-v4 protocol is explicitly diagnostic

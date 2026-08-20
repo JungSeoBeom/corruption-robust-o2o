@@ -6,7 +6,7 @@ import torch
 
 from robust_o2o.agents import build_agent
 from robust_o2o.config import ALGORITHMS, ExperimentConfig
-from robust_o2o.networks import ExpansionGaussianPolicy
+from robust_o2o.networks import OfficialRPEXGaussianPolicy
 
 
 class AgentSmokeTest(unittest.TestCase):
@@ -55,9 +55,9 @@ class AgentSmokeTest(unittest.TestCase):
         agent = build_agent(
             self._config("rpex"), 5, 2, 1.0, torch.device("cpu")
         )
-        self.assertIsInstance(agent.actor, ExpansionGaussianPolicy)
+        self.assertIsInstance(agent.actor, OfficialRPEXGaussianPolicy)
         agent.begin_online()
-        self.assertIsInstance(agent.actor, ExpansionGaussianPolicy)
+        self.assertIsInstance(agent.actor, OfficialRPEXGaussianPolicy)
         states = torch.randn(4, 5)
         distribution = agent.actor.distribution(states)
         self.assertEqual(tuple(distribution.mean.shape), (4, 2))

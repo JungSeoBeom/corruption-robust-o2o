@@ -947,6 +947,7 @@ def evaluate_agent(
     seed: int,
     protocol: str = DEFAULT_PROTOCOL,
     evaluation_mode: str = "deterministic_diagnostic",
+    action_execution_profile: str = "clip_to_action_space",
 ) -> Dict[str, float]:
     returns = []
     with preserve_training_rng_state():
@@ -969,9 +970,15 @@ def evaluate_agent(
                     evaluation_mode=evaluation_mode,
                 )
                 action_np = action.detach().cpu().numpy()
-                action_np = np.clip(
-                    action_np, env.action_space.low, env.action_space.high
-                ).astype(np.float32)
+                if action_execution_profile == "clip_to_action_space":
+                    action_np = np.clip(
+                        action_np, env.action_space.low, env.action_space.high
+                    )
+                elif action_execution_profile != "official_algorithm_behavior":
+                    raise ValueError(
+                        f"Unknown action_execution_profile {action_execution_profile!r}"
+                    )
+                action_np = action_np.astype(np.float32)
                 raw_state, reward, terminated, truncated, _ = step_env(
                     env,
                     action_np,

@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Optional
 
+from robust_o2o.manifest import aggregation_signature
+
 
 def _imports():
     try:
@@ -111,6 +113,17 @@ def _load_runs(root: Path):
             continue
         with config_path.open(encoding="utf-8") as stream:
             config = json.load(stream)
+        manifest_path = metrics_path.parent / "experiment_manifest.json"
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        else:
+            manifest = {
+                "algorithm": config.get("algorithm"),
+                "implementation_profile": "legacy_current",
+                "implementation_fidelity": "legacy_unknown",
+                "suite_profile": "legacy_current",
+                "legacy_source_profile": config.get("algorithm_profile"),
+            }
         summary_path = metrics_path.parent / "summary.json"
         summary = {}
         if summary_path.exists():
@@ -132,9 +145,15 @@ def _load_runs(root: Path):
         ):
             frame[key] = config[key]
         frame["protocol"] = config.get("protocol", "unknown_legacy_protocol")
-        frame["algorithm_profile"] = config.get(
-            "algorithm_profile", "unknown_legacy_profile"
+        frame["algorithm_profile"] = manifest.get(
+            "implementation_profile", "legacy_current"
         )
+        frame["implementation_profile"] = frame["algorithm_profile"]
+        frame["implementation_fidelity"] = manifest.get(
+            "implementation_fidelity", "legacy_unknown"
+        )
+        frame["suite_profile"] = manifest.get("suite_profile", "legacy_current")
+        frame["aggregation_signature"] = aggregation_signature(manifest)
         frame["resolved_algorithm_profile"] = config.get(
             "resolved_algorithm_profile", "unknown_legacy_profile"
         )
@@ -194,6 +213,13 @@ def write_final_score_summary(
     frame = frame[frame["run_status"] == "completed"]
     if frame.empty:
         raise RuntimeError("No completed runs match the requested summary filters")
+    signature_counts = frame.groupby("algorithm")["aggregation_signature"].nunique()
+    mixed_algorithms = signature_counts[signature_counts > 1]
+    if not mixed_algorithms.empty:
+        raise RuntimeError(
+            "Manifest mismatch within final-score groups: "
+            + ", ".join(mixed_algorithms.index.tolist())
+        )
 
     x_column = "env_steps" if phase == "online" else "step"
     final_runs = (
@@ -203,6 +229,7 @@ def write_final_score_summary(
     )
     group_keys = [
         "algorithm",
+        "aggregation_signature",
         "protocol",
         "algorithm_profile",
         "resolved_algorithm_profile",
@@ -248,7 +275,7 @@ def plot_aggregate(
     corruption: Optional[str] = None,
     target: Optional[str] = None,
     phase: str = "online",
-    include_running: bool = True,
+    include_running: bool = False,
 ) -> Path:
     plt, pd = _imports()
     frame = _load_runs(root)
@@ -262,6 +289,13 @@ def plot_aggregate(
         frame = frame[frame["corruption_target"] == target]
     allowed_statuses = ("completed", "running", "unknown") if include_running else ("completed",)
     frame = frame[frame["run_status"].isin(allowed_statuses)]
+    signature_counts = frame.groupby("algorithm")["aggregation_signature"].nunique()
+    mixed_algorithms = signature_counts[signature_counts > 1]
+    if not mixed_algorithms.empty:
+        raise RuntimeError(
+            "Manifest mismatch within algorithm curves: "
+            + ", ".join(mixed_algorithms.index.tolist())
+        )
     identity_columns = [
         "algorithm",
         "algorithm_profile",
@@ -277,7 +311,7 @@ def plot_aggregate(
             "select an explicit comparison directory instead of silently "
             "choosing the latest run"
         )
-    for column in ("protocol", "algorithm_profile", "dataset_id", "evaluation_env_id"):
+    for column in ("protocol", "dataset_id", "evaluation_env_id"):
         if frame[column].nunique(dropna=False) > 1:
             raise RuntimeError(
                 f"Mixed {column} values cannot be aggregated without an explicit "
@@ -305,6 +339,7 @@ def plot_aggregate(
     summary_frames = []
     group_keys = (
         "algorithm",
+        "aggregation_signature",
         "protocol",
         "algorithm_profile",
         "resolved_algorithm_profile",
@@ -333,11 +368,17 @@ def plot_aggregate(
         for key, value in zip(group_keys, group):
             summary[key] = value
         summary_frames.append(summary)
-        label = f"{group[0]} [{group[3]}]"
+        label = f"{group[0]} [{group[4]}]"
+        if group_frame["suite_profile"].iloc[0] == "common_budget_robustness":
+            label += " COMMON-BUDGET PORT"
+        if group_frame["implementation_fidelity"].iloc[0] == "approximation":
+            label += " APPROX"
+        if "oracle" in str(group[4]):
+            label += " ORACLE"
         if phase in ("offline", "offline_online") and group[0] == "wsrl":
-            label = f"CQL-REDQ pretrainer for WSRL [{group[3]}]"
+            label = f"CQL-REDQ pretrainer for WSRL [{group[4]}]"
         if len(frame["env_name"].unique()) > 1:
-            label += f" | {group[6]}"
+            label += f" | {group[7]}"
         axis.plot(summary[x_column], summary["mean"], label=label)
         axis.fill_between(
             summary[x_column],
@@ -403,7 +444,7 @@ def update_comparison_plots(
     corruption: Optional[str] = None,
     target: Optional[str] = None,
 ) -> dict[str, Path]:
-    """Atomically refresh the three standard plots from completed runs only."""
+    """Refresh completed benchmark plots and separate live diagnostics."""
     runs_dir = comparison_dir / "runs"
     outputs = {}
     for phase in ("offline_online", "offline", "online"):
@@ -416,6 +457,15 @@ def update_comparison_plots(
             target,
             phase,
             include_running=False,
+        )
+        plot_aggregate(
+            runs_dir,
+            comparison_dir / f"diagnostic_running_{phase}.png",
+            env_name,
+            corruption,
+            target,
+            phase,
+            include_running=True,
         )
     return outputs
 
@@ -433,6 +483,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="online",
     )
     parser.add_argument("--single-run")
+    parser.add_argument(
+        "--include-running-diagnostic",
+        action="store_true",
+        help="include running/legacy-unknown runs in a diagnostic-only plot",
+    )
     return parser
 
 
@@ -449,6 +504,7 @@ def main() -> None:
         args.corruption,
         args.target,
         args.phase,
+        include_running=args.include_running_diagnostic,
     )
     print(output)
 

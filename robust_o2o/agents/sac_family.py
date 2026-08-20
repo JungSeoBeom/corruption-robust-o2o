@@ -29,21 +29,33 @@ class SACEnsembleAgent(BaseAgent):
         super().__init__(device)
         self.config = config
         self.variant = config.algorithm
+        network_hidden_layers = (
+            2
+            if self.variant == "wsrl"
+            and config.implementation_profile != "legacy_current"
+            else max(config.hidden_layers, 3)
+        )
+        wsrl_profile = (
+            self.variant == "wsrl"
+            and config.implementation_profile != "legacy_current"
+        )
         self.actor = TanhGaussianPolicy(
             state_dim,
             action_dim,
             config.hidden_dim,
-            max(config.hidden_layers, 3),
+            network_hidden_layers,
             max_action,
             layer_norm=(self.variant == "wsrl" and config.wsrl_layer_norm),
+            wsrl_profile=wsrl_profile,
         )
         self.critic = EnsembleQNetwork(
             state_dim,
             action_dim,
             config.hidden_dim,
-            max(config.hidden_layers, 3),
+            network_hidden_layers,
             config.sac_num_critics,
             layer_norm=(self.variant == "wsrl" and config.wsrl_layer_norm),
+            wsrl_profile=wsrl_profile,
         )
         self.target_critic = copy.deepcopy(self.critic).requires_grad_(False)
         self.critic2 = (
@@ -123,6 +135,13 @@ class SACEnsembleAgent(BaseAgent):
             device=self.device,
         )
 
+    @staticmethod
+    def _wsrl_subsampled_min(
+        q_values: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        """REDQ minimum for an explicit with-replacement critic sample."""
+        return q_values.index_select(0, indices).min(dim=0).values
+
     def _critic_values_for_actions(
         self,
         critic: EnsembleQNetwork,
@@ -145,15 +164,37 @@ class SACEnsembleAgent(BaseAgent):
         next_states: torch.Tensor,
         data_actions: torch.Tensor,
     ) -> torch.Tensor:
-        if self.config.algorithm_profile == "legacy_current":
+        if self.config.implementation_profile == "legacy_current":
             return self._legacy_cql_penalty(states, data_actions)
         critics = [self.critic]
         if self.critic2 is not None:
             critics.append(self.critic2)
+        wsrl_indices = (
+            self._sample_target_critic_indices(self.critic.num_critics)
+            if self.variant == "wsrl"
+            else None
+        )
+
+        def evaluate(critic, sample_states, sample_actions):
+            values = self._critic_values_for_actions(
+                critic, sample_states, sample_actions
+            )
+            return (
+                values.index_select(0, wsrl_indices)
+                if wsrl_indices is not None
+                else values
+            )
+
+        data_values = []
+        for critic in critics:
+            values = critic(states, data_actions)
+            if wsrl_indices is not None:
+                values = values.index_select(0, wsrl_indices)
+            data_values.append(values)
         result = importance_sampled_cql(
             policy=self.actor,
             evaluators=tuple(
-                lambda sample_states, sample_actions, critic=critic: self._critic_values_for_actions(
+                lambda sample_states, sample_actions, critic=critic: evaluate(
                     critic, sample_states, sample_actions
                 )
                 for critic in critics
@@ -161,7 +202,7 @@ class SACEnsembleAgent(BaseAgent):
             states=states,
             next_states=next_states,
             data_actions=data_actions,
-            data_values=tuple(critic(states, data_actions) for critic in critics),
+            data_values=tuple(data_values),
             num_actions=self.config.cql_n_actions,
             temperature=self.config.cql_temperature,
         )
@@ -344,8 +385,11 @@ class SACEnsembleAgent(BaseAgent):
         sampled_actions, log_prob, _, policy_std = self.actor(
             states, need_log_prob=True
         )
+        target_entropy = (
+            0.0 if self.variant == "wsrl" else float(-self.actor.action_dim)
+        )
         alpha_loss = -(
-            self.log_alpha * (log_prob + float(-self.actor.action_dim)).detach()
+            self.log_alpha * (log_prob + target_entropy).detach()
         ).mean()
         if update_actor_temperature:
             self.alpha_optimizer.zero_grad(set_to_none=True)
@@ -429,9 +473,9 @@ class SACEnsembleAgent(BaseAgent):
                 indices = self._sample_target_critic_indices(
                     next_q_candidates.shape[0]
                 )
-                clipped_candidates = next_q_candidates.index_select(
-                    0, indices
-                ).min(dim=0).values
+                clipped_candidates = self._wsrl_subsampled_min(
+                    next_q_candidates, indices
+                )
                 best = clipped_candidates.argmax(dim=1, keepdim=True)
                 next_q = clipped_candidates.gather(1, best).squeeze(1)
                 selected_log_prob = next_log_prob.gather(1, best).squeeze(1)
@@ -472,9 +516,11 @@ class SACEnsembleAgent(BaseAgent):
                     indices = self._sample_target_critic_indices(
                         next_q_all.shape[0]
                     )
-                    target_values = next_q_all.index_select(0, indices)
-                next_q = target_values.min(dim=0).values
-                next_q = next_q - self.alpha.detach() * next_log_prob
+                    next_q = self._wsrl_subsampled_min(next_q_all, indices)
+                else:
+                    next_q = target_values.min(dim=0).values
+                if self.variant != "wsrl" or self.config.backup_entropy:
+                    next_q = next_q - self.alpha.detach() * next_log_prob
                 target_scalar = rewards + (
                     1.0 - terminals
                 ) * self.config.discount * next_q

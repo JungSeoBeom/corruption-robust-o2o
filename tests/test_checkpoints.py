@@ -90,10 +90,10 @@ class CheckpointConfigurationTest(unittest.TestCase):
                 (logger.run_dir / "checkpoints/offline/step_000000010.pt").exists()
             )
             self.assertTrue(
-                (logger.run_dir / "checkpoints/offline/step_000000020.pt").exists()
+                any((logger.run_dir / "checkpoints/offline").glob("step_000000020_manifest_*.pt"))
             )
             self.assertTrue(
-                (logger.run_dir / "checkpoints/online/final.pt").exists()
+                any((logger.run_dir / "checkpoints/online").glob("final_manifest_*.pt"))
             )
 
 

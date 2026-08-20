@@ -12,13 +12,13 @@ from pathlib import Path
 
 from robust_o2o.config import (
     ALGORITHMS,
-    ALGORITHM_PROFILES,
     CORRUPTION_MODES,
     DEFAULT_PROTOCOL,
     LOCAL_PROTOCOL,
     LEGACY_LOCAL_PROTOCOL_ALIAS,
     PROTOCOLS,
 )
+from robust_o2o.fidelity import IMPLEMENTATION_PROFILES, SUITE_PROFILES
 
 
 def _csv(value: str):
@@ -48,8 +48,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seeds", type=_csv, default=["0"])
     parser.add_argument("--stage", choices=("offline", "online", "both"), default="both")
     parser.add_argument("--protocol", choices=PROTOCOLS, default=DEFAULT_PROTOCOL)
+    parser.add_argument("--implementation-profile", choices=IMPLEMENTATION_PROFILES)
     parser.add_argument(
-        "--algorithm-profile", choices=ALGORITHM_PROFILES, default="reference"
+        "--suite-profile", choices=SUITE_PROFILES,
+        default="common_budget_robustness",
     )
     parser.add_argument("--allow-diagnostic-protocol", action="store_true")
     parser.add_argument("--output-dir", default="results")
@@ -70,7 +72,7 @@ def commands(
     ):
         targets = ["none"] if corruption == "clean" else args.targets
         for target in targets:
-            yield [
+            command = [
                 sys.executable,
                 str(script),
                 "--algorithm",
@@ -87,8 +89,8 @@ def commands(
                 args.stage,
                 "--protocol",
                 args.protocol,
-                "--algorithm-profile",
-                args.algorithm_profile,
+                "--suite-profile",
+                args.suite_profile,
                 "--output-dir",
                 args.output_dir,
                 "--comparison-name",
@@ -96,6 +98,9 @@ def commands(
                 *(["--allow-diagnostic-protocol"] if args.allow_diagnostic_protocol else []),
                 *passthrough,
             ]
+            if args.implementation_profile:
+                command.extend(("--implementation-profile", args.implementation_profile))
+            yield command
 
 
 def main() -> int:

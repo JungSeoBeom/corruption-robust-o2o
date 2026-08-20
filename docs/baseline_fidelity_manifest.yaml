@@ -1,0 +1,105 @@
+schema_version: 1
+audit_date: "2026-08-20"
+baselines:
+  rpex_riql:
+    paper_title: "RPEX: Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption"
+    algorithm_name: [RPEX, RIQL-naive]
+    upstream_repository: "https://github.com/felix-thu/RPEX"
+    upstream_commit: "35da71ee5151b6179d21b9a2b4ce1b6408aedd04"
+    upstream_files:
+      - pex/networks/policy.py
+      - pex/algorithms/riql.py
+      - pex/algorithms/rpex.py
+      - pex/algorithms/aligniql.py
+      - RIQL_TRAIN_CONFIG.py
+      - attack.py
+      - attack_offline.py
+      - attack_online.py
+    upstream_functions:
+      - GaussianPolicy.forward
+      - RIQL.update
+      - RIQL.policy_update
+      - RPEX.select_action
+      - ALIGNIQL.policy_update
+      - get_config
+      - Attack.optimize_para
+    supported_environments: "D4RL MuJoCo locomotion v2 datasets listed by upstream"
+    implementation_status: "official policy/loss/config-table port; explicit paper/code conflict profiles"
+    known_paper_code_conflicts:
+      - "official code fine-tunes from online replay only; paper describes offline/online replay mixing"
+      - "official code evaluates epsilon-greedy policy switching; paper describes greedy highest-weight selection"
+      - "official code corrupts the stored transition after env.step; sensor/actuator semantics require pre-action corruption"
+    local_divergences:
+      - "500k/500k is labelled common_budget_robustness, never paper reproduction"
+      - "clean and mixed have no RIQL_TRAIN_CONFIG.py row and are explicit extensions or unsupported"
+      - "The pinned public code has no mixed-corruption implementation/config; rpex_paper_mixed therefore fails instead of guessing"
+
+  wsrl:
+    paper_title: "Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data"
+    algorithm_name: WSRL
+    upstream_repository: "https://github.com/zhouzypaul/wsrl"
+    upstream_commit: "ad4dc1248a138bc15d6e053f2d1dba1b8cfbaca2"
+    upstream_files:
+      - experiments/configs/train_config.py
+      - experiments/configs/wsrl_config.py
+      - experiments/scripts/locomotion/launch_cql_finetune.sh
+      - experiments/scripts/locomotion/launch_wsrl_finetune.sh
+      - wsrl/agents/sac.py
+      - wsrl/agents/cql.py
+      - wsrl/networks/mlp.py
+    upstream_functions:
+      - SACAgent.update_high_utd
+      - SACAgent.critic_loss_fn
+      - SACAgent.policy_loss_fn
+      - CQLAgent._get_cql_q_diff
+      - MLP.__call__
+    supported_environments: "AntMaze, Adroit, Kitchen, and D4RL MuJoCo locomotion"
+    implementation_status: "locomotion 2x256 LayerNorm, final-hidden scale 1e-2, REDQ-10/2, CQL subset, and high-UTD port"
+    known_paper_code_conflicts: []
+    local_divergences:
+      - "PyTorch port; canonical metadata records upstream JAX/Flax commit"
+      - "common-budget 500k pretraining is separated from upstream 250k recipe"
+      - "method profile preserves actor/critic/temperature LR 1e-4/3e-4/1e-4, target entropy 0, and backup_entropy=False"
+
+  cal_ql:
+    paper_title: "Cal-QL: Calibrated Offline RL Pre-Training for Efficient Online Fine-Tuning"
+    algorithm_name: Cal-QL
+    upstream_repository: "https://github.com/nakamotoo/Cal-QL"
+    upstream_commit: "ac6eafec22e8d60836573e1f488c7f626ce8a77e"
+    upstream_files:
+      - JaxCQL/conservative_sac.py
+      - JaxCQL/conservative_sac_main.py
+      - scripts/run_antmaze.sh
+      - scripts/run_adroit.sh
+    upstream_functions:
+      - ConservativeSAC.train
+      - ConservativeSAC._get_policy_actions
+      - ConservativeSAC._get_tensor_values
+    supported_environments: "Official release recipes: AntMaze and Adroit"
+    implementation_status: "D4RL locomotion task port"
+    known_paper_code_conflicts: []
+    local_divergences:
+      - "Hopper/HalfCheetah/Walker2d are always labelled d4rl_locomotion_port/task_port"
+      - "oracle_exclude_corrupted calibration is an oracle diagnostic and is not aggregated with all-data calibration"
+
+  pessimistic_q_ensemble:
+    paper_title: "Offline-to-Online Reinforcement Learning via Balanced Replay and Pessimistic Q-Ensemble"
+    algorithm_name: Pessimistic Q-Ensemble
+    upstream_repository: "https://github.com/shlee94/Off2OnRL"
+    upstream_commit: "6f298fa9ef040d725067d0f2775022bd2900d635"
+    upstream_files:
+      - rlkit/examples/ours.py
+      - rlkit/rlkit/torch/sac/ours.py
+      - rlkit/rlkit/core/batch_rl_algorithm.py
+      - rlkit/rlkit/data_management/prioritized_replay_buffer.py
+    upstream_functions:
+      - experiment
+      - OursTrainer.compute_loss
+      - TorchOurRLAlgorithm._train
+      - PriorityReplayBuffer.random_batch
+    supported_environments: "D4RL MuJoCo v0 recipes in the public release"
+    implementation_status: "pqe_shared_actor_approx only; method_fidelity fail-fast"
+    known_paper_code_conflicts: []
+    local_divergences:
+      - "Current local actor/critic topology is not the upstream N=5 checkpoint-loaded policy ensemble"
+      - "Results are experimental_approximation/approximation and cannot be named PQE reference"

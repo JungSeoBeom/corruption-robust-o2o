@@ -3,12 +3,15 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import shutil
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .paths import resolve_run_layout
+from .manifest import build_experiment_manifest
 
 
 METRIC_FIELDS = (
@@ -36,9 +39,72 @@ class RunLogger:
     def __init__(self, config: object):
         self.start_wall = datetime.now().astimezone()
         self.start_monotonic = time.perf_counter()
+        self.elapsed_offset = 0.0
         stamp = self.start_wall.strftime("%Y%m%d_%H%M%S")
         short_id = str(uuid.uuid4())[:8]
         run_id = f"{stamp}_{short_id}"
+        self.run_id = run_id
+        self.short_id = short_id
+        if config.resume_run:
+            supplied = Path(config.resume_run).expanduser().resolve()
+            run_dir = supplied
+            if supplied.is_file():
+                # <run>/checkpoints/<phase>/<file>.pt
+                run_dir = supplied.parents[2]
+            if not (run_dir / "metrics.csv").exists():
+                raise ValueError(
+                    "--resume-run must name a run directory or one of its checkpoints"
+                )
+            runs_ancestor = next(
+                (parent for parent in run_dir.parents if parent.name == "runs"), None
+            )
+            if runs_ancestor is None:
+                raise ValueError("resume run is not inside a canonical runs directory")
+            self.comparison_dir = runs_ancestor.parent
+            self.run_dir = run_dir
+            self.run_id = run_dir.name
+            self.metrics_path = run_dir / "metrics.csv"
+            self.train_metrics_path = run_dir / "train_metrics.jsonl"
+            summary_path = run_dir / "summary.json"
+            if summary_path.exists():
+                previous_summary = json.loads(
+                    summary_path.read_text(encoding="utf-8")
+                )
+                self.elapsed_offset = float(
+                    previous_summary.get("elapsed_seconds", 0.0)
+                )
+                previous_start = previous_summary.get("start_time")
+                if previous_start:
+                    self.start_wall = datetime.strptime(
+                        previous_start, "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=datetime.now().astimezone().tzinfo)
+            else:
+                with self.metrics_path.open(newline="", encoding="utf-8") as stream:
+                    rows = list(csv.DictReader(stream))
+                elapsed_values = [
+                    float(row["elapsed_seconds"])
+                    for row in rows
+                    if row.get("elapsed_seconds") not in (None, "")
+                ]
+                self.elapsed_offset = max(elapsed_values, default=0.0)
+                try:
+                    parsed_start = datetime.strptime(
+                        run_dir.name[:15], "%Y%m%d_%H%M%S"
+                    )
+                    self.start_wall = parsed_start.replace(
+                        tzinfo=datetime.now().astimezone().tzinfo
+                    )
+                except ValueError:
+                    pass
+            self.logger = logging.getLogger(f"robust_o2o.{short_id}")
+            self.logger.setLevel(logging.INFO)
+            self.logger.propagate = False
+            self._configure_handlers()
+            self._manifest_written = True
+            self.last_eval = None
+            self.config = config
+            return
+
         comparison_id = config.comparison_name or run_id
         self.comparison_dir, runs_dir = resolve_run_layout(
             config.output_dir,
@@ -52,7 +118,23 @@ class RunLogger:
         self.run_dir = (
             runs_dir
             / config.algorithm
+            / config.suite_profile
+            / config.implementation_profile
+            / config.implementation_fidelity
+            / (
+                f"budget_{config.suite_profile}_off{config.offline_steps}"
+                f"_on{config.online_steps}_utd"
+                f"{config.wsrl_utd_ratio if config.algorithm == 'wsrl' else config.updates_per_step}"
+            )
             / config.resolved_algorithm_profile
+            / config.online_replay_profile
+            / config.evaluation_policy_profile
+            / config.attack_timing
+            / config.random_attack_semantics
+            / config.adversarial_attack_profile
+            / config.mixed_corruption_profile
+            / config.action_execution_profile
+            / config.task_profile
             / config.corruption
             / config.corruption_target
             / config.env_name
@@ -68,6 +150,12 @@ class RunLogger:
         self.logger = logging.getLogger(f"robust_o2o.{short_id}")
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
+        self._configure_handlers()
+        self._manifest_written = False
+        self.last_eval: Optional[Dict[str, float]] = None
+        self.config = config
+
+    def _configure_handlers(self) -> None:
         formatter = logging.Formatter(
             "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
         )
@@ -76,14 +164,63 @@ class RunLogger:
         file_handler.setFormatter(formatter)
         stream_handler.setFormatter(formatter)
         self.logger.handlers = [file_handler, stream_handler]
-        self.last_eval: Optional[Dict[str, float]] = None
-        self.config = config
 
     @property
     def elapsed(self) -> float:
-        return time.perf_counter() - self.start_monotonic
+        return self.elapsed_offset + time.perf_counter() - self.start_monotonic
 
     def write_config(self, config: Dict[str, Any]) -> None:
+        if self.config.resume_run:
+            manifest_path = self.run_dir / "experiment_manifest.json"
+            if not manifest_path.exists():
+                raise ValueError("resume run has no canonical experiment manifest")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            requested_manifest = build_experiment_manifest(config)
+            if requested_manifest["manifest_sha256"] != manifest["manifest_sha256"]:
+                raise ValueError(
+                    "resume configuration does not match the original canonical "
+                    "manifest; use --initialize-from-checkpoint for a new run"
+                )
+            setattr(self.config, "_manifest_sha256", manifest["manifest_sha256"])
+            event = {
+                "timestamp": datetime.now().astimezone().isoformat(),
+                "resume_source": str(self.config.resume_run),
+                "resolved_config_sha256": requested_manifest["manifest_sha256"],
+            }
+            with (self.run_dir / "resume_events.jsonl").open(
+                "a", encoding="utf-8"
+            ) as stream:
+                stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+            return
+        if not self._manifest_written:
+            manifest = build_experiment_manifest(config)
+            manifest_hash = manifest["manifest_sha256"]
+            old_dir = self.run_dir
+            desired_dir = (
+                old_dir.parent
+                / f"manifest_{manifest_hash[:16]}"
+                / self.run_id
+            )
+            for handler in self.logger.handlers:
+                handler.close()
+            self.logger.handlers = []
+            desired_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old_dir), str(desired_dir))
+            self.run_dir = desired_dir
+            self.metrics_path = self.run_dir / "metrics.csv"
+            self.train_metrics_path = self.run_dir / "train_metrics.jsonl"
+            self._configure_handlers()
+            config = {
+                **config,
+                "run_dir": str(self.run_dir),
+                "manifest_sha256": manifest_hash,
+            }
+            setattr(self.config, "_manifest_sha256", manifest_hash)
+            with (self.run_dir / "experiment_manifest.json").open(
+                "w", encoding="utf-8"
+            ) as stream:
+                json.dump(manifest, stream, indent=2, ensure_ascii=False)
+            self._manifest_written = True
         for filename in ("config.json", "resolved_config.json"):
             with (self.run_dir / filename).open("w", encoding="utf-8") as stream:
                 json.dump(config, stream, indent=2, ensure_ascii=False, default=str)

@@ -14,13 +14,13 @@ from pathlib import Path
 from typing import Iterable
 
 from robust_o2o.config import (
-    ALGORITHM_PROFILES,
     BENCHMARK_ENVS,
     DEFAULT_PROTOCOL,
     LEGACY_LOCAL_PROTOCOL_ALIAS,
     LOCAL_PROTOCOL,
     PROTOCOLS,
 )
+from robust_o2o.fidelity import IMPLEMENTATION_PROFILES, SUITE_PROFILES
 
 
 ENV_NAME = "hopper-medium-replay-v2"
@@ -45,6 +45,9 @@ RESERVED_PASSTHROUGH_OPTIONS = {
     "--corruption-target",
     "--env-name",
     "--stage",
+    "--suite-profile",
+    "--implementation-profile",
+    "--algorithm-profile",
 }
 
 
@@ -72,7 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--online-steps", type=int, default=500_000)
     parser.add_argument("--protocol", choices=PROTOCOLS, default=DEFAULT_PROTOCOL)
     parser.add_argument(
-        "--algorithm-profile", choices=ALGORITHM_PROFILES, default="reference"
+        "--implementation-profile", choices=IMPLEMENTATION_PROFILES
+    )
+    parser.add_argument(
+        "--suite-profile", choices=SUITE_PROFILES,
+        default="common_budget_robustness",
     )
     parser.add_argument("--allow-diagnostic-protocol", action="store_true")
     parser.add_argument("--output-root", default="results")
@@ -106,6 +113,13 @@ def _validate_args(
             parser.error(f"invalid seed: {seed!r}")
     if args.offline_steps < 0 or args.online_steps < 0:
         parser.error("--offline-steps and --online-steps cannot be negative")
+    if args.suite_profile == "method_fidelity":
+        parser.error(
+            "method_fidelity 5x5 is unavailable: Cal-QL locomotion is a task "
+            "port and the local PQE is pqe_shared_actor_approx. Use "
+            "--suite-profile common_budget_robustness; no run will be mislabeled "
+            "as paper reproduction."
+        )
     if args.protocol in (LOCAL_PROTOCOL, "local_gymnasium_v4") and not args.allow_diagnostic_protocol:
         parser.error(
             "the local Gymnasium protocol is diagnostic-only; pass "
@@ -155,8 +169,8 @@ def commands(
             "both",
             "--protocol",
             args.protocol,
-            "--algorithm-profile",
-            args.algorithm_profile,
+            "--suite-profile",
+            args.suite_profile,
             "--output-root",
             args.output_root,
             "--comparison-name",
@@ -166,6 +180,8 @@ def commands(
             "--online-steps",
             str(args.online_steps),
         ]
+        if args.implementation_profile:
+            command.extend(("--implementation-profile", args.implementation_profile))
         if args.allow_diagnostic_protocol:
             command.append("--allow-diagnostic-protocol")
         if args.dataset_dir:
@@ -194,6 +210,7 @@ def main() -> int:
         f"SCHEDULE: offline={args.offline_steps:,}, online={args.online_steps:,}",
         flush=True,
     )
+    print(f"SUITE_PROFILE: {args.suite_profile}", flush=True)
     print(f"TOTAL_RUNS: {total_runs} ({len(args.seeds)} seed(s))", flush=True)
 
     failures = 0

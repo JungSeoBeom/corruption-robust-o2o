@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -14,7 +15,7 @@ from robust_o2o.config import (
     build_parser,
     config_from_args,
 )
-from robust_o2o.networks import EnsembleLayerNorm
+from robust_o2o.networks import EnsembleLayerNorm, VectorizedLinear
 from robust_o2o.experiment import _validate_checkpoint
 from robust_o2o.device import seed_everything
 
@@ -84,7 +85,7 @@ class ReferenceProfileTest(unittest.TestCase):
         )
         self.assertEqual(config.calql_bc_warmup_steps, 0)
         self.assertTrue(config.cql_max_target_backup)
-        self.assertEqual(config.resolved_algorithm_profile, "calql_reference")
+        self.assertEqual(config.resolved_algorithm_profile, "calql_locomotion_port")
         agent = build_agent(config, 3, 2, 1.0, torch.device("cpu"))
         self.assertEqual(agent.actor_optimizer.param_groups[0]["lr"], 1e-4)
         self.assertEqual(agent.q1_optimizer.param_groups[0]["lr"], 3e-4)
@@ -120,6 +121,20 @@ class ReferenceProfileTest(unittest.TestCase):
         self.assertEqual(config.wsrl_utd_ratio, 4)
         self.assertEqual(config.wsrl_total_sampled_batch_size if hasattr(config, "wsrl_total_sampled_batch_size") else config.wsrl_utd_ratio * config.wsrl_per_critic_batch_size, 1024)
         agent = build_agent(config, 3, 2, 1.0, torch.device("cpu"))
+        actor_linears = [
+            module
+            for module in agent.actor.trunk.modules()
+            if isinstance(module, torch.nn.Linear)
+        ]
+        self.assertEqual(len(actor_linears), 2)
+        self.assertAlmostEqual(
+            torch.linalg.matrix_norm(actor_linears[-1].weight, ord=2).item(),
+            1e-2,
+            places=6,
+        )
+        self.assertEqual(config.actor_learning_rate, 1e-4)
+        self.assertEqual(config.critic_learning_rate, 3e-4)
+        self.assertEqual(config.temperature_learning_rate, 1e-4)
         self.assertTrue(any(isinstance(module, torch.nn.LayerNorm) for module in agent.actor.modules()))
         self.assertTrue(any(isinstance(module, EnsembleLayerNorm) for module in agent.critic.modules()))
         torch.manual_seed(config.learner_seed)
@@ -127,6 +142,37 @@ class ReferenceProfileTest(unittest.TestCase):
         torch.manual_seed(config.learner_seed)
         second_indices = agent._sample_target_critic_indices(10)
         self.assertTrue(torch.equal(first_indices, second_indices))
+        fixed_q = torch.tensor(
+            [[9.0, -1.0], [4.0, 8.0], [2.0, 7.0], [6.0, 3.0]]
+        )
+        fixed_indices = torch.tensor([2, 2])
+        self.assertTrue(
+            torch.equal(
+                agent._wsrl_subsampled_min(fixed_q, fixed_indices),
+                torch.tensor([2.0, 7.0]),
+            )
+        )
+        cql_batch = tensor_batch()
+        agent.zero_grad(set_to_none=True)
+        with patch.object(
+            agent,
+            "_sample_target_critic_indices",
+            return_value=torch.tensor([1, 1]),
+        ):
+            cql_penalty = agent._cql_penalty(
+                cql_batch["observations"],
+                cql_batch["next_observations"],
+                cql_batch["actions"],
+            )
+        cql_penalty.backward()
+        output_layer = [
+            module
+            for module in agent.critic.modules()
+            if isinstance(module, VectorizedLinear)
+        ][-1]
+        per_head_gradient = output_layer.weight.grad.abs().sum(dim=(1, 2))
+        self.assertGreater(per_head_gradient[1].item(), 0.0)
+        self.assertEqual(torch.count_nonzero(per_head_gradient).item(), 1)
         agent.begin_online()
         batches = []
         for _ in range(config.wsrl_utd_ratio):
@@ -207,7 +253,8 @@ class ReferenceProfileTest(unittest.TestCase):
         config._environment_fingerprint_payload = {"dataset_sha256": "new"}
         payload = {
             "algorithm": "cal_ql",
-            "algorithm_profile": "reference",
+            "algorithm_profile": config.implementation_profile,
+            "implementation_profile": config.implementation_profile,
             "env_name": config.env_name,
             "protocol": config.protocol,
             "state_dim": 3,
@@ -220,7 +267,8 @@ class ReferenceProfileTest(unittest.TestCase):
             _validate_checkpoint(payload, config, 3, 2)
         payload["environment_fingerprint"] = "current"
         payload["algorithm_profile"] = "legacy_current"
-        with self.assertRaisesRegex(ValueError, "algorithm_profile"):
+        payload["implementation_profile"] = "legacy_current"
+        with self.assertRaisesRegex(ValueError, "implementation_profile"):
             _validate_checkpoint(payload, config, 3, 2)
 
 

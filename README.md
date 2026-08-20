@@ -54,11 +54,9 @@ The shared environment is stored under `~/.local/share/micromamba`, MuJoCo 2.1
 under `~/.mujoco/mujoco210`, and datasets under `~/.d4rl/datasets`. All are
 visible from the login and compute nodes through the shared home directory.
 Batch output is written to `slurm-*.out` in the submission directory. The CPU
-nodes are Spot VMs. Slurm may requeue the wrapper after preemption, but that
-restarts the command from the beginning; periodic checkpoints survive on the
-shared home directory but are not selected automatically. An online checkpoint
-restores model state but does not exactly restore the live MuJoCo state or
-online replay buffer.
+nodes are Spot VMs. Initialization and interruption recovery are deliberately
+separate: `--initialize-from-checkpoint` starts a new run, while `--resume-run`
+restores replay/RNG/optimizer state from an episode-boundary resume checkpoint.
 
 For local Apple Silicon execution, the separate
 `local_gymnasium_v4_diagnostic` protocol
@@ -68,14 +66,15 @@ the explicit `--allow-diagnostic-protocol` acknowledgement. The old
 `local_gymnasium_v4` spelling is accepted only as an alias and is recorded under
 the canonical diagnostic name.
 
-The default algorithm profile is `reference`. It resolves Cal-QL to
-`calql_reference` (no BC warmup, actor LR `1e-4`, critic LR `3e-4`, max-Q target
-backup) and WSRL to `wsrl_reference_redq10x2` (CQL-REDQ pretrainer, 10 critics,
-2-critic target subset, LayerNorm, online UTD 4 with one actor/temperature
-update). `--algorithm-profile legacy_current` is provided only to reproduce the
-previous Cal-QL BC-100k and WSRL min-all-10 implementation.
-See [REFERENCE_FIDELITY.md](docs/REFERENCE_FIDELITY.md) for the static
-before/after audit and pinned upstream source snapshots.
+The generic `reference` profile has been removed. Every run records an
+`implementation_profile`, an `implementation_fidelity`, and a `suite_profile`.
+The default 5×5 suite is `common_budget_robustness`, is visibly labelled
+`COMMON-BUDGET PORT`, and is never reported as paper reproduction.
+`method_fidelity` uses upstream budgets and fails before training when an exact
+method/task port is unavailable. In particular, locomotion Cal-QL is a
+`task_port`, and the current PQE is explicitly `pqe_shared_actor_approx`.
+See [baseline_fidelity_manifest.yaml](docs/baseline_fidelity_manifest.yaml) for
+the pinned upstream commits and file/function provenance.
 
 ## 1. Algorithms
 
@@ -128,6 +127,17 @@ The smoke test verifies Gym 0.23.1, NumPy 1.23.5, the exact D4RL commit,
 `mujoco_py`, the complete environment registration, dataset loading, and score
 normalization. `--dataset-dir /path/to/datasets` changes the D4RL cache through
 `d4rl.set_dataset_path()`.
+
+On a Linux x86_64 strict host, the bounded end-to-end preflight also performs
+10 offline updates, 20 online steps, at most two evaluation episodes, and a
+checkpoint save/load:
+
+```bash
+python scripts/preflight_strict.py
+```
+
+It fails on unsupported platforms or version mismatches. It never substitutes
+the local Gymnasium diagnostic and reports that substitution as strict success.
 
 The default device option is `--device auto`:
 
@@ -205,11 +215,13 @@ The following corruption targets are supported:
 - `mixed`: allocate corrupted transitions across all four targets using
   `--mixed-ratios`
 
-Online corruption is explicitly replay-only poisoning. The bounded clean policy
-action is executed in `env.step()`. The selected observation/action/reward/next
-observation field is then corrupted only in the transition stored in replay.
-Thus clean runs require exact equality between executed and replayed actions,
-while action-corruption runs intentionally record a mismatch.
+Corruption timing is explicit. `official_code_reference` uses
+`post_transition_replay_poisoning`: the clean observation selects the action,
+the clean action is executed, and the selected field is changed only before the
+transition enters replay. `paper_reference` uses the separate
+`paper_pre_action_sensor_actuator` path, where observation corruption precedes
+action selection and action corruption precedes `env.step()`. The two profiles
+have different manifest identities and cannot be aggregated.
 
 The default corruption parameters match RPEX:
 
@@ -279,17 +291,22 @@ python run_experiment.py \
 ```
 
 Attack results are stored in `results/attack_cache/<protocol>/`. Cache keys hash
-the dataset, attack checkpoint, target/rate/range, seed, attack steps and step
-size, norm, preprocessing-relevant MC settings, and implementation version.
+the dataset and normalizer, attack checkpoint, target/rate/range, attack seed,
+offline and online steps/step sizes, device, timing, objective, optimizer,
+source commit, MC settings, and implementation version. Writes use a per-key
+file lock, temporary file, fsync, SHA-256 sidecar, and atomic replace; loads
+validate the checksum, embedded metadata, shape, dtype, and indices.
 `--attack-min-step-size` is explicit and defaults to zero; no hidden runtime
 lower bound is applied. Add `--force-regenerate-attack` to regenerate a cache.
 
 ### Correctness-sensitive modes
 
-- `--action-distribution tanh_gaussian` is the safe RPEX/PEX default. It uses a
-  bounded transformed Gaussian and Jacobian-corrected log density.
-  `legacy_gaussian` is unbounded reproduction-only behavior; environment actions
-  are still clipped before execution.
+- RPEX/RIQL non-legacy profiles resolve to
+  `official_unsquashed_gaussian`: bounded mean, state-independent log standard
+  deviation, ordinary Normal samples, and no tanh-Jacobian correction.
+  `tanh_gaussian` remains available for explicit non-reference ablations.
+  `--action-execution-profile` separately records
+  `official_algorithm_behavior` or `clip_to_action_space`.
 - `--evaluation-mode deterministic_diagnostic` uses policy means and a
   deterministic expansion branch. `method_faithful` preserves stochastic RPEX
   expansion, and `both` logs both. Evaluation saves/restores Python, NumPy,
@@ -319,8 +336,8 @@ python run_experiment.py \
   --seed 0
 ```
 
-Then run the online stage using `checkpoints/offline/final.pt` from the resulting
-run directory:
+Then run the online stage using the manifest-tagged final checkpoint from the
+resulting run directory:
 
 ```bash
 python run_experiment.py \
@@ -329,16 +346,35 @@ python run_experiment.py \
   --corruption random \
   --corruption-target rewards \
   --stage online \
-  --checkpoint /absolute/path/to/run/checkpoints/offline/final.pt \
+  --initialize-from-checkpoint /absolute/path/to/final_manifest_<sha>.pt \
   --seed 0
 ```
 
-The final offline checkpoint is stored at
-`checkpoints/offline/final.pt` inside the run directory. The program fails
+The final offline checkpoint is stored as
+`checkpoints/offline/final_manifest_<sha>.pt` inside the run directory. The program fails
 immediately if the checkpoint algorithm, environment, or
 observation/action dimensions do not match the current command. The state
 normalization mode, location, and scale are also restored from the checkpoint.
 New runs write both `config.json` and `resolved_config.json`.
+
+Interrupted-run continuation is different. Reissue the original semantic
+arguments and point `--resume-run` at its run directory:
+
+```bash
+python run_experiment.py \
+  --algorithm riql_naive \
+  --env-name hopper-medium-replay-v2 \
+  --corruption random \
+  --corruption-target rewards \
+  --stage both \
+  --suite-profile common_budget_robustness \
+  --resume-run /absolute/path/to/run_dir
+```
+
+Only an episode-boundary checkpoint with complete replay, optimizer, scheduler,
+RNG, environment, counter, and writer state is eligible. The requested
+canonical manifest must equal the original manifest; otherwise the command
+fails and instructs the user to initialize a new run instead.
 
 ## Quick training diagnostics
 
@@ -365,19 +401,21 @@ Checkpoints are separated by algorithm through the run directory and by phase
 inside each run:
 
 ```text
-results/comparisons/<protocol>/<profile>/<env>/<corruption>/<target>/<comparison_id>/runs/
-└── <algorithm>/<corruption>/<target>/<env>/seed_<seed>/<run_id>/
-└── checkpoints/
+results/comparisons/<protocol>/<suite+profile>/<env>/<corruption>/<target>/<comparison_id>/runs/
+└── <algorithm>/<suite>/<implementation>/<fidelity>/<budget>/.../
+    └── manifest_<sha>/<run_id>/
+        └── checkpoints/
     ├── offline/
-    │   ├── step_000100000.pt
-    │   └── final.pt
+    │   ├── step_000100000_manifest_<sha>.pt
+    │   └── final_manifest_<sha>.pt
     └── online/
-        ├── step_000100000.pt
-        └── final.pt
+        ├── step_000100000_manifest_<sha>.pt
+        └── final_manifest_<sha>.pt
 ```
 
 The shared periodic interval defaults to `100,000`. Five periodic checkpoints
-per phase are retained by default; `final.pt` is always retained.
+per phase are retained by default; the manifest-tagged final checkpoint is
+always retained.
 
 ```bash
 python run_experiment.py \
@@ -445,8 +483,9 @@ results/comparisons/<protocol>/<profile>/<env>/<corruption>/<target>/<comparison
 ```
 
 - The three `comparison_*.png` files show the combined, offline-only, and
-  online-only curves. They are refreshed after every evaluation, including the
-  currently running algorithm.
+  online-only curves and include completed runs only. Separate
+  `diagnostic_running_{offline_online,offline,online}.png` files are refreshed
+  after every evaluation and may include the currently running algorithm.
 - The matching CSV files contain mean/std/count at every evaluation step.
 - `final_scores.csv`: final normalized/raw return and runtime mean/std by
   algorithm
@@ -469,13 +508,15 @@ the clean setting and all four individual random-corruption targets:
 
 ```bash
 conda activate corruption-rpex-v2
-python run_55_experiment.py
+python run_55_experiment.py --suite-profile common_budget_robustness
 ```
 
 Hopper remains the default. To run the same suite on HalfCheetah:
 
 ```bash
-python run_55_experiment.py --env-name halfcheetah-medium-replay-v2
+python run_55_experiment.py \
+  --env-name halfcheetah-medium-replay-v2 \
+  --suite-profile common_budget_robustness
 ```
 
 This runs 25 experiments for the default seed, with 500,000 offline updates and
@@ -561,7 +602,8 @@ results/
     ├── comparison_offline_online.png
     ├── comparison_offline.png
     ├── comparison_online.png
-    └── runs/<algorithm>/<corruption>/<target>/<env>/seed_<seed>/<timestamp>_<id>/
+    └── runs/<algorithm>/<suite>/<implementation>/<fidelity>/<budget>/.../
+        └── manifest_<sha>/<timestamp>_<id>/
     ├── config.json
     ├── result.log
     ├── metrics.csv
@@ -570,9 +612,9 @@ results/
     ├── summary.json
     └── checkpoints/
         ├── offline/
-        │   └── final.pt
+        │   └── final_manifest_<sha>.pt
         └── online/
-            └── final.pt
+            └── final_manifest_<sha>.pt
 ```
 
 - `metrics.csv`: evaluation step, raw return, D4RL normalized return, standard
@@ -628,8 +670,9 @@ ELAPSED: 04:05:05 (14705.000 seconds)
 
 ## 9. Important points for performance and runtime comparisons
 
-- Keep the environment, seed, corruption rate/range, offline/online step counts,
-  and number of evaluation episodes identical across all nine algorithms.
+- Use `common_budget_robustness` when offline/online budgets must be identical.
+  Use `method_fidelity` when each method's upstream budget is required; never
+  combine the two suites in one reported curve.
 - On supported hardware, RO2O with `--ro2o-sample-size 20` and the 10-critic
   UWMSG/RO2O configurations are particularly slow. Reduce the sample size or
   critic count only during exploratory runs, and restore the original values
@@ -637,10 +680,9 @@ ELAPSED: 04:05:05 (14705.000 seconds)
 - MPS and CPU results may not be exactly identical because of floating-point
   implementation differences. Use the same device for all results in a
   comparison table.
-- Never aggregate different environment protocols or algorithm profiles. New
-  paths are namespaced as
-  `results/comparisons/<protocol>/<profile>/<env>/<corruption>/<target>/<id>`;
-  `comparison.ipynb` selects both values explicitly and rejects duplicates.
+- Never aggregate different environment protocols, implementation profiles, or
+  suite profiles. Every run has a canonical manifest SHA in its path and
+  checkpoints; plotting rejects non-seed manifest differences and duplicates.
 - A single-seed curve has no seed-uncertainty band. Episode-return dispersion is
   not substituted for across-seed uncertainty.
 - Adversarial offline-attack generation time is included in the total `ELAPSED`
@@ -657,12 +699,17 @@ references for the unified objectives and default values. The remaining
 baselines were adapted to the shared PyTorch/replay interface using their
 official public implementations and algorithm descriptions.
 
+See `docs/baseline_fidelity_manifest.yaml` before treating any adaptation as a
+paper reproduction. In particular, locomotion Cal-QL is a task port and the
+current Pessimistic Q-Ensemble is an approximation.
+
 - RPEX: <https://github.com/felix-thu/RPEX>
 - Pinned D4RL environment registry, dataset conversion, and normalization:
   <https://github.com/rail-berkeley/d4rl/tree/d842aa194b416e564e54b0730d9f934e3e32f854>
 - RIQL: provided `RIQL-main` directory
 - UWMSG: provided `UWMSG-main` directory
 - WSRL: <https://github.com/zhouzypaul/wsrl>
+- Cal-QL: <https://github.com/nakamotoo/Cal-QL>
 - RO2O: <https://github.com/BattleWen/RO2O>
 - Balanced Replay + Pessimistic Q-Ensemble:
   <https://github.com/shlee94/Off2OnRL>

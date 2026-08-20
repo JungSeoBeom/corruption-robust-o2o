@@ -54,6 +54,18 @@ class OfflineDataset:
     def priority_statistics(self) -> Dict[str, float]:
         return _priority_statistics(self.priorities, self.priority_updates)
 
+    def state_dict(self) -> Dict[str, object]:
+        return {
+            "rng_state": self.rng.bit_generator.state,
+            "priorities": self.priorities.copy(),
+            "priority_updates": self.priority_updates,
+        }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        self.rng.bit_generator.state = state["rng_state"]
+        self.priorities[...] = np.asarray(state["priorities"], dtype=np.float64)
+        self.priority_updates = int(state.get("priority_updates", 0))
+
 
 class ReplayBuffer:
     def __init__(
@@ -131,6 +143,42 @@ class ReplayBuffer:
         return _priority_statistics(
             self.priorities[: self.size], self.priority_updates
         )
+
+    def state_dict(self) -> Dict[str, object]:
+        size = self.size
+        return {
+            "capacity": self.capacity,
+            "states": self.states[:size].copy(),
+            "actions": self.actions[:size].copy(),
+            "rewards": self.rewards[:size].copy(),
+            "next_states": self.next_states[:size].copy(),
+            "terminals": self.terminals[:size].copy(),
+            "mc_returns": self.mc_returns[:size].copy(),
+            "priorities": self.priorities[:size].copy(),
+            "position": self.position,
+            "size": size,
+            "rng_state": self.rng.bit_generator.state,
+            "priority_updates": self.priority_updates,
+        }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        if int(state["capacity"]) != self.capacity:
+            raise ValueError("resume replay capacity does not match resolved config")
+        size = int(state["size"])
+        for name in (
+            "states",
+            "actions",
+            "rewards",
+            "next_states",
+            "terminals",
+            "mc_returns",
+            "priorities",
+        ):
+            getattr(self, name)[:size] = np.asarray(state[name])
+        self.position = int(state["position"])
+        self.size = size
+        self.rng.bit_generator.state = state["rng_state"]
+        self.priority_updates = int(state.get("priority_updates", 0))
 
 
 def _safe_probabilities(priorities: np.ndarray) -> np.ndarray:

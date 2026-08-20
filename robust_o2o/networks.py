@@ -44,11 +44,34 @@ class TanhGaussianPolicy(nn.Module):
         action_low: Optional[torch.Tensor] = None,
         action_high: Optional[torch.Tensor] = None,
         layer_norm: bool = False,
+        wsrl_profile: bool = False,
     ):
         super().__init__()
-        self.trunk = mlp(
-            state_dim, hidden_dim, hidden_layers, hidden_dim, layer_norm=layer_norm
-        )
+        self.wsrl_profile = bool(wsrl_profile)
+        if self.wsrl_profile:
+            # WSRL's Flax MLP treats ``hidden_dims=[256, 256]`` as exactly two
+            # Dense-LayerNorm-ReLU blocks.  The generic helper has a separate
+            # output layer and would silently create a third affine transform.
+            modules: list[nn.Module] = []
+            input_dim = state_dim
+            hidden_linears: list[nn.Linear] = []
+            for _ in range(hidden_layers):
+                linear = nn.Linear(input_dim, hidden_dim)
+                hidden_linears.append(linear)
+                modules.append(linear)
+                if layer_norm:
+                    modules.append(nn.LayerNorm(hidden_dim))
+                modules.append(nn.ReLU())
+                input_dim = hidden_dim
+            self.trunk = nn.Sequential(*modules)
+        else:
+            self.trunk = mlp(
+                state_dim,
+                hidden_dim,
+                hidden_layers,
+                hidden_dim,
+                layer_norm=layer_norm,
+            )
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
         self.action_dim = action_dim
@@ -61,16 +84,29 @@ class TanhGaussianPolicy(nn.Module):
         self.register_buffer("action_scale", (high - low) / 2.0)
         self.register_buffer("action_bias", (high + low) / 2.0)
 
-        nn.init.uniform_(self.mean.weight, -1e-3, 1e-3)
-        nn.init.uniform_(self.mean.bias, -1e-3, 1e-3)
-        nn.init.uniform_(self.log_std.weight, -1e-3, 1e-3)
-        nn.init.uniform_(self.log_std.bias, -1e-3, 1e-3)
+        if self.wsrl_profile:
+            # locomotion_wsrl sets kernel_scale_final=1e-2 on the final hidden
+            # Dense. All other Dense kernels use orthogonal(sqrt(2)).
+            for index, linear in enumerate(hidden_linears):
+                scale = 1e-2 if index == len(hidden_linears) - 1 else math.sqrt(2.0)
+                nn.init.orthogonal_(linear.weight, gain=scale)
+                nn.init.zeros_(linear.bias)
+            for head in (self.mean, self.log_std):
+                nn.init.orthogonal_(head.weight, gain=math.sqrt(2.0))
+                nn.init.zeros_(head.bias)
+        else:
+            nn.init.uniform_(self.mean.weight, -1e-3, 1e-3)
+            nn.init.uniform_(self.mean.bias, -1e-3, 1e-3)
+            nn.init.uniform_(self.log_std.weight, -1e-3, 1e-3)
+            nn.init.uniform_(self.log_std.bias, -1e-3, 1e-3)
 
     def distribution(self, states: torch.Tensor) -> Normal:
         hidden = self.trunk(states)
         mean = self.mean(hidden)
-        log_std = self.log_std(hidden).clamp(LOG_STD_MIN, LOG_STD_MAX)
-        return Normal(mean, log_std.exp())
+        log_std = self.log_std(hidden)
+        if self.wsrl_profile:
+            return Normal(mean, log_std.exp().clamp(1e-5, 10.0))
+        return Normal(mean, log_std.clamp(LOG_STD_MIN, LOG_STD_MAX).exp())
 
     def forward(
         self,
@@ -176,8 +212,12 @@ class ExpansionGaussianPolicy(nn.Module):
         return self(states, deterministic=deterministic)[0]
 
 
-class LegacyExpansionGaussianPolicy(nn.Module):
-    """Unbounded official-code reproduction mode; unsafe for env execution."""
+class OfficialRPEXGaussianPolicy(nn.Module):
+    """felix-thu/RPEX GaussianPolicy with ``scale_distribution=False``.
+
+    The mean is bounded before constructing an ordinary Normal distribution;
+    samples are deliberately not squashed and log-probability has no Jacobian.
+    """
 
     def __init__(
         self,
@@ -188,7 +228,12 @@ class LegacyExpansionGaussianPolicy(nn.Module):
         max_action: float = 1.0,
     ):
         super().__init__()
-        self.trunk = mlp(state_dim, hidden_dim, hidden_layers, hidden_dim)
+        modules: list[nn.Module] = []
+        input_dim = state_dim
+        for _ in range(hidden_layers):
+            modules.extend((nn.Linear(input_dim, hidden_dim), nn.ReLU()))
+            input_dim = hidden_dim
+        self.trunk = nn.Sequential(*modules)
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
         self.action_dim = action_dim
@@ -208,6 +253,11 @@ class LegacyExpansionGaussianPolicy(nn.Module):
     def act(self, states: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
         distribution = self.distribution(states)
         return distribution.mean if deterministic else distribution.sample()
+
+
+# Checkpoint/source compatibility name for results produced before fidelity
+# profiles were introduced.  New code always records OfficialRPEXGaussianPolicy.
+LegacyExpansionGaussianPolicy = OfficialRPEXGaussianPolicy
 
 
 class DeterministicPolicy(nn.Module):
@@ -319,12 +369,17 @@ class EnsembleQNetwork(nn.Module):
         hidden_layers: int = 2,
         num_critics: int = 5,
         layer_norm: bool = False,
+        wsrl_profile: bool = False,
+        rpex_profile: bool = False,
     ):
         super().__init__()
         modules = []
         input_dim = state_dim + action_dim
+        hidden_linears = []
         for _ in range(hidden_layers):
-            modules.append(VectorizedLinear(input_dim, hidden_dim, num_critics))
+            linear = VectorizedLinear(input_dim, hidden_dim, num_critics)
+            hidden_linears.append(linear)
+            modules.append(linear)
             if layer_norm:
                 modules.append(EnsembleLayerNorm(hidden_dim, num_critics))
             modules.append(nn.ReLU())
@@ -333,8 +388,25 @@ class EnsembleQNetwork(nn.Module):
         self.net = nn.Sequential(*modules)
         self.num_critics = num_critics
         last = self.net[-1]
-        nn.init.uniform_(last.weight, -3e-3, 3e-3)
-        nn.init.uniform_(last.bias, -3e-3, 3e-3)
+        if wsrl_profile:
+            for layer_index, linear in enumerate(hidden_linears):
+                scale = (
+                    1e-2
+                    if layer_index == len(hidden_linears) - 1
+                    else math.sqrt(2.0)
+                )
+                for critic_index in range(num_critics):
+                    nn.init.orthogonal_(linear.weight[critic_index], gain=scale)
+                nn.init.zeros_(linear.bias)
+            for critic_index in range(num_critics):
+                nn.init.orthogonal_(last.weight[critic_index], gain=math.sqrt(2.0))
+            nn.init.zeros_(last.bias)
+        else:
+            if rpex_profile:
+                for linear in hidden_linears:
+                    nn.init.constant_(linear.bias, 0.1)
+            nn.init.uniform_(last.weight, -3e-3, 3e-3)
+            nn.init.uniform_(last.bias, -3e-3, 3e-3)
 
     def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         state_action = torch.cat((states, actions), dim=-1)
