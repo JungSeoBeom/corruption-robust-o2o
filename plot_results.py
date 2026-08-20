@@ -153,6 +153,18 @@ def _load_runs(root: Path):
             "implementation_fidelity", "legacy_unknown"
         )
         frame["suite_profile"] = manifest.get("suite_profile", "legacy_current")
+        frame["run_purpose"] = manifest.get("run_purpose", "legacy_unknown")
+        frame["attack_timing"] = manifest.get("attack_timing", "legacy_unknown")
+        frame["adversarial_attack_profile"] = manifest.get(
+            "adversarial_attack_profile",
+            manifest.get("attack_implementation", "legacy_unknown"),
+        )
+        frame["online_corruption_scale_profile"] = manifest.get(
+            "online_corruption_scale_profile", "legacy_unknown"
+        )
+        frame["wsrl_entropy_profile"] = manifest.get(
+            "wsrl_entropy_profile", "legacy_unknown"
+        )
         frame["aggregation_signature"] = aggregation_signature(manifest)
         frame["resolved_algorithm_profile"] = config.get(
             "resolved_algorithm_profile", "unknown_legacy_profile"
@@ -369,10 +381,41 @@ def plot_aggregate(
             summary[key] = value
         summary_frames.append(summary)
         label = f"{group[0]} [{group[4]}]"
-        if group_frame["suite_profile"].iloc[0] == "common_budget_robustness":
-            label += " COMMON-BUDGET PORT"
+        if group_frame["suite_profile"].iloc[0] in (
+            "common_budget_robustness",
+            "common_budget_diagnostic",
+        ):
+            label += " | COMMON-BUDGET / NOT PAPER REPRO"
         if group_frame["implementation_fidelity"].iloc[0] == "approximation":
-            label += " APPROX"
+            label += " | PQE shared-actor approximation"
+        if (
+            group_frame["adversarial_attack_profile"].iloc[0]
+            == "experimental_sign_pgd"
+        ):
+            label += " | EXPERIMENTAL SIGN-PGD"
+        if group_frame["attack_timing"].iloc[0] != "legacy_unknown":
+            timing_label = {
+                "official_code_post_transition_replay_poisoning": "post-replay",
+                "paper_pre_action_sensor_actuator": "pre-action",
+            }.get(
+                group_frame["attack_timing"].iloc[0],
+                group_frame["attack_timing"].iloc[0],
+            )
+            label += f" | {timing_label}"
+        if group_frame["online_corruption_scale_profile"].iloc[0] != "legacy_unknown":
+            scale_label = {
+                "rpex_official_code": "unit-scale",
+                "dataset_std_scaled_extension": "dataset-std",
+            }.get(
+                group_frame["online_corruption_scale_profile"].iloc[0],
+                group_frame["online_corruption_scale_profile"].iloc[0],
+            )
+            label += f" | {scale_label}"
+        if (
+            group[0] == "wsrl"
+            and group_frame["wsrl_entropy_profile"].iloc[0] == "legacy_zero"
+        ):
+            label += " | LEGACY ENTROPY 0"
         if "oracle" in str(group[4]):
             label += " ORACLE"
         if phase in ("offline", "offline_online") and group[0] == "wsrl":

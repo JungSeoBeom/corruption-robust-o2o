@@ -67,10 +67,12 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "algorithm": algorithm,
         "paper_title": resolved.get("paper_title"),
         "implementation_profile": resolved.get("implementation_profile"),
+        "algorithm_profile": resolved.get("resolved_algorithm_profile"),
         "implementation_fidelity": resolved.get("implementation_fidelity"),
         "upstream_repository": UPSTREAM_REPOSITORIES.get(algorithm),
         "upstream_commit": resolved.get("upstream_commit"),
         "suite_profile": resolved.get("suite_profile"),
+        "run_purpose": resolved.get("run_purpose"),
         "budget_profile": resolved.get("budget_profile"),
         "not_paper_reproduction": resolved.get("not_paper_reproduction"),
         "environment_protocol": resolved.get("environment_protocol"),
@@ -102,11 +104,23 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
             ),
         },
         "evaluation_policy_profile": resolved.get("evaluation_policy_profile"),
+        "target_entropy": resolved.get("target_entropy"),
+        "wsrl_entropy_profile": resolved.get("wsrl_entropy_profile"),
         "evaluation_mode": resolved.get("evaluation_mode"),
         "online_replay_profile": resolved.get("online_replay_profile"),
         "attack_semantics": resolved.get("random_attack_semantics"),
         "attack_timing": resolved.get("attack_timing"),
         "attack_implementation": resolved.get("adversarial_attack_profile"),
+        "adversarial_attack_profile": resolved.get("adversarial_attack_profile"),
+        "online_corruption_scale_profile": resolved.get(
+            "online_corruption_scale_profile"
+        ),
+        "offline_adversarial_reward_rule": resolved.get(
+            "offline_adversarial_reward_rule"
+        ),
+        "online_adversarial_reward_rule": resolved.get(
+            "online_adversarial_reward_rule"
+        ),
         "attack_implementation_version": resolved.get(
             "offline_corruption", {}
         ).get("attack_implementation_version"),
@@ -114,12 +128,24 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
             "offline_corruption", {}
         ).get("attack_checkpoint_fingerprint"),
         "corruption": resolved.get("corruption"),
+        "attack_mode": resolved.get("corruption"),
         "corruption_target": resolved.get("corruption_target"),
         "corruption_rate": {
             "offline": resolved.get("offline_corruption_rate"),
             "online": resolved.get("online_corruption_rate"),
         },
         "corruption_range": resolved.get("corruption_range"),
+        "reward_corruption_support": {
+            "distribution": resolved.get("offline_corruption", {}).get(
+                "reward_corruption_distribution"
+            ),
+            "low": resolved.get("offline_corruption", {}).get(
+                "reward_corruption_low"
+            ),
+            "high": resolved.get("offline_corruption", {}).get(
+                "reward_corruption_high"
+            ),
+        },
         "selected_transition_count": resolved.get("offline_corruption", {}).get(
             "selected_transition_count"
         ),

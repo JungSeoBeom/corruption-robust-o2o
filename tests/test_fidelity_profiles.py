@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import hashlib
 import json
 import math
 import multiprocessing
@@ -18,7 +19,11 @@ from robust_o2o.corruption import (
     AttackOracle,
     EDACActor,
     EDACCritic,
+    OnlineCorruptionAudit,
+    corrupt_online_reward_value,
     corrupt_offline_dataset,
+    online_corruption_scale,
+    resolve_attack_checkpoint,
 )
 from robust_o2o.fidelity import canonical_json_sha256
 from robust_o2o.agents import build_agent
@@ -71,6 +76,188 @@ def _assert_nested_equal(test: unittest.TestCase, first, second) -> None:
 
 
 class FidelityProfileTest(unittest.TestCase):
+    def test_primary_suite_keeps_ports_explicit_and_rejects_pqe(self):
+        calql = ExperimentConfig(
+            "cal_ql",
+            "hopper-medium-replay-v2",
+            suite_profile="primary_research_benchmark",
+        )
+        self.assertEqual(calql.implementation_profile, "locomotion_port")
+        self.assertEqual(calql.implementation_fidelity, "task_port")
+        clean_rpex = ExperimentConfig(
+            "rpex",
+            "hopper-medium-replay-v2",
+            suite_profile="primary_research_benchmark",
+        )
+        self.assertTrue(clean_rpex.riql_config_extension)
+        self.assertEqual(clean_rpex.implementation_fidelity, "task_port")
+        with self.assertRaisesRegex(ValueError, "shared_actor"):
+            ExperimentConfig(
+                "pessimistic_q_ensemble",
+                "hopper-medium-replay-v2",
+                suite_profile="primary_research_benchmark",
+            )
+
+    def test_wsrl_official_target_entropy_and_temperature_loss(self):
+        cases = {
+            "hopper-medium-replay-v2": (3, -3.0),
+            "halfcheetah-medium-replay-v2": (6, -6.0),
+            "walker2d-medium-replay-v2": (6, -6.0),
+        }
+        for env_name, (action_dim, expected) in cases.items():
+            config = ExperimentConfig("wsrl", env_name)
+            self.assertEqual(config.target_entropy, expected)
+            agent = build_agent(config, 4, action_dim, 1.0, torch.device("cpu"))
+            log_prob = torch.tensor([-2.0, -4.0])
+            expected_loss = agent.alpha * ((-log_prob.mean()) - expected)
+            self.assertTrue(
+                torch.allclose(agent._temperature_loss(log_prob), expected_loss)
+            )
+
+        legacy = ExperimentConfig(
+            "wsrl",
+            "hopper-medium-replay-v2",
+            wsrl_entropy_profile="legacy_zero",
+        )
+        self.assertEqual(legacy.target_entropy, 0.0)
+
+    def test_random_reward_range_and_seed_independence(self):
+        dataset = _small_corruption_dataset()
+        for corruption_range, bound in ((0.0, 0.0), (0.5, 15.0), (1.0, 30.0), (2.0, 60.0)):
+            config = ExperimentConfig(
+                "riql_naive",
+                "hopper-medium-replay-v2",
+                corruption="random",
+                corruption_target="rewards",
+                offline_corruption_rate=1.0,
+                corruption_range=corruption_range,
+                corruption_seed=123,
+            )
+            with tempfile.TemporaryDirectory() as directory:
+                result, stats = corrupt_offline_dataset(
+                    dataset, config, None, Path(directory)
+                )
+            self.assertTrue(np.all(result["rewards"] >= -bound))
+            self.assertTrue(np.all(result["rewards"] <= bound))
+            self.assertEqual(stats["reward_corruption_low"], -bound)
+            self.assertEqual(stats["reward_corruption_high"], bound)
+
+        first = ExperimentConfig(
+            "riql_naive",
+            "hopper-medium-replay-v2",
+            corruption="random",
+            corruption_target="rewards",
+            offline_corruption_rate=1.0,
+            corruption_seed=77,
+            learner_seed=1,
+        )
+        second = ExperimentConfig(
+            "riql_naive",
+            "hopper-medium-replay-v2",
+            corruption="random",
+            corruption_target="rewards",
+            offline_corruption_rate=1.0,
+            corruption_seed=77,
+            learner_seed=999,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            left, left_stats = corrupt_offline_dataset(dataset, first, None, Path(directory))
+            right, right_stats = corrupt_offline_dataset(dataset, second, None, Path(directory))
+        self.assertTrue(np.array_equal(left["rewards"], right["rewards"]))
+        self.assertEqual(
+            left_stats["selected_transition_indices_sha256"],
+            right_stats["selected_transition_indices_sha256"],
+        )
+
+    def test_online_corruption_scale_profiles(self):
+        state_std = np.asarray([2.0, 4.0, 8.0], dtype=np.float32)
+        action_std = np.asarray([0.25, 0.5], dtype=np.float32)
+        official = ExperimentConfig(
+            "rpex",
+            "hopper-medium-replay-v2",
+            corruption="random",
+            corruption_target="observations",
+            implementation_profile="official_code_reference",
+        )
+        self.assertTrue(
+            np.array_equal(
+                online_corruption_scale(
+                    "observations", official, state_std=state_std, action_std=action_std
+                ),
+                np.ones_like(state_std),
+            )
+        )
+        self.assertTrue(
+            np.array_equal(
+                online_corruption_scale(
+                    "dynamics", official, state_std=state_std, action_std=action_std
+                ),
+                np.ones_like(state_std),
+            )
+        )
+        self.assertTrue(
+            np.array_equal(
+                online_corruption_scale(
+                    "actions", official, state_std=state_std, action_std=action_std
+                ),
+                action_std,
+            )
+        )
+        extension = ExperimentConfig(
+            "riql_naive",
+            "hopper-medium-replay-v2",
+            corruption="random",
+            corruption_target="observations",
+            online_corruption_scale_profile="dataset_std_scaled_extension",
+        )
+        self.assertTrue(
+            np.array_equal(
+                online_corruption_scale(
+                    "observations", extension, state_std=state_std, action_std=action_std
+                ),
+                state_std,
+            )
+        )
+
+    def test_online_adversarial_reward_official_parity_and_opt_in(self):
+        config = ExperimentConfig(
+            "rpex",
+            "hopper-medium-replay-v2",
+            corruption="adversarial",
+            corruption_target="rewards",
+            implementation_profile="official_code_reference",
+            corruption_seed=19,
+        )
+        expected_rng = np.random.default_rng(19)
+        actual_rng = np.random.default_rng(19)
+        expected = float(expected_rng.uniform(-1.0, 1.0))
+        actual = corrupt_online_reward_value(7.5, config, actual_rng)
+        self.assertEqual(actual, expected)
+        self.assertEqual(
+            config.online_adversarial_reward_rule,
+            "official_uniform_replacement",
+        )
+        with self.assertRaisesRegex(ValueError, "explicit.*experimental_sign_pgd"):
+            ExperimentConfig(
+                "rpex",
+                "hopper-medium-replay-v2",
+                corruption="adversarial",
+                corruption_target="rewards",
+                adversarial_attack_profile="experimental_sign_pgd",
+            )
+        experimental = ExperimentConfig(
+            "rpex",
+            "hopper-medium-replay-v2",
+            corruption="adversarial",
+            corruption_target="rewards",
+            adversarial_attack_profile="experimental_sign_pgd",
+            allow_experimental_adversarial_attack=True,
+        )
+        self.assertEqual(
+            experimental.online_adversarial_reward_rule,
+            "experimental_scaled_sign_flip",
+        )
+
     def test_generic_reference_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "generic.*reference"):
             ExperimentConfig(
@@ -324,6 +511,61 @@ class FidelityProfileTest(unittest.TestCase):
             self.assertEqual(len(caches), 1)
             self.assertTrue(caches[0].with_suffix(".npz.sha256").exists())
 
+    def test_official_adversarial_observation_cache_miss_then_hit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "oracle.pt"
+            torch.save(
+                {
+                    "actor": EDACActor(3, 2, 1.0).state_dict(),
+                    "critic": EDACCritic(3, 2).state_dict(),
+                },
+                checkpoint,
+            )
+            missing_sha = ExperimentConfig(
+                "rpex",
+                "hopper-medium-replay-v2",
+                corruption="adversarial",
+                corruption_target="observations",
+                implementation_profile="official_code_reference",
+                attack_checkpoint=str(checkpoint),
+            )
+            with self.assertRaisesRegex(ValueError, "checkpoint-sha256"):
+                resolve_attack_checkpoint(missing_sha)
+            expected_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+            config = ExperimentConfig(
+                "rpex",
+                "hopper-medium-replay-v2",
+                corruption="adversarial",
+                corruption_target="observations",
+                implementation_profile="official_code_reference",
+                offline_corruption_rate=0.0,
+                attack_checkpoint=str(checkpoint),
+                attack_checkpoint_sha256=expected_sha,
+            )
+            self.assertEqual(resolve_attack_checkpoint(config), checkpoint.resolve())
+            oracle = AttackOracle(
+                3,
+                2,
+                1.0,
+                checkpoint,
+                torch.device("cpu"),
+                seed=config.corruption_seed,
+                implementation_profile="rpex_official_adam",
+            )
+            first, first_stats = corrupt_offline_dataset(
+                _small_corruption_dataset(), config, oracle, root / "cache"
+            )
+            second, second_stats = corrupt_offline_dataset(
+                _small_corruption_dataset(), config, oracle, root / "cache"
+            )
+            self.assertFalse(first_stats["cache_hit"])
+            self.assertTrue(second_stats["cache_hit"])
+            self.assertTrue(
+                np.array_equal(first["observations"], second["observations"])
+            )
+            oracle.close()
+
     def test_two_processes_generate_one_atomic_cache(self):
         context = multiprocessing.get_context("fork")
         with tempfile.TemporaryDirectory() as directory:
@@ -399,8 +641,12 @@ class FidelityProfileTest(unittest.TestCase):
         agent_checkpoint = copy.deepcopy(uninterrupted.checkpoint_state())
         replay_checkpoint = copy.deepcopy(replay.state_dict())
         torch_checkpoint = torch.random.get_rng_state().clone()
+        expected_batches = []
+        expected_metrics = []
         for _ in range(100):
-            uninterrupted.update(replay.sample(2, torch.device("cpu")))
+            batch = replay.sample(2, torch.device("cpu"))
+            expected_batches.append(copy.deepcopy(batch))
+            expected_metrics.append(uninterrupted.update(batch))
 
         torch.manual_seed(999)
         resumed = build_agent(config, 3, 2, 1.0, torch.device("cpu"))
@@ -408,8 +654,13 @@ class FidelityProfileTest(unittest.TestCase):
         resumed_replay = ReplayBuffer(3, 2, 32, seed=999)
         resumed_replay.load_state_dict(replay_checkpoint)
         torch.random.set_rng_state(torch_checkpoint)
-        for _ in range(100):
-            resumed.update(resumed_replay.sample(2, torch.device("cpu")))
+        actual_metrics = []
+        for expected_batch in expected_batches:
+            actual_batch = resumed_replay.sample(2, torch.device("cpu"))
+            _assert_nested_equal(self, expected_batch, actual_batch)
+            actual_metrics.append(resumed.update(actual_batch))
+
+        self.assertEqual(expected_metrics, actual_metrics)
 
         _assert_nested_equal(
             self,
@@ -514,6 +765,46 @@ class FidelityProfileTest(unittest.TestCase):
         self.assertEqual(aggregation_signature(first), aggregation_signature(second))
         second["action_clipping"] = not second["action_clipping"]
         self.assertNotEqual(aggregation_signature(first), aggregation_signature(second))
+
+        for key, value in (
+            ("online_corruption_scale_profile", "rpex_official_code"),
+            ("adversarial_attack_profile", "experimental_sign_pgd"),
+            ("wsrl_entropy_profile", "legacy_zero"),
+            ("run_purpose", "final_benchmark"),
+        ):
+            changed = json.loads(json.dumps(first))
+            changed[key] = value
+            self.assertNotEqual(
+                aggregation_signature(first), aggregation_signature(changed), key
+            )
+
+    def test_online_corruption_audit_is_resume_safe(self):
+        config = ExperimentConfig(
+            "riql_naive",
+            "hopper-medium-replay-v2",
+            corruption="random",
+            corruption_target="observations",
+        )
+        values = (
+            np.asarray([1.0, 2.0], dtype=np.float32),
+            np.asarray([0.5], dtype=np.float32),
+            3.0,
+            np.asarray([4.0, 5.0], dtype=np.float32),
+        )
+        uninterrupted = OnlineCorruptionAudit()
+        uninterrupted.update(1, "observations", *values)
+        uninterrupted.update(2, "observations", *values)
+        split = OnlineCorruptionAudit()
+        split.update(1, "observations", *values)
+        resumed = OnlineCorruptionAudit(split.state_dict())
+        resumed.update(2, "observations", *values)
+        self.assertEqual(uninterrupted.state_dict(), resumed.state_dict())
+        metadata = resumed.metadata(config)
+        self.assertEqual(metadata["selected_transition_count"], 2)
+        self.assertEqual(
+            metadata["attack_timing"],
+            "official_code_post_transition_replay_poisoning",
+        )
 
 
 if __name__ == "__main__":

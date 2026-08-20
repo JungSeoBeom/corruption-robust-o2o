@@ -15,6 +15,7 @@ from .agents import build_agent
 from .config import LEGACY_PROTOCOL, ExperimentConfig
 from .corruption import (
     AttackOracle,
+    OnlineCorruptionAudit,
     corrupt_pre_action_value,
     corrupt_offline_dataset,
     corrupt_online_transition,
@@ -995,6 +996,9 @@ def _run_online(
     episode_steps = 0
     episode_return = 0.0
     corrupted_online = int(resume_state.get("corrupted_online", 0)) if online_resume else 0
+    corruption_audit = OnlineCorruptionAudit(
+        resume_state.get("online_corruption_audit") if online_resume else None
+    )
     last_metrics: Dict[str, float] = {}
     accumulator = MetricAccumulator()
     if online_resume:
@@ -1042,6 +1046,7 @@ def _run_online(
             "global_rng": capture_global_rng_state(rng, oracle),
             "environment_rng": capture_environment_rng_state(env),
             "corrupted_online": corrupted_online,
+            "online_corruption_audit": corruption_audit.state_dict(),
             "raw_action_abs_max": raw_action_abs_max,
             "executed_action_abs_max": executed_action_abs_max,
             "executed_oob": executed_oob,
@@ -1112,6 +1117,9 @@ def _run_online(
         episode_steps += 1
         episode_return += reward
 
+        if not pre_action:
+            selected_target = sample_online_corruption_target(config, rng)
+
         if pre_action and selected_target in ("observations", "actions"):
             stored_state = policy_state.copy()
             stored_action = executed_action.copy()
@@ -1136,9 +1144,18 @@ def _run_online(
                 state_std,
                 action_std,
                 selected_target=selected_target,
-                selection_already_sampled=pre_action,
+                selection_already_sampled=True,
             )
         corrupted_online += int(was_corrupted)
+        if was_corrupted and selected_target is not None:
+            corruption_audit.update(
+                env_step,
+                selected_target,
+                stored_state,
+                stored_action,
+                stored_reward,
+                stored_next_state,
+            )
         replay_mismatch += int(
             not np.allclose(stored_action, executed_action, rtol=1e-6, atol=1e-6)
         )
@@ -1338,3 +1355,8 @@ def _run_online(
         corrupted_online,
         config.online_steps,
     )
+    online_corruption_metadata = corruption_audit.metadata(config)
+    with (logger.run_dir / "online_corruption_manifest.json").open(
+        "w", encoding="utf-8"
+    ) as stream:
+        json.dump(online_corruption_metadata, stream, indent=2, ensure_ascii=False)

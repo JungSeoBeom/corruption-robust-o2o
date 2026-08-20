@@ -19,7 +19,14 @@ IMPLEMENTATION_FIDELITIES = (
     "approximation",
     "legacy_unknown",
 )
-SUITE_PROFILES = ("method_fidelity", "common_budget_robustness")
+SUITE_PROFILES = (
+    "primary_research_benchmark",
+    "common_budget_diagnostic",
+    # Backward-compatible names retained for existing commands/results.
+    "method_fidelity",
+    "common_budget_robustness",
+)
+RUN_PURPOSES = ("smoke", "diagnostic", "final_benchmark")
 
 ONLINE_REPLAY_PROFILES = (
     "official_code_online_only",
@@ -54,6 +61,19 @@ TASK_PROFILES = ("official_supported_task", "d4rl_locomotion_port")
 ADVERSARIAL_ATTACK_PROFILES = (
     "rpex_official_adam",
     "experimental_sign_pgd",
+)
+ONLINE_CORRUPTION_SCALE_PROFILES = (
+    "rpex_official_code",
+    "dataset_std_scaled_extension",
+)
+WSRL_ENTROPY_PROFILES = (
+    "official_negative_action_dim",
+    "legacy_zero",
+)
+OFFLINE_ADVERSARIAL_REWARD_RULES = ("official_sign_flip",)
+ONLINE_ADVERSARIAL_REWARD_RULES = (
+    "official_uniform_replacement",
+    "experimental_scaled_sign_flip",
 )
 
 

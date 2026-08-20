@@ -1,6 +1,6 @@
 # Baseline fidelity overhaul report
 
-Audit date: 2026-08-20
+Audit date: 2026-08-21
 
 This report describes the static audit and bounded verification used for the
 research-facing `run_55` suite. No long reinforcement-learning run was
@@ -49,11 +49,14 @@ until a citable source supplies the missing definition.
 - `robust_o2o/agents/iql_family.py`: RIQL quantile/clipped robust loss, AlignIQL,
   actor/critic learning rates, cosine scheduler, and checkpointed scheduler.
 - `robust_o2o/agents/sac_family.py`: WSRL REDQ 10/2 with replacement, full-10
-  actor minimum, subset CQL, target entropy zero, no entropy backup, and 4:1:1
-  critic/actor/temperature schedule.
+  actor minimum, subset CQL, official `-action_dim` target entropy with a
+  softplus Geq multiplier, no entropy backup, and 4:1:1
+  critic/actor/temperature schedule. Entropy zero is legacy-only.
 - `robust_o2o/corruption.py`: explicit pre/post timing, official Adam versus
-  sign-PGD, dedicated RNG, identity-complete locked atomic cache, checksum and
-  shape/dtype/metadata validation, mask and value hashes.
+  opt-in sign-PGD, separate offline/online reward rules, official unit-scale
+  online observation/dynamics attacks, dedicated RNG, identity-complete locked
+  atomic cache, checksum and shape/dtype/metadata validation, and mask/value
+  hashes.
 - `robust_o2o/environment.py`: profile-controlled action execution and strict
   environment/action/horizon checks.
 - `robust_o2o/replay.py`, `robust_o2o/experiment.py`, and
@@ -146,7 +149,7 @@ suite was run through `unittest discover`. Ruff is installed in the base Conda
 environment and was run from there. No mypy configuration exists. The strict
 preflight is skipped for the platform reason in section E.
 
-Final result: 106 tests passed, 0 failed, 0 skipped. Ruff, `diff --check`, and
+Final result: 115 tests total: 114 passed, 0 failed, 1 skipped. Ruff, `diff --check`, and
 byte-code compilation passed. The local diagnostic smoke passed; the strict
 Linux preflight was not executed.
 
@@ -230,3 +233,55 @@ python run_experiment.py --algorithm riql_naive \
   --offline-steps 10 --online-steps 200 --eval-episodes 2 \
   --online-checkpoint-period 10 --output-dir /tmp/o2o-resume-smoke
 ```
+
+## I. 2026-08-21 P0 re-audit and launch decision
+
+### Pre-change findings
+
+| Priority | Local file/function | Pre-change behavior | Pinned upstream behavior | Result impact |
+|---|---|---|---|---|
+| P0 | `agents/sac_family.py:SACEnsembleAgent.update` | WSRL target entropy was `0.0`; temperature used the generic exponential-log-alpha loss | `wsrl/agents/sac.py:SACAgent.create` resolves nonnegative entropy to `-action_dim`; `temperature_loss_fn` uses the softplus Geq multiplier | Changes entropy pressure and therefore actor/critic fine-tuning |
+| P0 | `corruption.py:_corrupt_target_values` and `corrupt_online_transition` | Random reward support remained `[-30,30]` for every severity | Requested severity semantics preserve the upstream range-1 behavior and scale support by `corruption_range` | Invalidated reward severity sweeps |
+| P0 | `corruption.py:corrupt_online_transition` | Observation/dynamics always used offline dataset std | `RPEX/attack_online.py` passes unit std for online observation/dynamics and dataset action std for actions | Changed dimension-wise perturbation bounds |
+| P0 | `config.py` | Experimental sign-PGD was the default profile | RPEX official-code-aligned runs require the Adam attacker and verified weights/settings | Could silently mislabel an experimental attack as RPEX |
+| P0 | `corruption.py:corrupt_online_transition` | Online adversarial reward used `-range * reward` | `RPEX/attack.py:corrupt_trans` uses selected `Uniform(-1,1)` replacement online; offline uses sign flip | Mixed two distinct attack definitions |
+| P1 | `run_55_experiment.py` | Research and common-budget vocabulary did not expose the requested primary/diagnostic split | Primary must exclude non-exact PQE; diagnostic may retain the approximation | Could place an approximation in a primary suite |
+
+### Result
+
+- WSRL official entropy is `-3` for Hopper and `-6` for HalfCheetah/Walker2d;
+  `legacy_zero` is the only zero-entropy profile. The resolved value and
+  parameterization are in config, manifest, path hash, and checkpoints.
+- Random reward supports are exactly `0`, `[-15,15]`, `[-30,30]`, and
+  `[-60,60]` for ranges `0`, `0.5`, `1`, and `2`.
+- Online scale, attack timing, adversarial optimizer, offline/online reward
+  rules, selection hash, and value hash are persisted and aggregation-strict.
+- `experimental_sign_pgd` requires both its profile flag and
+  `--allow-experimental-adversarial-attack`.
+- `primary_research_benchmark` excludes PQE. `common_budget_diagnostic` retains
+  it only as `PQE shared-actor approximation` and labels the entire suite as
+  not paper reproduction. `final_benchmark` requires seeds `0,1,2,3,4`.
+
+### Verification classification
+
+- Unit/mock tested: 115 total; 114 passed, 1 platform skip, 0 failed.
+- Ruff, `git diff --check`, and byte-code compilation: passed.
+- Local diagnostic tested: five clean algorithms, WSRL entropy path, random
+  reward range `0.5`, official unit-scale random dynamics, and official online
+  adversarial reward; all bounded runs completed. Outputs were written only
+  below `/tmp`.
+- Strict D4RL runtime: not tested. The strict preflight correctly failed on
+  macOS before environment creation because it is Linux x86_64-only.
+- Pytest: not installed in the `corruption` environment; base pytest cannot
+  collect the suite because base Python has no Torch. The same tests were run
+  with `unittest discover` in the target environment.
+- Mypy: not run; the repository has no mypy configuration or dependency.
+
+### Full experiment decision: CONDITIONAL GO
+
+The five-algorithm common-budget diagnostic suite is runnable. The primary
+research suite is ready for RPEX, RIQL-naive, WSRL, and the explicitly labelled
+Cal-QL locomotion port only after the strict Linux preflight passes. A five-
+algorithm paper-faithful primary claim remains blocked because exact
+Off2OnRL/PQE is not implemented; the shared-actor approximation is never used
+as an automatic replacement.

@@ -68,11 +68,13 @@ the canonical diagnostic name.
 
 The generic `reference` profile has been removed. Every run records an
 `implementation_profile`, an `implementation_fidelity`, and a `suite_profile`.
-The default 5×5 suite is `common_budget_robustness`, is visibly labelled
-`COMMON-BUDGET PORT`, and is never reported as paper reproduction.
-`method_fidelity` uses upstream budgets and fails before training when an exact
-method/task port is unavailable. In particular, locomotion Cal-QL is a
-`task_port`, and the current PQE is explicitly `pqe_shared_actor_approx`.
+The default 5×5 suite is `common_budget_diagnostic`, is visibly labelled
+`COMMON-BUDGET PORT / NOT PAPER REPRODUCTION`, and is never reported as paper
+reproduction. `primary_research_benchmark` uses upstream-aligned profiles,
+keeps locomotion Cal-QL explicitly labelled as a task port, and excludes PQE
+because the current implementation is only `pqe_shared_actor_approx`. The old
+`common_budget_robustness` and `method_fidelity` names remain compatibility
+profiles for existing commands and results.
 See [baseline_fidelity_manifest.yaml](docs/baseline_fidelity_manifest.yaml) for
 the pinned upstream commits and file/function provenance.
 
@@ -228,9 +230,16 @@ The default corruption parameters match RPEX:
 - Offline corruption rate: `0.3`
 - Online corruption rate: `0.5`
 - Corruption range: `1.0`
-- Random reward corruption: replace selected rewards with `Uniform(-30, 30)`
-- Adversarial reward corruption: change selected rewards to
-  `-range × reward`
+- Random reward corruption: replace selected rewards with
+  `Uniform(-30 × range, 30 × range)`
+- Offline adversarial reward corruption: official `-range × reward` sign flip
+- Online adversarial reward corruption: official `Uniform(-1, 1)` replacement
+
+Official RPEX online observation/dynamics poisoning uses unit scale; actions
+use the offline action standard deviation. The historical dataset-standard-
+deviation behavior is available only as
+`--online-corruption-scale-profile dataset_std_scaled_extension` and has a
+separate manifest/plot identity.
 
 Example with custom corruption parameters:
 
@@ -507,8 +516,8 @@ Run RPEX, RIQL naive, WSRL, Cal-QL, and Pessimistic Q-Ensemble on Hopper for
 the clean setting and all four individual random-corruption targets:
 
 ```bash
-conda activate corruption-rpex-v2
-python run_55_experiment.py --suite-profile common_budget_robustness
+conda activate corruption
+python run_55_experiment.py --suite-profile common_budget_diagnostic
 ```
 
 Hopper remains the default. To run the same suite on HalfCheetah:
@@ -516,7 +525,7 @@ Hopper remains the default. To run the same suite on HalfCheetah:
 ```bash
 python run_55_experiment.py \
   --env-name halfcheetah-medium-replay-v2 \
-  --suite-profile common_budget_robustness
+  --suite-profile common_budget_diagnostic
 ```
 
 This runs 25 experiments for the default seed, with 500,000 offline updates and
@@ -670,9 +679,10 @@ ELAPSED: 04:05:05 (14705.000 seconds)
 
 ## 9. Important points for performance and runtime comparisons
 
-- Use `common_budget_robustness` when offline/online budgets must be identical.
-  Use `method_fidelity` when each method's upstream budget is required; never
-  combine the two suites in one reported curve.
+- Use `common_budget_diagnostic` when offline/online budgets must be identical.
+  Use `primary_research_benchmark` for the research-facing suite; it excludes
+  the shared-actor PQE approximation. A `final_benchmark` run requires at least
+  seeds `0,1,2,3,4`. Never combine these suites in one reported curve.
 - On supported hardware, RO2O with `--ro2o-sample-size 20` and the 10-critic
   UWMSG/RO2O configurations are particularly slow. Reduce the sample size or
   critic count only during exploratory runs, and restore the original values

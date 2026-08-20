@@ -28,7 +28,12 @@ from robust_o2o.config import (
     PROTOCOLS,
     normalize_env_name,
 )
-from robust_o2o.fidelity import IMPLEMENTATION_PROFILES, SUITE_PROFILES
+from robust_o2o.fidelity import (
+    IMPLEMENTATION_PROFILES,
+    ONLINE_CORRUPTION_SCALE_PROFILES,
+    RUN_PURPOSES,
+    SUITE_PROFILES,
+)
 from robust_o2o.environment import preflight_runtime
 from robust_o2o.logging_utils import format_duration, format_timestamp
 from robust_o2o.paths import comparison_directory
@@ -43,7 +48,7 @@ ALGORITHM_DISPLAY_NAMES = {
     "cal_ql": "Cal-QL",
     "wsrl": "WSRL",
     "ro2o": "RO2O",
-    "pessimistic_q_ensemble": "Pessimistic Q-Ensemble",
+    "pessimistic_q_ensemble": "PQE shared-actor approximation",
 }
 
 TIMING_FIELDS = (
@@ -91,6 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--suite-profile", choices=SUITE_PROFILES,
         default="common_budget_robustness",
     )
+    parser.add_argument("--run-purpose", choices=RUN_PURPOSES, default="diagnostic")
+    parser.add_argument(
+        "--online-corruption-scale-profile",
+        choices=ONLINE_CORRUPTION_SCALE_PROFILES,
+    )
     parser.add_argument("--allow-diagnostic-protocol", action="store_true")
     parser.add_argument("--output-root", default="results")
     parser.add_argument("--dataset-dir")
@@ -127,6 +137,30 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             int(seed)
         except ValueError:
             parser.error(f"invalid seed: {seed!r}")
+    if args.run_purpose == "final_benchmark":
+        required = {"0", "1", "2", "3", "4"}
+        if not required.issubset(set(args.seeds)):
+            parser.error(
+                "final_benchmark requires at least seeds 0,1,2,3,4; "
+                "single-seed runs are smoke/diagnostic only"
+            )
+    if (
+        args.suite_profile == "primary_research_benchmark"
+        and "pessimistic_q_ensemble" in args.algorithms
+    ):
+        parser.error(
+            "primary_research_benchmark excludes the local PQE shared-actor "
+            "approximation; remove pessimistic_q_ensemble"
+        )
+    if args.online_corruption_scale_profile is None:
+        args.online_corruption_scale_profile = (
+            "rpex_official_code"
+            if args.suite_profile in (
+                "method_fidelity",
+                "primary_research_benchmark",
+            )
+            else "dataset_std_scaled_extension"
+        )
     if args.corruption == "clean":
         args.corruption_target = "none"
     elif args.corruption_target == "none":
@@ -173,6 +207,11 @@ def commands(
     runs_dir: Path,
 ) -> Iterable[list[str]]:
     script = Path(__file__).resolve().parent / "run_experiment.py"
+    scale_profile = args.online_corruption_scale_profile or (
+        "rpex_official_code"
+        if args.suite_profile in ("method_fidelity", "primary_research_benchmark")
+        else "dataset_std_scaled_extension"
+    )
     for algorithm in args.algorithms:
         for seed in args.seeds:
             command = [
@@ -196,6 +235,10 @@ def commands(
                 args.protocol,
                 "--suite-profile",
                 args.suite_profile,
+                "--run-purpose",
+                args.run_purpose,
+                "--online-corruption-scale-profile",
+                scale_profile,
                 "--output-dir",
                 str(runs_dir),
             ]
@@ -396,6 +439,8 @@ def main() -> int:
         "protocol": args.protocol,
         "implementation_profile": args.implementation_profile or "auto",
         "suite_profile": args.suite_profile,
+        "run_purpose": args.run_purpose,
+        "online_corruption_scale_profile": args.online_corruption_scale_profile,
         "environment": args.env_name,
         "corruption": args.corruption,
         "corruption_target": args.corruption_target,

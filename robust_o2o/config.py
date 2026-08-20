@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -14,12 +15,17 @@ from .fidelity import (
     IMPLEMENTATION_PROFILES,
     LEGACY_ACTION_EXECUTION_PROFILE_ALIASES,
     MIXED_CORRUPTION_PROFILES,
+    OFFLINE_ADVERSARIAL_REWARD_RULES,
+    ONLINE_ADVERSARIAL_REWARD_RULES,
+    ONLINE_CORRUPTION_SCALE_PROFILES,
     ONLINE_REPLAY_PROFILES,
     POLICY_EXTRACTIONS,
     RANDOM_ATTACK_SEMANTICS,
+    RUN_PURPOSES,
     SUITE_PROFILES,
     TASK_PROFILES,
     UPSTREAM_COMMITS,
+    WSRL_ENTROPY_PROFILES,
     resolve_riql_reference_row,
 )
 
@@ -43,6 +49,12 @@ DEFAULT_PROTOCOL = LEGACY_PROTOCOL
 PROTOCOLS = (LEGACY_PROTOCOL, LOCAL_PROTOCOL, LEGACY_LOCAL_PROTOCOL_ALIAS)
 ALGORITHM_PROFILES = IMPLEMENTATION_PROFILES
 CALIBRATION_MASK_MODES = ("all", "oracle_exclude_corrupted", "disabled")
+
+ACTION_DIMS = {
+    "halfcheetah": 6,
+    "hopper": 3,
+    "walker2d": 6,
+}
 
 ALGORITHM_TITLES = {
     "rpex": "Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption",
@@ -115,6 +127,7 @@ class ExperimentConfig:
     implementation_profile: Optional[str] = None
     implementation_fidelity: Optional[str] = None
     suite_profile: str = "common_budget_robustness"
+    run_purpose: str = "diagnostic"
     # Input-only compatibility shim.  ``reference`` is accepted only so old
     # commands fail with a precise migration message instead of being silently
     # promoted to a paper reference.
@@ -137,6 +150,7 @@ class ExperimentConfig:
     initialize_from_checkpoint: Optional[str] = None
     resume_run: Optional[str] = None
     attack_checkpoint: Optional[str] = None
+    attack_checkpoint_sha256: Optional[str] = None
     comparison_name: Optional[str] = None
     device: str = "auto"
     cuda_device: int = 0
@@ -180,7 +194,11 @@ class ExperimentConfig:
     action_execution_profile: str = "clip_to_action_space"
     policy_extraction: Optional[str] = None
     task_profile: Optional[str] = None
-    adversarial_attack_profile: str = "experimental_sign_pgd"
+    adversarial_attack_profile: Optional[str] = None
+    allow_experimental_adversarial_attack: bool = False
+    online_corruption_scale_profile: Optional[str] = None
+    offline_adversarial_reward_rule: Optional[str] = None
+    online_adversarial_reward_rule: Optional[str] = None
 
     # IQL / RIQL / PEX / RPEX
     expectile: float = 0.7
@@ -221,6 +239,8 @@ class ExperimentConfig:
     wsrl_layer_norm: Optional[bool] = None
     wsrl_utd_ratio: Optional[int] = None
     wsrl_per_critic_batch_size: int = 256
+    wsrl_entropy_profile: str = "official_negative_action_dim"
+    target_entropy: Optional[float] = None
 
     # Off2OnRL balanced replay. ``uniform`` is an explicit ablation.
     pqe_replay_mode: str = "balanced_density"
@@ -270,6 +290,7 @@ class ExperimentConfig:
         if self.algorithm_profile is not None:
             self.algorithm_profile = self.algorithm_profile.lower()
         self.suite_profile = self.suite_profile.lower()
+        self.run_purpose = self.run_purpose.lower()
         self.state_normalization = self.state_normalization.lower()
         self.action_distribution = self.action_distribution.lower()
         self.evaluation_mode = (
@@ -287,9 +308,29 @@ class ExperimentConfig:
             self.policy_extraction.lower() if self.policy_extraction else None
         )
         self.task_profile = self.task_profile.lower() if self.task_profile else None
-        self.adversarial_attack_profile = self.adversarial_attack_profile.lower()
+        self.adversarial_attack_profile = (
+            self.adversarial_attack_profile.lower()
+            if self.adversarial_attack_profile is not None
+            else "rpex_official_adam"
+        )
         if self.adversarial_attack_profile == "official_adam":
             self.adversarial_attack_profile = "rpex_official_adam"
+        self.online_corruption_scale_profile = (
+            self.online_corruption_scale_profile.lower()
+            if self.online_corruption_scale_profile is not None
+            else None
+        )
+        self.offline_adversarial_reward_rule = (
+            self.offline_adversarial_reward_rule.lower()
+            if self.offline_adversarial_reward_rule is not None
+            else None
+        )
+        self.online_adversarial_reward_rule = (
+            self.online_adversarial_reward_rule.lower()
+            if self.online_adversarial_reward_rule is not None
+            else None
+        )
+        self.wsrl_entropy_profile = self.wsrl_entropy_profile.lower()
         self.mc_return_source = self.mc_return_source.lower()
         self.calibration_mask_mode = self.calibration_mask_mode.lower()
         self.pqe_replay_mode = self.pqe_replay_mode.lower()
@@ -304,12 +345,41 @@ class ExperimentConfig:
 
         self._resolve_role_seeds()
         self._resolve_implementation_profile()
+        if self.online_corruption_scale_profile is None:
+            self.online_corruption_scale_profile = (
+                "rpex_official_code"
+                if self.implementation_profile == "official_code_reference"
+                else "dataset_std_scaled_extension"
+            )
+        if self.offline_adversarial_reward_rule is None:
+            self.offline_adversarial_reward_rule = "official_sign_flip"
+        if self.online_adversarial_reward_rule is None:
+            self.online_adversarial_reward_rule = (
+                "official_uniform_replacement"
+                if self.adversarial_attack_profile == "rpex_official_adam"
+                else "experimental_scaled_sign_flip"
+            )
         self._resolve_algorithm_profile()
         if self.online_attack_step_size is None:
             self.online_attack_step_size = (
                 0.1
                 if self.adversarial_attack_profile == "rpex_official_adam"
                 else self.attack_step_size
+            )
+        if (
+            self.corruption == "adversarial"
+            and self.corruption_target != "rewards"
+            and self.adversarial_attack_profile == "rpex_official_adam"
+            and (
+                self.offline_attack_steps != 100
+                or self.online_attack_steps != 2
+                or not math.isclose(self.attack_step_size, 0.01)
+                or not math.isclose(self.online_attack_step_size, 0.1)
+            )
+        ):
+            raise ValueError(
+                "rpex_official_adam requires the pinned upstream schedule: "
+                "offline=100x0.01 and online=2x0.1"
             )
         if self.evaluation_mode is None:
             self.evaluation_mode = (
@@ -349,6 +419,8 @@ class ExperimentConfig:
             raise ValueError(f"Unknown implementation_fidelity {self.implementation_fidelity!r}")
         if self.suite_profile not in SUITE_PROFILES:
             raise ValueError(f"Unknown suite_profile {self.suite_profile!r}")
+        if self.run_purpose not in RUN_PURPOSES:
+            raise ValueError(f"Unknown run_purpose {self.run_purpose!r}")
         for value, choices, label in (
             (self.online_replay_profile, ONLINE_REPLAY_PROFILES, "online_replay_profile"),
             (self.evaluation_policy_profile, EVALUATION_POLICY_PROFILES, "evaluation_policy_profile"),
@@ -359,9 +431,53 @@ class ExperimentConfig:
             (self.policy_extraction, POLICY_EXTRACTIONS, "policy_extraction"),
             (self.task_profile, TASK_PROFILES, "task_profile"),
             (self.adversarial_attack_profile, ADVERSARIAL_ATTACK_PROFILES, "adversarial_attack_profile"),
+            (
+                self.online_corruption_scale_profile,
+                ONLINE_CORRUPTION_SCALE_PROFILES,
+                "online_corruption_scale_profile",
+            ),
+            (self.wsrl_entropy_profile, WSRL_ENTROPY_PROFILES, "wsrl_entropy_profile"),
+            (
+                self.offline_adversarial_reward_rule,
+                OFFLINE_ADVERSARIAL_REWARD_RULES,
+                "offline_adversarial_reward_rule",
+            ),
+            (
+                self.online_adversarial_reward_rule,
+                ONLINE_ADVERSARIAL_REWARD_RULES,
+                "online_adversarial_reward_rule",
+            ),
         ):
             if value not in choices:
                 raise ValueError(f"Unknown {label} {value!r}; choose from {choices}")
+        if (
+            self.corruption == "adversarial"
+            and self.adversarial_attack_profile == "experimental_sign_pgd"
+            and not self.allow_experimental_adversarial_attack
+        ):
+            raise ValueError(
+                "experimental_sign_pgd requires both an explicit "
+                "--adversarial-attack-profile experimental_sign_pgd and "
+                "--allow-experimental-adversarial-attack"
+            )
+        if (
+            self.adversarial_attack_profile == "rpex_official_adam"
+            and self.online_adversarial_reward_rule
+            != "official_uniform_replacement"
+        ):
+            raise ValueError(
+                "rpex_official_adam requires official_uniform_replacement for "
+                "online adversarial rewards"
+            )
+        if (
+            self.implementation_profile == "official_code_reference"
+            and self.corruption_target in ("observations", "actions", "dynamics", "mixed")
+            and self.online_corruption_scale_profile != "rpex_official_code"
+        ):
+            raise ValueError(
+                "official_code_reference requires "
+                "online_corruption_scale_profile=rpex_official_code"
+            )
         if self.calibration_mask_mode not in CALIBRATION_MASK_MODES:
             raise ValueError(
                 "calibration_mask_mode must be all, oracle_exclude_corrupted, "
@@ -500,6 +616,14 @@ class ExperimentConfig:
                 setattr(self, name, int((self.seed + offset) % modulus))
 
     def _resolve_implementation_profile(self) -> None:
+        primary_suite = self.suite_profile in (
+            "method_fidelity",
+            "primary_research_benchmark",
+        )
+        common_budget_suite = self.suite_profile in (
+            "common_budget_robustness",
+            "common_budget_diagnostic",
+        )
         if self.algorithm_profile == "reference":
             raise ValueError(
                 "The generic algorithm_profile='reference' was removed because it "
@@ -518,29 +642,35 @@ class ExperimentConfig:
         if self.implementation_profile is None:
             self.implementation_profile = self.algorithm_profile
 
-        if self.suite_profile == "method_fidelity":
+        if primary_suite:
             if self.algorithm == "pessimistic_q_ensemble":
                 raise ValueError(
-                    "method_fidelity is unavailable for Pessimistic Q-Ensemble: "
+                    "primary research fidelity is unavailable for Pessimistic Q-Ensemble: "
                     "the local implementation is pqe_shared_actor_approx, not the "
                     "official N=5 independently pretrained ensemble"
                 )
-            if self.algorithm == "cal_ql":
+            if self.algorithm == "cal_ql" and self.suite_profile == "method_fidelity":
                 raise ValueError(
                     "method_fidelity is unavailable for Cal-QL on D4RL locomotion: "
                     "the official Cal-QL repository supports AntMaze/Adroit; select "
                     "locomotion_port or common_budget_robustness and report task_port"
                 )
-            expected = "official_code_reference"
+            expected = (
+                "locomotion_port"
+                if self.algorithm == "cal_ql"
+                else "official_code_reference"
+            )
             if self.implementation_profile is None:
                 self.implementation_profile = expected
-            if self.implementation_profile not in (
-                "official_code_reference",
-                "paper_reference",
-            ):
+            allowed_profiles = (
+                ("locomotion_port",)
+                if self.algorithm == "cal_ql"
+                else ("official_code_reference", "paper_reference")
+            )
+            if self.implementation_profile not in allowed_profiles:
                 raise ValueError(
-                    "method_fidelity requires official_code_reference or "
-                    "paper_reference"
+                    "primary research suite requires a method-specific official "
+                    "profile (Cal-QL locomotion uses locomotion_port)"
                 )
             if self.algorithm in ("rpex", "riql_naive", "riql_pex"):
                 self.offline_steps = 2_000_001
@@ -562,12 +692,18 @@ class ExperimentConfig:
             "legacy_current": "legacy_unknown",
             "experimental_approximation": "approximation",
         }[self.implementation_profile]
-        if (
-            self.suite_profile == "common_budget_robustness"
-            and fidelity not in ("approximation", "legacy_unknown")
-        ):
+        if common_budget_suite and fidelity not in ("approximation", "legacy_unknown"):
             fidelity = "task_port"
         if self.algorithm == "cal_ql" and fidelity == "exact_upstream_port":
+            fidelity = "task_port"
+        riql_extension = (
+            self.algorithm in ("rpex", "riql_naive", "riql_pex")
+            and (
+                self.corruption not in ("random", "adversarial")
+                or self.corruption_target not in INDIVIDUAL_CORRUPTION_TARGETS
+            )
+        )
+        if riql_extension and self.suite_profile == "primary_research_benchmark":
             fidelity = "task_port"
         if self.implementation_fidelity not in (None, fidelity):
             raise ValueError(
@@ -619,7 +755,10 @@ class ExperimentConfig:
                 self.env_name,
                 self.corruption,
                 self.corruption_target,
-                allow_extension=self.suite_profile == "common_budget_robustness",
+                allow_extension=(
+                    common_budget_suite
+                    or self.suite_profile == "primary_research_benchmark"
+                ),
             )
             self.riql_config_row = row_key
             self.riql_config_extension = row.extension
@@ -628,7 +767,7 @@ class ExperimentConfig:
             self.num_critics = row.num_critics
             self.inv_temperature = row.inverse_temperature
             self.kappa = row.kappa
-            if self.suite_profile == "method_fidelity":
+            if primary_suite:
                 self.updates_per_step = row.utd_ratio
                 self.actor_learning_rate = row.actor_lr
                 self.critic_learning_rate = row.critic_lr
@@ -689,6 +828,21 @@ class ExperimentConfig:
                 self.wsrl_layer_norm = reference
             if self.wsrl_utd_ratio is None:
                 self.wsrl_utd_ratio = 4 if reference else self.updates_per_step
+            action_dim = ACTION_DIMS[self.env_name.split("-", 1)[0]]
+            resolved_target_entropy = (
+                -float(action_dim)
+                if self.wsrl_entropy_profile
+                == "official_negative_action_dim"
+                else 0.0
+            )
+            if self.target_entropy is not None and not math.isclose(
+                float(self.target_entropy), resolved_target_entropy
+            ):
+                raise ValueError(
+                    "target_entropy is resolved by wsrl_entropy_profile; "
+                    f"expected {resolved_target_entropy}"
+                )
+            self.target_entropy = resolved_target_entropy
         else:
             self.wsrl_num_critics = self.sac_num_critics
             if self.wsrl_target_critic_subsample_size is None:
@@ -697,6 +851,10 @@ class ExperimentConfig:
                 self.wsrl_layer_norm = False
             if self.wsrl_utd_ratio is None:
                 self.wsrl_utd_ratio = self.updates_per_step
+            if self.target_entropy is None:
+                self.target_entropy = -float(
+                    ACTION_DIMS[self.env_name.split("-", 1)[0]]
+                )
         if self.algorithm not in ("rpex", "riql_pex"):
             self.evaluation_policy_profile = "deterministic_diagnostic"
         if self.algorithm in ("pex", "cal_ql"):
@@ -788,12 +946,14 @@ class ExperimentConfig:
             self.wsrl_utd_ratio if self.algorithm == "wsrl" else self.updates_per_step
         )
         result["not_paper_reproduction"] = (
-            self.suite_profile == "common_budget_robustness"
+            self.suite_profile
+            in ("common_budget_robustness", "common_budget_diagnostic")
             or self.implementation_fidelity in ("task_port", "approximation")
         )
         result["paper_reproduction_eligible"] = (
             self.implementation_fidelity == "exact_upstream_port"
-            and self.suite_profile == "method_fidelity"
+            and self.suite_profile
+            in ("method_fidelity", "primary_research_benchmark")
         )
         result["oracle_information"] = (
             self.calibration_mask_mode == "oracle_exclude_corrupted"
@@ -811,6 +971,13 @@ class ExperimentConfig:
                     "offline_stage_label": "CQL-REDQ pretrainer for WSRL",
                     "parameters_frozen_during_warmup": True,
                     "offline_data_retained_online": False,
+                    "target_entropy": self.target_entropy,
+                    "temperature_parameterization": (
+                        "softplus_lagrange"
+                        if self.wsrl_entropy_profile
+                        == "official_negative_action_dim"
+                        else "legacy_exponential_log_alpha"
+                    ),
                     "wsrl_total_sampled_batch_size": self.wsrl_utd_ratio
                     * self.wsrl_per_critic_batch_size,
                 }
@@ -849,6 +1016,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=SUITE_PROFILES,
         default="common_budget_robustness",
     )
+    parser.add_argument("--run-purpose", choices=RUN_PURPOSES, default="diagnostic")
     parser.add_argument(
         "--protocol",
         choices=PROTOCOLS,
@@ -885,6 +1053,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="resume an interrupted run from its full run-state checkpoint",
     )
     parser.add_argument("--attack-checkpoint")
+    parser.add_argument(
+        "--attack-checkpoint-sha256",
+        help="required expected SHA256 for a custom official attacker checkpoint",
+    )
     parser.add_argument(
         "--comparison-name",
         help="comparison group ID; generated automatically for a standalone run",
@@ -984,7 +1156,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task-profile", choices=TASK_PROFILES)
     parser.add_argument(
         "--adversarial-attack-profile", choices=ADVERSARIAL_ATTACK_PROFILES,
-        default="experimental_sign_pgd",
+    )
+    parser.add_argument(
+        "--allow-experimental-adversarial-attack", action="store_true"
+    )
+    parser.add_argument(
+        "--online-corruption-scale-profile",
+        choices=ONLINE_CORRUPTION_SCALE_PROFILES,
+    )
+    parser.add_argument(
+        "--offline-adversarial-reward-rule",
+        choices=OFFLINE_ADVERSARIAL_REWARD_RULES,
+    )
+    parser.add_argument(
+        "--online-adversarial-reward-rule",
+        choices=ONLINE_ADVERSARIAL_REWARD_RULES,
     )
 
     parser.add_argument("--expectile", type=float, default=0.7)
@@ -1021,6 +1207,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wsrl-layer-norm", action=argparse.BooleanOptionalAction)
     parser.add_argument("--wsrl-utd-ratio", type=int)
     parser.add_argument("--wsrl-per-critic-batch-size", type=int, default=256)
+    parser.add_argument(
+        "--wsrl-entropy-profile",
+        choices=WSRL_ENTROPY_PROFILES,
+        default="official_negative_action_dim",
+    )
+    parser.add_argument("--target-entropy", type=float)
     parser.add_argument(
         "--mc-return-source",
         choices=("post_corruption", "legacy_pre_corruption"),
@@ -1100,3 +1292,20 @@ def default_attack_checkpoint(env_name: str) -> Optional[Path]:
         / "2999.pt"
     )
     return candidate if candidate.exists() else None
+
+
+DEFAULT_ATTACK_CHECKPOINT_SHA256 = {
+    "halfcheetah-medium-replay-v2": (
+        "7334ff2b658e95423ca520e258a15ebb6d32ac044cbb3bde27b352bb41e59beb"
+    ),
+    "hopper-medium-replay-v2": (
+        "f5c558003cfd3814c4ea6cff4ce5319b61a8e3dc9013cf208c29e37e368680bd"
+    ),
+    "walker2d-medium-replay-v2": (
+        "8028210fde88f2950115613b37df991358f6cb322f6ba06911662c99cd6d5852"
+    ),
+}
+
+
+def default_attack_checkpoint_sha256(env_name: str) -> Optional[str]:
+    return DEFAULT_ATTACK_CHECKPOINT_SHA256.get(env_name)

@@ -3,7 +3,14 @@ from __future__ import annotations
 import unittest
 
 from robust_o2o.config import DEFAULT_PROTOCOL
-from run_55_experiment import ALGORITHMS, ENV_NAME, SETTINGS, build_parser, commands
+from run_55_experiment import (
+    ALGORITHMS,
+    ENV_NAME,
+    SETTINGS,
+    _validate_args,
+    build_parser,
+    commands,
+)
 
 
 class Run55ExperimentTest(unittest.TestCase):
@@ -54,6 +61,35 @@ class Run55ExperimentTest(unittest.TestCase):
                 command[command.index("--env-name") + 1],
                 "halfcheetah-medium-replay-v2",
             )
+
+    def test_primary_suite_excludes_pqe_and_final_requires_five_seeds(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--suite-profile",
+                "primary_research_benchmark",
+                "--seeds",
+                "0,1,2,3,4",
+                "--run-purpose",
+                "final_benchmark",
+            ]
+        )
+        _validate_args(parser, args, ())
+        generated = list(commands(args, (), "primary_suite"))
+        for command in generated:
+            algorithms = command[command.index("--algorithms") + 1].split(",")
+            self.assertNotIn("pessimistic_q_ensemble", algorithms)
+            self.assertEqual(len(algorithms), 4)
+            self.assertEqual(
+                command[command.index("--online-corruption-scale-profile") + 1],
+                "rpex_official_code",
+            )
+
+        invalid = parser.parse_args(
+            ["--run-purpose", "final_benchmark", "--seeds", "0"]
+        )
+        with self.assertRaises(SystemExit):
+            _validate_args(parser, invalid, ())
 
 
 if __name__ == "__main__":

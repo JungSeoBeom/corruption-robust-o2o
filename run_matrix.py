@@ -18,7 +18,12 @@ from robust_o2o.config import (
     LEGACY_LOCAL_PROTOCOL_ALIAS,
     PROTOCOLS,
 )
-from robust_o2o.fidelity import IMPLEMENTATION_PROFILES, SUITE_PROFILES
+from robust_o2o.fidelity import (
+    IMPLEMENTATION_PROFILES,
+    ONLINE_CORRUPTION_SCALE_PROFILES,
+    RUN_PURPOSES,
+    SUITE_PROFILES,
+)
 
 
 def _csv(value: str):
@@ -46,12 +51,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=["observations", "actions", "rewards", "dynamics"],
     )
     parser.add_argument("--seeds", type=_csv, default=["0"])
+    parser.add_argument("--corruption-ranges", type=_csv, default=["1.0"])
     parser.add_argument("--stage", choices=("offline", "online", "both"), default="both")
     parser.add_argument("--protocol", choices=PROTOCOLS, default=DEFAULT_PROTOCOL)
     parser.add_argument("--implementation-profile", choices=IMPLEMENTATION_PROFILES)
     parser.add_argument(
         "--suite-profile", choices=SUITE_PROFILES,
         default="common_budget_robustness",
+    )
+    parser.add_argument("--run-purpose", choices=RUN_PURPOSES, default="diagnostic")
+    parser.add_argument(
+        "--online-corruption-scale-profile",
+        choices=ONLINE_CORRUPTION_SCALE_PROFILES,
     )
     parser.add_argument("--allow-diagnostic-protocol", action="store_true")
     parser.add_argument("--output-dir", default="results")
@@ -67,11 +78,17 @@ def commands(
     comparison_name: str,
 ):
     script = Path(__file__).resolve().parent / "run_experiment.py"
+    scale_profile = args.online_corruption_scale_profile or (
+        "rpex_official_code"
+        if args.suite_profile in ("method_fidelity", "primary_research_benchmark")
+        else "dataset_std_scaled_extension"
+    )
     for algorithm, env_name, corruption, seed in itertools.product(
         args.algorithms, args.envs, args.corruptions, args.seeds
     ):
         targets = ["none"] if corruption == "clean" else args.targets
-        for target in targets:
+        ranges = ["1.0"] if corruption == "clean" else args.corruption_ranges
+        for target, corruption_range in itertools.product(targets, ranges):
             command = [
                 sys.executable,
                 str(script),
@@ -91,6 +108,12 @@ def commands(
                 args.protocol,
                 "--suite-profile",
                 args.suite_profile,
+                "--run-purpose",
+                args.run_purpose,
+                "--online-corruption-scale-profile",
+                scale_profile,
+                "--corruption-range",
+                corruption_range,
                 "--output-dir",
                 args.output_dir,
                 "--comparison-name",
@@ -112,6 +135,24 @@ def main() -> int:
         parser.error(
             "the local Gymnasium protocol is diagnostic-only; pass "
             "--allow-diagnostic-protocol to acknowledge this"
+        )
+    for value in args.corruption_ranges:
+        try:
+            parsed = float(value)
+        except ValueError:
+            parser.error(f"invalid corruption range: {value!r}")
+        if parsed < 0.0:
+            parser.error("--corruption-ranges cannot contain negative values")
+    if args.run_purpose == "final_benchmark":
+        required = {"0", "1", "2", "3", "4"}
+        if not required.issubset(set(args.seeds)):
+            parser.error("final_benchmark requires at least seeds 0,1,2,3,4")
+    if (
+        args.suite_profile == "primary_research_benchmark"
+        and "pessimistic_q_ensemble" in args.algorithms
+    ):
+        parser.error(
+            "primary_research_benchmark excludes pqe_shared_actor_approx"
         )
     comparison_name = args.comparison_name
     if not comparison_name:

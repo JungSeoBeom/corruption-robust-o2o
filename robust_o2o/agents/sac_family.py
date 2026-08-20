@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import math
 from typing import Dict
 
 import torch
@@ -82,7 +83,15 @@ class SACEnsembleAgent(BaseAgent):
             if self.variant == "pessimistic_q_ensemble"
             else None
         )
-        self.log_alpha = torch.nn.Parameter(torch.zeros(1))
+        alpha_parameter_init = (
+            math.log(math.expm1(1.0))
+            if self.variant == "wsrl"
+            and config.wsrl_entropy_profile == "official_negative_action_dim"
+            else 0.0
+        )
+        self.log_alpha = torch.nn.Parameter(
+            torch.full((1,), alpha_parameter_init)
+        )
         self.ro2o_uncertainty = config.ro2o_uncertainty
         self.last_priority_values: torch.Tensor | None = None
         self.to(device)
@@ -108,7 +117,27 @@ class SACEnsembleAgent(BaseAgent):
 
     @property
     def alpha(self) -> torch.Tensor:
+        if (
+            self.variant == "wsrl"
+            and self.config.wsrl_entropy_profile
+            == "official_negative_action_dim"
+        ):
+            # zhouzypaul/wsrl uses a softplus-parameterized Geq multiplier.
+            return F.softplus(self.log_alpha)
         return self.log_alpha.exp()
+
+    def _temperature_loss(self, log_prob: torch.Tensor) -> torch.Tensor:
+        target_entropy = float(self.config.target_entropy)
+        if (
+            self.variant == "wsrl"
+            and self.config.wsrl_entropy_profile
+            == "official_negative_action_dim"
+        ):
+            entropy = -log_prob.detach().mean()
+            return self.alpha * (entropy - target_entropy)
+        return -(
+            self.log_alpha * (log_prob + target_entropy).detach()
+        ).mean()
 
     def select_action(
         self,
@@ -385,12 +414,18 @@ class SACEnsembleAgent(BaseAgent):
         sampled_actions, log_prob, _, policy_std = self.actor(
             states, need_log_prob=True
         )
-        target_entropy = (
-            0.0 if self.variant == "wsrl" else float(-self.actor.action_dim)
-        )
-        alpha_loss = -(
-            self.log_alpha * (log_prob + target_entropy).detach()
-        ).mean()
+        temperature_log_prob = log_prob
+        if (
+            update_actor_temperature
+            and self.variant == "wsrl"
+            and self.config.wsrl_entropy_profile
+            == "official_negative_action_dim"
+        ):
+            # Upstream SACAgent.temperature_loss_fn samples from next observations.
+            _, temperature_log_prob, _, _ = self.actor(
+                next_states, need_log_prob=True
+            )
+        alpha_loss = self._temperature_loss(temperature_log_prob)
         if update_actor_temperature:
             self.alpha_optimizer.zero_grad(set_to_none=True)
             alpha_loss.backward()

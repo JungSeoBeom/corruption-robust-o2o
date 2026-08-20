@@ -17,13 +17,14 @@ from .config import (
     INDIVIDUAL_CORRUPTION_TARGETS,
     ExperimentConfig,
     default_attack_checkpoint,
+    default_attack_checkpoint_sha256,
 )
 from .device import clear_accelerator_cache
 from .environment import Dataset
 from .networks import VectorizedLinear
 
 
-ATTACK_IMPLEMENTATION_VERSION = "corruption_v4_profiled_rng_timing_atomic_cache"
+ATTACK_IMPLEMENTATION_VERSION = "corruption_v5_profiled_scale_reward_sha_audit"
 ATTACK_OBJECTIVE = "minimize_edac_ensemble_mean_q"
 
 
@@ -91,7 +92,9 @@ class AttackOracle:
         self.device = device
         self.checkpoint = checkpoint.resolve()
         self.implementation_profile = implementation_profile
-        self.generator = torch.Generator(device="cpu")
+        generator_device = device if device.type in ("cpu", "cuda") else torch.device("cpu")
+        self.generator_device = generator_device
+        self.generator = torch.Generator(device=generator_device)
         self.generator.manual_seed(int(seed))
         self.actor = EDACActor(state_dim, action_dim, max_action).to(device).eval()
         self.critic = EDACCritic(state_dim, action_dim).to(device).eval()
@@ -120,7 +123,11 @@ class AttackOracle:
         )
         actions_tensor = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
         std_tensor = torch.as_tensor(std, dtype=torch.float32, device=self.device)
-        initial = torch.empty(original_tensor.shape, dtype=torch.float32, device="cpu")
+        initial = torch.empty(
+            original_tensor.shape,
+            dtype=torch.float32,
+            device=self.generator_device,
+        )
         initial.uniform_(-scale, scale, generator=self.generator)
         if self.implementation_profile == "rpex_official_adam":
             # Upstream Attack.sample_para includes std here and optimize_para
@@ -174,13 +181,38 @@ class AttackOracle:
 
 def resolve_attack_checkpoint(config: ExperimentConfig) -> Path:
     if config.attack_checkpoint:
-        return Path(config.attack_checkpoint).expanduser().resolve()
-    candidate = default_attack_checkpoint(config.env_name)
+        candidate = Path(config.attack_checkpoint).expanduser().resolve()
+        expected_sha256 = config.attack_checkpoint_sha256
+        if (
+            config.adversarial_attack_profile == "rpex_official_adam"
+            and not expected_sha256
+        ):
+            raise ValueError(
+                "A custom official attacker checkpoint requires "
+                "--attack-checkpoint-sha256; unverified weights cannot be used "
+                "for a research reference run"
+            )
+    else:
+        candidate = default_attack_checkpoint(config.env_name)
+        expected_sha256 = default_attack_checkpoint_sha256(config.env_name)
     if candidate is None:
         raise FileNotFoundError(
             "Adversarial corruption needs an EDAC checkpoint. Pass "
             "--attack-checkpoint. The supplied checkpoints cover the three "
             "*-medium-replay-v2 environments."
+        )
+    if not candidate.exists():
+        raise FileNotFoundError(f"Adversarial attack checkpoint not found: {candidate}")
+    actual_sha256 = _sha256_file(candidate)
+    if expected_sha256 is None:
+        if config.adversarial_attack_profile == "rpex_official_adam":
+            raise ValueError(
+                "No pinned SHA256 is available for the official attacker checkpoint"
+            )
+    elif actual_sha256.lower() != expected_sha256.lower():
+        raise ValueError(
+            "Attacker checkpoint SHA256 mismatch: "
+            f"expected={expected_sha256.lower()} actual={actual_sha256.lower()}"
         )
     return candidate
 
@@ -282,6 +314,9 @@ def corruption_cache_fingerprint(
         "mixed_ratios": list(config.mixed_ratios),
         "attack_implementation_version": ATTACK_IMPLEMENTATION_VERSION,
         "attack_implementation_profile": config.adversarial_attack_profile,
+        "online_corruption_scale_profile": config.online_corruption_scale_profile,
+        "offline_adversarial_reward_rule": config.offline_adversarial_reward_rule,
+        "online_adversarial_reward_rule": config.online_adversarial_reward_rule,
         "attack_objective": ATTACK_OBJECTIVE,
         "attack_optimizer": (
             "adam_reinitialized_each_step"
@@ -321,6 +356,148 @@ def _target_dataset_key(target: str) -> str:
     }[target]
 
 
+def reward_corruption_metadata(
+    config: ExperimentConfig, phase: str
+) -> Dict[str, Any]:
+    if config.corruption == "clean":
+        return {
+            "reward_corruption_distribution": "none",
+            "reward_corruption_low": None,
+            "reward_corruption_high": None,
+        }
+    if config.corruption_target not in ("rewards", "mixed"):
+        return {
+            "reward_corruption_distribution": "not_applicable",
+            "reward_corruption_low": None,
+            "reward_corruption_high": None,
+        }
+    if config.corruption == "random":
+        bound = 30.0 * config.corruption_range
+        return {
+            "reward_corruption_distribution": "uniform_replacement",
+            "reward_corruption_low": -bound,
+            "reward_corruption_high": bound,
+        }
+    if phase == "offline":
+        return {
+            "reward_corruption_distribution": config.offline_adversarial_reward_rule,
+            "reward_corruption_low": None,
+            "reward_corruption_high": None,
+        }
+    if config.online_adversarial_reward_rule == "official_uniform_replacement":
+        return {
+            "reward_corruption_distribution": "uniform_replacement",
+            "reward_corruption_low": -1.0,
+            "reward_corruption_high": 1.0,
+        }
+    return {
+        "reward_corruption_distribution": "experimental_scaled_sign_flip",
+        "reward_corruption_low": None,
+        "reward_corruption_high": None,
+    }
+
+
+def corrupt_offline_reward_values(
+    original: np.ndarray,
+    config: ExperimentConfig,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if config.corruption == "random":
+        return (
+            rng.uniform(-1.0, 1.0, size=original.shape).astype(np.float32)
+            * 30.0
+            * config.corruption_range
+        )
+    if config.offline_adversarial_reward_rule != "official_sign_flip":
+        raise ValueError(
+            "Unsupported offline adversarial reward rule: "
+            f"{config.offline_adversarial_reward_rule}"
+        )
+    return (-config.corruption_range * original).astype(np.float32)
+
+
+def corrupt_online_reward_value(
+    reward: float,
+    config: ExperimentConfig,
+    rng: np.random.Generator,
+) -> float:
+    if config.corruption == "random":
+        return float(rng.uniform(-1.0, 1.0) * 30.0 * config.corruption_range)
+    if config.online_adversarial_reward_rule == "official_uniform_replacement":
+        # felix-thu/RPEX attack.py::corrupt_trans online adversarial branch.
+        return float(rng.uniform(-1.0, 1.0))
+    if config.online_adversarial_reward_rule == "experimental_scaled_sign_flip":
+        return float(-config.corruption_range * reward)
+    raise ValueError(
+        "Unsupported online adversarial reward rule: "
+        f"{config.online_adversarial_reward_rule}"
+    )
+
+
+class OnlineCorruptionAudit:
+    """Small, resume-safe hash chain for selected online poison events."""
+
+    def __init__(self, state: Optional[Dict[str, Any]] = None):
+        state = state or {}
+        self.selected_transition_count = int(
+            state.get("selected_transition_count", 0)
+        )
+        self._selected_digest = bytes.fromhex(
+            state.get("selected_transition_hash", hashlib.sha256(b"").hexdigest())
+        )
+        self._value_digest = bytes.fromhex(
+            state.get("corruption_value_hash", hashlib.sha256(b"").hexdigest())
+        )
+
+    def update(
+        self,
+        step: int,
+        target: str,
+        state: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_state: np.ndarray,
+    ) -> None:
+        identity = np.asarray([step], dtype=np.int64).tobytes() + target.encode("utf-8")
+        self._selected_digest = hashlib.sha256(
+            self._selected_digest + identity
+        ).digest()
+        value_bytes = b"".join(
+            (
+                np.ascontiguousarray(state, dtype=np.float32).tobytes(),
+                np.ascontiguousarray(action, dtype=np.float32).tobytes(),
+                np.asarray([reward], dtype=np.float32).tobytes(),
+                np.ascontiguousarray(next_state, dtype=np.float32).tobytes(),
+            )
+        )
+        self._value_digest = hashlib.sha256(
+            self._value_digest + identity + value_bytes
+        ).digest()
+        self.selected_transition_count += 1
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "selected_transition_count": self.selected_transition_count,
+            "selected_transition_hash": self._selected_digest.hex(),
+            "corruption_value_hash": self._value_digest.hex(),
+        }
+
+    def metadata(self, config: ExperimentConfig) -> Dict[str, Any]:
+        return {
+            **self.state_dict(),
+            "corruption_mode": config.corruption,
+            "corruption_target": config.corruption_target,
+            "offline_corruption_rate": config.offline_corruption_rate,
+            "online_corruption_rate": config.online_corruption_rate,
+            "corruption_range": config.corruption_range,
+            "corruption_seed": config.corruption_seed,
+            "attack_semantics": config.random_attack_semantics,
+            "attack_timing": config.attack_timing,
+            "online_corruption_scale_profile": config.online_corruption_scale_profile,
+            **reward_corruption_metadata(config, "online"),
+        }
+
+
 def _corruption_stats(
     dataset_size: int,
     target_indices: Dict[str, np.ndarray],
@@ -338,6 +515,8 @@ def _corruption_stats(
         "corruption_seed": config.corruption_seed,
         "corruption_rate": config.offline_corruption_rate,
         "corruption_range": config.corruption_range,
+        "online_corruption_scale_profile": config.online_corruption_scale_profile,
+        **reward_corruption_metadata(config, "offline"),
     }
     for target, ratio in zip(
         INDIVIDUAL_CORRUPTION_TARGETS, config.mixed_ratios
@@ -371,7 +550,7 @@ def _corruption_value_sha256(
         digest.update(indices.tobytes())
         digest.update(str(values.dtype).encode("ascii"))
         digest.update(str(values.shape).encode("ascii"))
-        digest.update(memoryview(values).cast("B"))
+        digest.update(values.tobytes())
     return digest.hexdigest()
 
 
@@ -597,6 +776,11 @@ def _atomic_write_cache(path: Path, payload: Dict[str, np.ndarray]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(checksum_tmp, checksum_path)
+        if _sha256_file(path) != checksum:
+            raise RuntimeError(f"Post-write corruption cache checksum failed: {path}")
+        with np.load(path, allow_pickle=False) as validation:
+            if "format_version" not in validation or "cache_key" not in validation:
+                raise RuntimeError(f"Post-write corruption cache validation failed: {path}")
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -620,12 +804,7 @@ def _corrupt_target_values(
         return original
 
     if target == "rewards":
-        if config.corruption == "random":
-            return (
-                rng.uniform(-1.0, 1.0, size=original.shape).astype(np.float32)
-                * 30.0
-            )
-        return (-config.corruption_range * original).astype(np.float32)
+        return corrupt_offline_reward_values(original, config, rng)
 
     std = dataset[key].std(axis=0, keepdims=True).astype(np.float32)
     if config.corruption == "random":
@@ -682,6 +861,8 @@ def corrupt_offline_dataset(
             "corruption_seed": config.corruption_seed,
             "corruption_rate": config.offline_corruption_rate,
             "corruption_range": config.corruption_range,
+            "online_corruption_scale_profile": config.online_corruption_scale_profile,
+            **reward_corruption_metadata(config, "offline"),
             "selected_transition_indices_sha256": hashlib.sha256(b"").hexdigest(),
             "corruption_value_sha256": hashlib.sha256(b"").hexdigest(),
         }
@@ -792,10 +973,7 @@ def corrupt_online_transition(
     next_state = raw_next_state.copy()
     target = selected_target
     if target == "rewards":
-        if config.corruption == "random":
-            stored_reward = float(rng.uniform(-1.0, 1.0) * 30.0)
-        else:
-            stored_reward = float(-config.corruption_range * reward)
+        stored_reward = corrupt_online_reward_value(reward, config, rng)
         return state, stored_action, stored_reward, next_state, True
 
     original = {
@@ -803,7 +981,9 @@ def corrupt_online_transition(
         "actions": stored_action,
         "dynamics": next_state,
     }[target]
-    std = action_std if target == "actions" else state_std
+    std = online_corruption_scale(
+        target, config, state_std=state_std, action_std=action_std
+    )
     if config.corruption == "random":
         attacked = original + rng.uniform(
             -config.corruption_range,
@@ -847,6 +1027,27 @@ def sample_online_corruption_target(
     return config.corruption_target
 
 
+def online_corruption_scale(
+    target: str,
+    config: ExperimentConfig,
+    *,
+    state_std: np.ndarray,
+    action_std: np.ndarray,
+) -> np.ndarray:
+    if target == "actions":
+        return action_std
+    if target not in ("observations", "dynamics"):
+        raise ValueError(f"No vector scale is defined for target {target!r}")
+    if config.online_corruption_scale_profile == "rpex_official_code":
+        return np.ones_like(state_std, dtype=np.float32)
+    if config.online_corruption_scale_profile == "dataset_std_scaled_extension":
+        return state_std
+    raise ValueError(
+        "Unknown online corruption scale profile: "
+        f"{config.online_corruption_scale_profile}"
+    )
+
+
 def corrupt_pre_action_value(
     original: np.ndarray,
     target: str,
@@ -860,7 +1061,9 @@ def corrupt_pre_action_value(
 ) -> np.ndarray:
     if target not in ("observations", "actions"):
         return original.copy()
-    std = state_std if target == "observations" else action_std
+    std = online_corruption_scale(
+        target, config, state_std=state_std, action_std=action_std
+    )
     if config.corruption == "random":
         return (
             original

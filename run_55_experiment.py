@@ -20,7 +20,12 @@ from robust_o2o.config import (
     LOCAL_PROTOCOL,
     PROTOCOLS,
 )
-from robust_o2o.fidelity import IMPLEMENTATION_PROFILES, SUITE_PROFILES
+from robust_o2o.fidelity import (
+    IMPLEMENTATION_PROFILES,
+    ONLINE_CORRUPTION_SCALE_PROFILES,
+    RUN_PURPOSES,
+    SUITE_PROFILES,
+)
 
 
 ENV_NAME = "hopper-medium-replay-v2"
@@ -46,6 +51,8 @@ RESERVED_PASSTHROUGH_OPTIONS = {
     "--env-name",
     "--stage",
     "--suite-profile",
+    "--run-purpose",
+    "--online-corruption-scale-profile",
     "--implementation-profile",
     "--algorithm-profile",
 }
@@ -79,7 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--suite-profile", choices=SUITE_PROFILES,
-        default="common_budget_robustness",
+        default="common_budget_diagnostic",
+    )
+    parser.add_argument("--run-purpose", choices=RUN_PURPOSES, default="diagnostic")
+    parser.add_argument(
+        "--online-corruption-scale-profile",
+        choices=ONLINE_CORRUPTION_SCALE_PROFILES,
     )
     parser.add_argument("--allow-diagnostic-protocol", action="store_true")
     parser.add_argument("--output-root", default="results")
@@ -120,6 +132,19 @@ def _validate_args(
             "--suite-profile common_budget_robustness; no run will be mislabeled "
             "as paper reproduction."
         )
+    if args.run_purpose == "final_benchmark":
+        required = {"0", "1", "2", "3", "4"}
+        if not required.issubset(set(args.seeds)):
+            parser.error(
+                "final_benchmark requires at least seeds 0,1,2,3,4; "
+                "single-seed runs are smoke/diagnostic only"
+            )
+    if args.online_corruption_scale_profile is None:
+        args.online_corruption_scale_profile = (
+            "rpex_official_code"
+            if args.suite_profile == "primary_research_benchmark"
+            else "dataset_std_scaled_extension"
+        )
     if args.protocol in (LOCAL_PROTOCOL, "local_gymnasium_v4") and not args.allow_diagnostic_protocol:
         parser.error(
             "the local Gymnasium protocol is diagnostic-only; pass "
@@ -149,7 +174,17 @@ def commands(
     experiment_name: str,
 ) -> Iterable[list[str]]:
     runner = Path(__file__).resolve().parent / "run_all_algorithms.py"
-    algorithm_csv = ",".join(ALGORITHMS)
+    scale_profile = args.online_corruption_scale_profile or (
+        "rpex_official_code"
+        if args.suite_profile == "primary_research_benchmark"
+        else "dataset_std_scaled_extension"
+    )
+    selected_algorithms = (
+        tuple(algorithm for algorithm in ALGORITHMS if algorithm != "pessimistic_q_ensemble")
+        if args.suite_profile == "primary_research_benchmark"
+        else ALGORITHMS
+    )
+    algorithm_csv = ",".join(selected_algorithms)
     seed_csv = ",".join(args.seeds)
     for corruption, target in SETTINGS:
         command = [
@@ -171,6 +206,10 @@ def commands(
             args.protocol,
             "--suite-profile",
             args.suite_profile,
+            "--run-purpose",
+            args.run_purpose,
+            "--online-corruption-scale-profile",
+            scale_profile,
             "--output-root",
             args.output_root,
             "--comparison-name",
@@ -200,17 +239,34 @@ def main() -> int:
     _validate_args(parser, args, passthrough)
     experiment_name = args.experiment_name or _default_experiment_name(args.env_name)
     generated_commands = list(commands(args, passthrough, experiment_name))
-    total_runs = len(ALGORITHMS) * len(SETTINGS) * len(args.seeds)
+    selected_algorithms = (
+        tuple(algorithm for algorithm in ALGORITHMS if algorithm != "pessimistic_q_ensemble")
+        if args.suite_profile == "primary_research_benchmark"
+        else ALGORITHMS
+    )
+    total_runs = len(selected_algorithms) * len(SETTINGS) * len(args.seeds)
 
     print(f"EXPERIMENT_NAME: {experiment_name}", flush=True)
     print(f"ENVIRONMENT: {args.env_name}", flush=True)
-    print(f"ALGORITHMS: {', '.join(ALGORITHMS)}", flush=True)
+    print(f"ALGORITHMS: {', '.join(selected_algorithms)}", flush=True)
     print("SETTINGS: clean/none, random/{observations,actions,rewards,dynamics}", flush=True)
+    if args.suite_profile == "primary_research_benchmark":
+        print(
+            "SCHEDULE: method-specific upstream budgets; Cal-QL locomotion "
+            f"port uses offline={args.offline_steps:,}, online={args.online_steps:,}",
+            flush=True,
+        )
+    else:
+        print(
+            f"SCHEDULE: offline={args.offline_steps:,}, online={args.online_steps:,}",
+            flush=True,
+        )
+    print(f"SUITE_PROFILE: {args.suite_profile}", flush=True)
+    print(f"RUN_PURPOSE: {args.run_purpose}", flush=True)
     print(
-        f"SCHEDULE: offline={args.offline_steps:,}, online={args.online_steps:,}",
+        f"ONLINE_CORRUPTION_SCALE_PROFILE: {args.online_corruption_scale_profile}",
         flush=True,
     )
-    print(f"SUITE_PROFILE: {args.suite_profile}", flush=True)
     print(f"TOTAL_RUNS: {total_runs} ({len(args.seeds)} seed(s))", flush=True)
 
     failures = 0

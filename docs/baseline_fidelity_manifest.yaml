@@ -1,5 +1,5 @@
 schema_version: 1
-audit_date: "2026-08-20"
+audit_date: "2026-08-21"
 baselines:
   rpex_riql:
     paper_title: "RPEX: Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption"
@@ -23,7 +23,15 @@ baselines:
       - ALIGNIQL.policy_update
       - get_config
       - Attack.optimize_para
+      - Attack.corrupt_rew
+      - corrupt_trans
     supported_environments: "D4RL MuJoCo locomotion v2 datasets listed by upstream"
+    local_files:
+      - robust_o2o/agents/iql_family.py
+      - robust_o2o/networks.py
+      - robust_o2o/corruption.py
+      - robust_o2o/experiment.py
+    fidelity_status: port
     implementation_status: "official policy/loss/config-table port; explicit paper/code conflict profiles"
     known_paper_code_conflicts:
       - "official code fine-tunes from online replay only; paper describes offline/online replay mixing"
@@ -33,6 +41,13 @@ baselines:
       - "500k/500k is labelled common_budget_robustness, never paper reproduction"
       - "clean and mixed have no RIQL_TRAIN_CONFIG.py row and are explicit extensions or unsupported"
       - "The pinned public code has no mixed-corruption implementation/config; rpex_paper_mixed therefore fails instead of guessing"
+    remaining_differences:
+      - "PyTorch port rather than the upstream training framework"
+      - "Clean/mixed RIQL rows are explicit task extensions, not upstream rows"
+    attacker_checkpoints:
+      halfcheetah-medium-replay-v2: "sha256:7334ff2b658e95423ca520e258a15ebb6d32ac044cbb3bde27b352bb41e59beb"
+      hopper-medium-replay-v2: "sha256:f5c558003cfd3814c4ea6cff4ce5319b61a8e3dc9013cf208c29e37e368680bd"
+      walker2d-medium-replay-v2: "sha256:8028210fde88f2950115613b37df991358f6cb322f6ba06911662c99cd6d5852"
 
   wsrl:
     paper_title: "Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data"
@@ -51,15 +66,26 @@ baselines:
       - SACAgent.update_high_utd
       - SACAgent.critic_loss_fn
       - SACAgent.policy_loss_fn
+      - SACAgent.temperature_loss_fn
+      - SACAgent.create
       - CQLAgent._get_cql_q_diff
+      - LagrangeMultiplier.__call__
       - MLP.__call__
     supported_environments: "AntMaze, Adroit, Kitchen, and D4RL MuJoCo locomotion"
+    local_files:
+      - robust_o2o/agents/sac_family.py
+      - robust_o2o/networks.py
+      - robust_o2o/cql.py
+      - robust_o2o/experiment.py
+    fidelity_status: port
     implementation_status: "locomotion 2x256 LayerNorm, final-hidden scale 1e-2, REDQ-10/2, CQL subset, and high-UTD port"
     known_paper_code_conflicts: []
     local_divergences:
       - "PyTorch port; canonical metadata records upstream JAX/Flax commit"
       - "common-budget 500k pretraining is separated from upstream 250k recipe"
-      - "method profile preserves actor/critic/temperature LR 1e-4/3e-4/1e-4, target entropy 0, and backup_entropy=False"
+      - "method profile preserves actor/critic/temperature LR 1e-4/3e-4/1e-4, resolved target entropy -action_dim, softplus Geq temperature multiplier, and backup_entropy=False"
+    remaining_differences:
+      - "PyTorch port rather than upstream JAX/Flax"
 
   cal_ql:
     paper_title: "Cal-QL: Calibrated Offline RL Pre-Training for Efficient Online Fine-Tuning"
@@ -76,11 +102,18 @@ baselines:
       - ConservativeSAC._get_policy_actions
       - ConservativeSAC._get_tensor_values
     supported_environments: "Official release recipes: AntMaze and Adroit"
+    local_files:
+      - robust_o2o/agents/calql.py
+      - robust_o2o/cql.py
+      - robust_o2o/config.py
+    fidelity_status: port
     implementation_status: "D4RL locomotion task port"
     known_paper_code_conflicts: []
     local_divergences:
       - "Hopper/HalfCheetah/Walker2d are always labelled d4rl_locomotion_port/task_port"
       - "oracle_exclude_corrupted calibration is an oracle diagnostic and is not aggregated with all-data calibration"
+    remaining_differences:
+      - "D4RL locomotion is outside the official task recipes"
 
   pessimistic_q_ensemble:
     paper_title: "Offline-to-Online Reinforcement Learning via Balanced Replay and Pessimistic Q-Ensemble"
@@ -98,8 +131,15 @@ baselines:
       - TorchOurRLAlgorithm._train
       - PriorityReplayBuffer.random_batch
     supported_environments: "D4RL MuJoCo v0 recipes in the public release"
+    local_files:
+      - robust_o2o/agents/sac_family.py
+      - robust_o2o/replay.py
+    fidelity_status: approximation
     implementation_status: "pqe_shared_actor_approx only; method_fidelity fail-fast"
     known_paper_code_conflicts: []
     local_divergences:
       - "Current local actor/critic topology is not the upstream N=5 checkpoint-loaded policy ensemble"
       - "Results are experimental_approximation/approximation and cannot be named PQE reference"
+    remaining_differences:
+      - "No N=5 independently pretrained policy/twin-critic members"
+      - "No exact policy moment-matching port"
