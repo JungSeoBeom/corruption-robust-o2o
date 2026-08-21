@@ -8,6 +8,7 @@ from robust_o2o.fidelity import MAIN_BASELINES
 from run_55_experiment import (
     ADVERSARIAL_SETTINGS,
     ALGORITHMS,
+    CLEAN_SETTINGS,
     DIAGNOSTIC_RANDOM_SETTINGS,
     ENV_NAME,
     SETTINGS,
@@ -167,12 +168,30 @@ class Run55ExperimentTest(unittest.TestCase):
         parser = build_parser()
         adversarial = parser.parse_args(["--corruption-suite", "adversarial"])
         commands_only = list(commands(adversarial, (), "adv_suite"))
+        all_suite = parser.parse_args(["--corruption-suite", "all"])
+        all_commands = list(commands(all_suite, (), "all_suite"))
+        expected_all = (
+            *CLEAN_SETTINGS,
+            *ADVERSARIAL_SETTINGS,
+            *STRICT_RANDOM_SETTINGS,
+        )
         self.assertEqual(len(commands_only), 4)
         self.assertEqual(settings_for_suite("adversarial"), ADVERSARIAL_SETTINGS)
         self.assertEqual(
             settings_for_suite("random"), DIAGNOSTIC_RANDOM_SETTINGS
         )
-        self.assertEqual(len(settings_for_suite("all")), 9)
+        self.assertEqual(settings_for_suite("all"), expected_all)
+        self.assertEqual(len(all_commands), len(expected_all))
+        self.assertEqual(
+            tuple(
+                (
+                    command[command.index("--corruption") + 1],
+                    command[command.index("--corruption-target") + 1],
+                )
+                for command in all_commands
+            ),
+            expected_all,
+        )
         self.assertEqual(
             settings_for_suite("adversarial", strict=True),
             STRICT_ADVERSARIAL_SETTINGS,

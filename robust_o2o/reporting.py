@@ -126,6 +126,12 @@ RESEARCH_SUMMARY_COLUMNS = (
     "seed",
     "offline_steps",
     "online_environment_steps",
+    "requested_online_steps",
+    "actual_online_steps",
+    "episode_boundary_overshoot",
+    "completed_online_transitions",
+    "pending_episode_length",
+    "effective_calql_training_transitions",
     "offline_gradient_updates",
     "online_critic_updates",
     "online_actor_updates",
@@ -143,6 +149,88 @@ RESEARCH_SUMMARY_COLUMNS = (
 MAIN_BASELINES = frozenset(CANONICAL_MAIN_BASELINES)
 ADAPTED_BASELINES: frozenset[str] = frozenset()
 APPROXIMATION_BASELINES: frozenset[str] = frozenset()
+
+CALQL_ONLINE_BUDGET_SEMANTICS = (
+    "calql_complete_current_episode_at_or_after_requested"
+)
+CALQL_FAIRNESS_FIELDS = (
+    "requested_online_steps",
+    "actual_online_steps",
+    "episode_boundary_overshoot",
+    "completed_online_transitions",
+    "pending_episode_length",
+    "effective_calql_training_transitions",
+)
+
+
+def validate_calql_completion_accounting(
+    values: Mapping[str, object], *, context: str = "Cal-QL completion"
+) -> dict[str, int]:
+    """Validate that every collected Cal-QL transition was calibration-safe.
+
+    Cal-QL cannot assign an exact return-to-go before an episode boundary.  A
+    completed research run therefore finishes the current episode, reports the
+    resulting overshoot, and exposes no pending transition.  The effective
+    training-transition count must describe exactly that completed replay.
+    """
+
+    missing = [field for field in CALQL_FAIRNESS_FIELDS if values.get(field) is None]
+    if missing:
+        raise ReportingValidationError(
+            f"{context} is missing fairness fields: {', '.join(missing)}"
+        )
+    semantics = values.get("online_budget_semantics")
+    if semantics != CALQL_ONLINE_BUDGET_SEMANTICS:
+        raise ReportingValidationError(
+            f"{context} uses online_budget_semantics={semantics!r}; expected "
+            f"{CALQL_ONLINE_BUDGET_SEMANTICS!r}"
+        )
+
+    resolved: dict[str, int] = {}
+    for field in CALQL_FAIRNESS_FIELDS:
+        value = values[field]
+        if isinstance(value, (bool, np.bool_)):
+            raise ReportingValidationError(
+                f"{context} has non-integer {field}={value!r}"
+            )
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ReportingValidationError(
+                f"{context} has non-integer {field}={value!r}"
+            ) from exc
+        if not np.isfinite(number) or number < 0 or not number.is_integer():
+            raise ReportingValidationError(
+                f"{context} has invalid {field}={value!r}"
+            )
+        resolved[field] = int(number)
+
+    requested = resolved["requested_online_steps"]
+    actual = resolved["actual_online_steps"]
+    overshoot = resolved["episode_boundary_overshoot"]
+    completed = resolved["completed_online_transitions"]
+    pending = resolved["pending_episode_length"]
+    effective = resolved["effective_calql_training_transitions"]
+    if actual < requested or overshoot != actual - requested:
+        raise ReportingValidationError(
+            f"{context} has inconsistent requested/actual/overshoot: "
+            f"requested={requested}, actual={actual}, overshoot={overshoot}"
+        )
+    if pending != 0:
+        raise ReportingValidationError(
+            f"{context} has pending_episode_length={pending}; expected 0"
+        )
+    if completed != actual:
+        raise ReportingValidationError(
+            f"{context} has completed_online_transitions={completed}, "
+            f"but actual_online_steps={actual}"
+        )
+    if effective != completed:
+        raise ReportingValidationError(
+            f"{context} has effective_calql_training_transitions={effective}, "
+            f"but completed_online_transitions={completed}"
+        )
+    return resolved
 
 
 def _canonical_algorithm(algorithm: object) -> str:
@@ -261,7 +349,13 @@ def _ensure_classification_columns(frame):
         "offline_gradient_updates": np.nan,
         "online_critic_updates": np.nan,
         "online_actor_updates": np.nan,
+        "requested_online_steps": np.nan,
+        "completed_online_transitions": np.nan,
+        "pending_episode_length": np.nan,
+        "effective_calql_training_transitions": np.nan,
     }
+    if "requested_online_steps" not in result and "planned_online_steps" in result:
+        result["requested_online_steps"] = result["planned_online_steps"]
     for column, value in optional_defaults.items():
         if column not in result:
             result[column] = value
@@ -1081,6 +1175,34 @@ def _research_summary_table(
                         run, "planned_online_steps", run_label
                     )
                 ),
+                "requested_online_steps": int(
+                    _single_value(
+                        run, "requested_online_steps", run_label
+                    )
+                ),
+                "actual_online_steps": int(
+                    _single_value(run, "actual_online_steps", run_label)
+                ),
+                "episode_boundary_overshoot": int(
+                    _single_value(
+                        run, "episode_boundary_overshoot", run_label
+                    )
+                ),
+                "completed_online_transitions": _finite_or_nan(
+                    _single_value(
+                        run, "completed_online_transitions", run_label
+                    )
+                ),
+                "pending_episode_length": _finite_or_nan(
+                    _single_value(run, "pending_episode_length", run_label)
+                ),
+                "effective_calql_training_transitions": _finite_or_nan(
+                    _single_value(
+                        run,
+                        "effective_calql_training_transitions",
+                        run_label,
+                    )
+                ),
                 "offline_gradient_updates": offline_updates,
                 "online_critic_updates": _finite_or_nan(
                     _single_value(
@@ -1116,6 +1238,17 @@ def _research_summary_table(
             raw_status = str(
                 _single_value(run, "run_status", str(run_dir))
             ).lower()
+            if algorithm == "cal_ql" and raw_status == "completed":
+                accounting = {
+                    field: _single_value(run, field, str(run_dir))
+                    for field in CALQL_FAIRNESS_FIELDS
+                }
+                accounting["online_budget_semantics"] = _single_value(
+                    run, "online_budget_semantics", str(run_dir)
+                )
+                validate_calql_completion_accounting(
+                    accounting, context=f"run {run_dir}"
+                )
             score = per_seed[per_seed["run_dir"] == str(run_dir)]
             if len(score) > 1:
                 raise ReportingValidationError(

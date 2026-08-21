@@ -596,12 +596,16 @@ SEED_FIELDS = {
     # corruption therefore makes this a seed-derived artifact even when the
     # normalization rule itself is identical across runs.
     "normalizer_sha256",
-    # Official RPEX-style episode-boundary stopping can overshoot by a
-    # seed-dependent number of environment steps.  These are run outcomes,
-    # not experimental settings, so they must not split otherwise comparable
-    # seeds into different aggregation groups.
+    # Episode-boundary stopping and trajectory completion produce
+    # seed-dependent run outcomes.  They are not experimental settings and
+    # must not split otherwise comparable seeds into different aggregation
+    # groups, including when a completed manifest is aggregated directly.
     "actual_online_steps",
     "episode_boundary_overshoot",
+    "completed_online_trajectories",
+    "completed_online_transitions",
+    "pending_episode_length",
+    "effective_calql_training_transitions",
     # Audit receipts are per-controller issuance evidence, not an algorithmic
     # setting.  The stable audit context token remains in the aggregation key.
     "final_audit_receipt_sha256",

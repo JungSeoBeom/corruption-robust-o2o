@@ -511,6 +511,7 @@ def _load_runs(root: Path):
                 "requested_online_steps", config.get("online_steps", 0)
             )
         )
+        frame["requested_online_steps"] = frame["planned_online_steps"]
         online_manifest_path = (
             metrics_path.parent / "online_corruption_manifest.json"
         )
@@ -535,6 +536,24 @@ def _load_runs(root: Path):
                 "completion/online corruption manifest actual-step mismatch: "
                 f"{metrics_path.parent}"
             )
+        if completion_manifest is not None and online_manifest:
+            for field in (
+                "episode_boundary_overshoot",
+                "completed_online_transitions",
+                "pending_episode_length",
+                "effective_calql_training_transitions",
+            ):
+                completion_value = completion_manifest.get(field)
+                online_value = online_manifest.get(field)
+                if (
+                    completion_value is not None
+                    and online_value is not None
+                    and completion_value != online_value
+                ):
+                    raise RuntimeError(
+                        "completion/online corruption manifest outcome mismatch "
+                        f"for {field}: {metrics_path.parent}"
+                    )
         frame["actual_online_steps"] = int(
             manifest_actual_steps
             if manifest_actual_steps is not None
@@ -637,6 +656,24 @@ def _load_runs(root: Path):
             )
             or 0
         )
+        if algorithm == "cal_ql":
+            for field in (
+                "completed_online_transitions",
+                "pending_episode_length",
+                "effective_calql_training_transitions",
+            ):
+                value = (
+                    completion_manifest.get(field)
+                    if completion_manifest is not None
+                    else online_manifest.get(field, manifest.get(field))
+                )
+                frame[field] = (
+                    int(value) if value is not None else float("nan")
+                )
+        else:
+            frame["completed_online_transitions"] = float("nan")
+            frame["pending_episode_length"] = float("nan")
+            frame["effective_calql_training_transitions"] = float("nan")
         frame["environment_horizon"] = int(
             manifest.get(
                 "environment_horizon", config.get("max_episode_steps", 0)

@@ -19,6 +19,7 @@ from robust_o2o.paths import comparison_directory
 from scripts.check_research_readiness import (
     _discover_runtime_evidence,
     _latest_completed,
+    _settings_for_suite,
     build_parser as build_readiness_parser,
     run_checks,
 )
@@ -215,6 +216,14 @@ class ResearchBenchmarkConfigTest(unittest.TestCase):
 
 
 class ResearchReadinessTest(unittest.TestCase):
+    def test_all_suite_readiness_order_is_clean_adversarial_random(self):
+        settings = _settings_for_suite("all")
+        modes = [mode for mode, _target in settings]
+        self.assertEqual(modes[0], "clean")
+        first_random = modes.index("random")
+        self.assertTrue(all(mode == "adversarial" for mode in modes[1:first_random]))
+        self.assertTrue(all(mode == "random" for mode in modes[first_random:]))
+
     def test_latest_completed_uses_completion_manifest_mtime(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -324,6 +333,14 @@ class ResearchReadinessTest(unittest.TestCase):
                     {
                         "completed_online_trajectories": 2,
                         "completed_online_transitions": 7,
+                        "pending_episode_length": 0,
+                        "effective_calql_training_transitions": 7,
+                        "requested_online_steps": 5,
+                        "actual_online_steps": 7,
+                        "episode_boundary_overshoot": 2,
+                        "online_budget_semantics": (
+                            "calql_complete_current_episode_at_or_after_requested"
+                        ),
                         "online_mc_return_valid_fraction": 1.0,
                         "online_critic_gradient_updates": 7,
                         "calql_online_cql_enabled": True,
@@ -385,6 +402,67 @@ class ResearchReadinessTest(unittest.TestCase):
             ):
                 check = next(item for item in checks if item.label == label)
                 self.assertTrue(check.ok, check.detail)
+
+    def test_calql_runtime_evidence_rejects_pending_or_unaccounted_steps(self):
+        with TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "calql"
+            run_dir.mkdir()
+            (run_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "algorithm": "cal_ql",
+                        "env_name": "hopper-medium-replay-v2",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "summary.json").write_text(
+                json.dumps({"status": "completed"}), encoding="utf-8"
+            )
+            (run_dir / "completed_experiment_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "completed_online_trajectories": 1,
+                        "completed_online_transitions": 7,
+                        "pending_episode_length": 1,
+                        "effective_calql_training_transitions": 7,
+                        "requested_online_steps": 5,
+                        "actual_online_steps": 7,
+                        "episode_boundary_overshoot": 2,
+                        "online_budget_semantics": (
+                            "calql_complete_current_episode_at_or_after_requested"
+                        ),
+                        "online_mc_return_valid_fraction": 1.0,
+                        "online_critic_gradient_updates": 7,
+                        "calql_online_cql_enabled": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = build_readiness_parser().parse_args(
+                [
+                    "--env-name",
+                    "hopper-medium-replay-v2",
+                    "--corruption-suite",
+                    "clean",
+                    "--run-dir",
+                    directory,
+                ]
+            )
+            checks = run_checks(
+                args,
+                environment_loader=lambda *unused_args, **unused_kwargs: {},
+            )
+            evidence = next(
+                check
+                for check in checks
+                if check.label == "CAL-QL ONLINE MC EVIDENCE"
+            )
+            self.assertFalse(evidence.ok)
+            self.assertRegex(
+                evidence.detail,
+                "pending_episode_length",
+            )
 
     def test_supplied_incomplete_runtime_directory_fails_closed(self):
         with TemporaryDirectory() as directory:

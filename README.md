@@ -387,7 +387,10 @@ lower bound is applied. Add `--force-regenerate-attack` to regenerate a cache.
   corruption recomputes return-to-go within trajectory boundaries. Online
   transitions remain pending until terminal or timeout; only then are exact
   MC returns written and trajectory-length × UTD updates performed. Main mode
-  uses `--calibration-mask-mode all`, so it does not reveal corrupted row
+  finishes the current episode when the requested online budget lands inside
+  a trajectory, and records requested/actual steps, overshoot, completed and
+  effective transitions, and a zero pending length in the completion manifest.
+  It uses `--calibration-mask-mode all`, so it does not reveal corrupted row
   indices to the learner. Oracle masking, disabled calibration, nonzero BC
   warmup, and fixed 50:50 mixing are rejected by the research profile.
   `legacy_pre_corruption` is an explicit reproduction mode.
@@ -657,6 +660,12 @@ single targets, but the strict adversarial setting is empty: the existing
 Hopper observation fixture is optimizer-core-only and authorizes no end-to-end
 condition. Applying an RPEX corruption condition to another baseline is
 recorded as `benchmark_transfer`.
+
+`run_55_experiment.py --corruption-suite all` executes the nine conditions in
+this order: clean, the four adversarial targets, then the four random targets.
+PQE collects a full 1,000-transition block before updating: 5,000 updates for
+the first block and 1,000 for each later full block. A final partial block is
+saved but is not trained early.
 
 Before any strict run, on a supported Linux x86_64 host, execute:
 

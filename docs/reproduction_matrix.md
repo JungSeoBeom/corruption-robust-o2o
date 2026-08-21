@@ -76,7 +76,8 @@ are read-only aliases and cannot be used for a new run.
 - Offline MC returns are recomputed after corruption. Online transitions stay
   in a pending episode buffer until terminal or timeout; only complete
   trajectories enter replay with exact post-corruption return-to-go. No fake
-  zero return is used.
+  zero return is used. If the requested online budget is reached mid-episode,
+  collection continues only to that episode's terminal/timeout boundary.
 - Online batch mixing dynamically uses
   `|D_offline|/(|D_offline|+|D_online-completed|)`. A completed trajectory
   triggers trajectory-length × UTD updates.
@@ -101,6 +102,9 @@ are read-only aliases and cannot be used for a new run.
   temperature 5 and clipping `[1e-3, 1e3]`. Source-derived controls are initial
   online fraction `0.75`, first epoch multiplier `5`, first online block
   `1,000`, online buffer `250,000`, and weight batch `256`.
+- Online learning follows the public epoch schedule: collect 1,000 transitions,
+  then run 5,000 learner updates for block zero and 1,000 updates after each
+  later full block. No learner update is applied to a final partial block.
 - Clean evaluation always uses the ensemble moment policy; it never selects a
   best member or best checkpoint.
 

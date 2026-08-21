@@ -827,6 +827,10 @@ class FidelityProfileTest(unittest.TestCase):
         second["corruption_artifact_hash"] = "seed-specific-final-artifact"
         second["actual_online_steps"] = 500_417
         second["episode_boundary_overshoot"] = 417
+        second["completed_online_trajectories"] = 501
+        second["completed_online_transitions"] = 500_417
+        second["pending_episode_length"] = 0
+        second["effective_calql_training_transitions"] = 500_417
         second["normalizer_sha256"] = "seed-specific-normalizer"
         second["launch_manifest_sha256"] = "seed-specific-launch"
         second["completion_manifest_sha256"] = "seed-specific-completion"

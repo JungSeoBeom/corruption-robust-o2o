@@ -13,7 +13,7 @@ import torch
 
 from robust_o2o.config import ExperimentConfig
 from robust_o2o.environment import StateNormalizer
-from robust_o2o.experiment import _run_online
+from robust_o2o.experiment import _restore_pqe_block_schedule, _run_online
 from robust_o2o.replay import OfflineDataset, ReplayBuffer
 
 
@@ -311,7 +311,10 @@ class MainControllerContractTest(unittest.TestCase):
                 self.total_updates += 1
                 return {"loss": 0.0, "online_calibration_bound_rate": 1.0}
 
-        config = _controller_config("cal_ql", online_steps=3)
+        # The requested budget lands one step before the episode boundary.
+        # Cal-QL must finish the trajectory so every collected transition has
+        # a real return-to-go and a safe boundary checkpoint.
+        config = _controller_config("cal_ql", online_steps=2)
         config.discount = 0.9
         config.updates_per_step = 2
         config.batch_size = 4
@@ -324,7 +327,9 @@ class MainControllerContractTest(unittest.TestCase):
             with (
                 patch("robust_o2o.experiment.ReplayBuffer", CapturingReplay),
                 patch("robust_o2o.experiment._evaluate"),
-                patch("robust_o2o.experiment._save_phase_checkpoint"),
+                patch(
+                    "robust_o2o.experiment._save_phase_checkpoint"
+                ) as save_checkpoint,
             ):
                 _run_online(
                     env,
@@ -340,6 +345,28 @@ class MainControllerContractTest(unittest.TestCase):
                     state_dim=2,
                     action_dim=1,
                 )
+            final_resume = save_checkpoint.call_args.kwargs["resume_state"]
+            with (
+                patch("robust_o2o.experiment.ReplayBuffer", CapturingReplay),
+                patch("robust_o2o.experiment._evaluate"),
+                patch("robust_o2o.experiment._save_phase_checkpoint") as noop_save,
+            ):
+                _run_online(
+                    env,
+                    object(),
+                    _dataset(),
+                    config,
+                    agent,
+                    offline,
+                    _normalizer(),
+                    None,
+                    torch.device("cpu"),
+                    logger,
+                    state_dim=2,
+                    action_dim=1,
+                    resume_state=final_resume,
+                )
+            noop_manifest = logger.completions[-1]
             manifest = json.loads(
                 (Path(directory) / "online_corruption_manifest.json").read_text(
                     encoding="utf-8"
@@ -365,8 +392,93 @@ class MainControllerContractTest(unittest.TestCase):
         self.assertEqual(manifest["pending_episode_length"], 0)
         self.assertEqual(manifest["online_mc_return_valid_fraction"], 1.0)
         self.assertAlmostEqual(manifest["calql_dynamic_offline_ratio"], 0.75)
+        self.assertEqual(
+            manifest["online_budget_semantics"],
+            "calql_complete_current_episode_at_or_after_requested",
+        )
+        self.assertEqual(manifest["requested_online_steps"], 2)
+        self.assertEqual(manifest["actual_online_steps"], 3)
+        self.assertEqual(manifest["episode_boundary_overshoot"], 1)
+        self.assertEqual(manifest["effective_calql_training_transitions"], 3)
+        self.assertTrue(noop_manifest["calql_online_cql_enabled"])
+        self.assertAlmostEqual(noop_manifest["calql_dynamic_offline_ratio"], 0.75)
+        self.assertEqual(noop_manifest["online_calibration_bound_rate"], 1.0)
+        self.assertEqual(noop_manifest["pending_episode_length"], 0)
+        noop_save.assert_not_called()
+        save_checkpoint.assert_called_once()
+        self.assertEqual(final_resume["phase_step"], 3)
+        self.assertTrue(final_resume["episode_boundary"])
+        self.assertEqual(final_resume["calql_trajectory"]["pending"], [])
 
-    def test_pqe_first_1000_step_block_maps_to_five_times_updates_and_poisoned_replay(self):
+    def test_calql_timeout_also_finishes_requested_episode_and_clears_pending(self):
+        replay_instances: list[ReplayBuffer] = []
+
+        class CapturingReplay(ReplayBuffer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                replay_instances.append(self)
+
+        class CountingAgent:
+            def __init__(self) -> None:
+                self.total_updates = 0
+
+            def select_action(self, state, evaluate=False):
+                del state, evaluate
+                return torch.asarray([0.0], dtype=torch.float32)
+
+            def update(self, batch):
+                self.assert_finite(batch["mc_returns"])
+                self.total_updates += 1
+                return {"online_calibration_bound_rate": 1.0}
+
+            @staticmethod
+            def assert_finite(values):
+                if not torch.isfinite(values).all():
+                    raise AssertionError("timeout trajectory produced invalid RTG")
+
+        config = _controller_config("cal_ql", online_steps=2)
+        config.max_episode_steps = 3
+        config.batch_size = 2
+        env = _LegacyEnv(terminal_at=99)
+        agent = CountingAgent()
+
+        with tempfile.TemporaryDirectory() as directory:
+            logger = _logger(directory, "calql-timeout-controller")
+            with (
+                patch("robust_o2o.experiment.ReplayBuffer", CapturingReplay),
+                patch("robust_o2o.experiment._evaluate"),
+                patch("robust_o2o.experiment._save_phase_checkpoint"),
+            ):
+                _run_online(
+                    env,
+                    object(),
+                    _dataset(),
+                    config,
+                    agent,
+                    OfflineDataset(_dataset(size=4), seed=4),
+                    _normalizer(),
+                    None,
+                    torch.device("cpu"),
+                    logger,
+                    state_dim=2,
+                    action_dim=1,
+                )
+            manifest = json.loads(
+                (Path(directory) / "online_corruption_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(env.total_steps, 3)
+        self.assertEqual(agent.total_updates, 3)
+        self.assertEqual(manifest["episode_boundary_overshoot"], 1)
+        self.assertEqual(manifest["pending_episode_length"], 0)
+        self.assertEqual(manifest["effective_calql_training_transitions"], 3)
+        np.testing.assert_array_equal(
+            replay_instances[0].terminals[:3], np.zeros(3, dtype=np.float32)
+        )
+
+    def test_pqe_updates_only_full_1000_step_blocks_and_records_block_ledger(self):
         replay_instances: list[ReplayBuffer] = []
         env = _LegacyEnv(terminal_at=1)
         counters = {"sample": 0, "priority": 0}
@@ -424,7 +536,7 @@ class MainControllerContractTest(unittest.TestCase):
 
             def online_update_count_for_block(self, block_index, normal_count):
                 self.block_calls.append((int(block_index), int(normal_count)))
-                return int(normal_count) * 5
+                return int(normal_count) * (5 if block_index == 0 else 1)
 
             def update(self, **kwargs):
                 self.assert_update_payload(kwargs)
@@ -448,12 +560,12 @@ class MainControllerContractTest(unittest.TestCase):
 
         config = _controller_config(
             "pessimistic_q_ensemble",
-            online_steps=1_000,
+            online_steps=2_500,
             corruption="random",
             corruption_target="rewards",
         )
         config.pqe_first_online_block_steps = 1_000
-        config.pqe_online_buffer_size = 2_000
+        config.pqe_online_buffer_size = 3_000
         config.updates_per_step = 1
         config.online_corruption_rate = 1.0
         offline = OfflineDataset(_dataset(size=12), seed=7)
@@ -480,7 +592,9 @@ class MainControllerContractTest(unittest.TestCase):
                     side_effect=fake_corruption,
                 ),
                 patch("robust_o2o.experiment._evaluate"),
-                patch("robust_o2o.experiment._save_phase_checkpoint"),
+                patch(
+                    "robust_o2o.experiment._save_phase_checkpoint"
+                ) as save_checkpoint,
             ):
                 _run_online(
                     env,
@@ -503,20 +617,137 @@ class MainControllerContractTest(unittest.TestCase):
             )
 
         self.assertEqual(agent.initial_priority_args, (offline.size, 1_000))
-        self.assertEqual(agent.block_calls, [(0, 1_000)])
-        self.assertEqual(agent.total_updates, 5_000)
-        self.assertEqual(counters, {"sample": 5_000, "priority": 5_000})
+        self.assertEqual(agent.block_calls, [(0, 1_000), (1, 1_000)])
+        self.assertEqual(agent.total_updates, 6_000)
+        self.assertEqual(counters, {"sample": 6_000, "priority": 6_000})
         replay = replay_instances[0]
-        self.assertEqual(replay.size, 1_000)
+        self.assertEqual(replay.size, 2_500)
         np.testing.assert_array_equal(
-            replay.rewards[: replay.size], np.full(1_000, 99.0, dtype=np.float32)
+            replay.rewards[: replay.size], np.full(2_500, 99.0, dtype=np.float32)
         )
         np.testing.assert_array_equal(
-            replay.priorities[: replay.size], np.full(1_000, 7.0, dtype=np.float64)
+            replay.priorities[: replay.size], np.full(2_500, 7.0, dtype=np.float64)
         )
-        self.assertEqual(manifest["selected_transition_count"], 1_000)
+        self.assertEqual(manifest["selected_transition_count"], 2_500)
         self.assertTrue(manifest["pqe_first_block_updates_applied"])
         self.assertEqual(manifest["pqe_first_block_update_count"], 5_000)
+        self.assertEqual(manifest["pqe_completed_block_count"], 2)
+        self.assertEqual(manifest["pqe_block_index"], 2)
+        self.assertEqual(manifest["pqe_steps_in_current_block"], 500)
+        self.assertEqual(manifest["pqe_block_update_counts"], [5_000, 1_000])
+        self.assertEqual(manifest["pqe_next_block_index"], 2)
+        save_checkpoint.assert_called_once()
+        final_resume = save_checkpoint.call_args.kwargs["resume_state"]
+        self.assertEqual(final_resume["pqe_block_index"], 2)
+        self.assertEqual(final_resume["pqe_steps_in_current_block"], 500)
+        self.assertEqual(
+            final_resume["pqe_block_update_counts"], [5_000, 1_000]
+        )
+
+    def test_pqe_legacy_resume_allows_only_exact_first_block_boundary(self):
+        config = _controller_config(
+            "pessimistic_q_ensemble", online_steps=3_000
+        )
+        exact_first_block_state = {
+            "phase": "online",
+            "phase_step": 1_000,
+            "pqe_first_block_updates_applied": True,
+            "pqe_first_block_update_count": 5_000,
+        }
+
+        counts, inferred = _restore_pqe_block_schedule(
+            config, exact_first_block_state, start_env_step=1_000
+        )
+
+        self.assertEqual(counts, [5_000])
+        self.assertTrue(inferred)
+
+        for invalid_fields in (
+            {
+                "pqe_first_block_updates_applied": False,
+                "pqe_first_block_update_count": 5_000,
+            },
+            {
+                "pqe_first_block_updates_applied": True,
+                "pqe_first_block_update_count": 4_999,
+            },
+        ):
+            with self.subTest(invalid_fields=invalid_fields), self.assertRaisesRegex(
+                ValueError, "must record exactly 5000"
+            ):
+                _restore_pqe_block_schedule(
+                    config,
+                    {"phase": "online", "phase_step": 1_000, **invalid_fields},
+                    start_env_step=1_000,
+                )
+
+        partial_first_block_state = {
+            "phase": "online",
+            "phase_step": 999,
+            "pqe_first_block_updates_applied": False,
+            "pqe_first_block_update_count": 0,
+        }
+        counts, inferred = _restore_pqe_block_schedule(
+            config, partial_first_block_state, start_env_step=999
+        )
+        self.assertEqual(counts, [])
+        self.assertTrue(inferred)
+
+    def test_pqe_legacy_resume_after_first_block_fails_closed(self):
+        config = _controller_config(
+            "pessimistic_q_ensemble", online_steps=3_000
+        )
+        irrecoverable_state = {
+            "phase": "online",
+            "phase_step": 2_500,
+            "pqe_first_block_updates_applied": True,
+            "pqe_first_block_update_count": 5_000,
+        }
+
+        with self.assertRaisesRegex(
+            ValueError, "old step-interleaved updates have no exact block ledger"
+        ):
+            _restore_pqe_block_schedule(
+                config, irrecoverable_state, start_env_step=2_500
+            )
+
+    def test_pqe_new_resume_ledger_must_cover_every_full_block_exactly(self):
+        config = _controller_config(
+            "pessimistic_q_ensemble", online_steps=3_000
+        )
+        base_state = {
+            "phase": "online",
+            "phase_step": 2_500,
+            "pqe_completed_block_count": 2,
+            "pqe_next_block_index": 2,
+            "pqe_block_index": 2,
+            "pqe_steps_in_current_block": 500,
+        }
+        counts, inferred = _restore_pqe_block_schedule(
+            config,
+            {**base_state, "pqe_block_update_counts": [5_000, 1_000]},
+            start_env_step=2_500,
+        )
+        self.assertEqual(counts, [5_000, 1_000])
+        self.assertFalse(inferred)
+
+        invalid_ledgers = (
+            [5_000],
+            [5_000, 999],
+        )
+        for ledger in invalid_ledgers:
+            state = {
+                **base_state,
+                "pqe_completed_block_count": len(ledger),
+                "pqe_next_block_index": len(ledger),
+                "pqe_block_update_counts": ledger,
+            }
+            with self.subTest(ledger=ledger), self.assertRaisesRegex(
+                ValueError, "block ledger|epoch schedule"
+            ):
+                _restore_pqe_block_schedule(
+                    config, state, start_env_step=2_500
+                )
 
     def test_wsrl_warmup_collects_transitions_without_any_update(self):
         class NoWarmupUpdateAgent:

@@ -12,11 +12,13 @@ from robust_o2o.fidelity import (
     REPORTING_RULES,
 )
 from robust_o2o.reporting import (
+    CALQL_ONLINE_BUDGET_SEMANTICS,
     PER_SEED_COLUMNS,
     RESEARCH_SUMMARY_COLUMNS,
     SUMMARY_COLUMNS,
     ReportingValidationError,
     aggregate_seed_scores,
+    validate_calql_completion_accounting,
     write_reporting_outputs,
 )
 
@@ -105,6 +107,34 @@ def evaluation_frame(
 
 
 class ReportingRuleTest(unittest.TestCase):
+    def test_calql_completion_accounting_contract(self):
+        valid = {
+            "requested_online_steps": 500,
+            "actual_online_steps": 517,
+            "episode_boundary_overshoot": 17,
+            "completed_online_transitions": 517,
+            "pending_episode_length": 0,
+            "effective_calql_training_transitions": 517,
+            "online_budget_semantics": CALQL_ONLINE_BUDGET_SEMANTICS,
+        }
+        self.assertEqual(
+            validate_calql_completion_accounting(valid),
+            {key: valid[key] for key in valid if key != "online_budget_semantics"},
+        )
+        invalid_cases = {
+            "semantics": {"online_budget_semantics": "exact_environment_steps"},
+            "overshoot": {"episode_boundary_overshoot": 16},
+            "pending": {"pending_episode_length": 1},
+            "completed": {"completed_online_transitions": 516},
+            "effective": {"effective_calql_training_transitions": 516},
+        }
+        for label, mutation in invalid_cases.items():
+            with self.subTest(label=label):
+                with self.assertRaises(ReportingValidationError):
+                    validate_calql_completion_accounting(
+                        {**valid, **mutation}
+                    )
+
     def test_empty_frame_is_typed_non_strict_and_fails_strict(self):
         per_seed, summary = aggregate_seed_scores(
             pd.DataFrame(),
@@ -504,6 +534,14 @@ class ReportingRuleTest(unittest.TestCase):
             item["uses_corruption_labels"] = False
             item["final_window_size"] = 3
             item["evaluation_corruption"] = "clean"
+            item["requested_online_steps"] = 40_000
+            if algorithm == "cal_ql":
+                item["online_budget_semantics"] = (
+                    CALQL_ONLINE_BUDGET_SEMANTICS
+                )
+                item["completed_online_transitions"] = 40_001
+                item["pending_episode_length"] = 0
+                item["effective_calql_training_transitions"] = 40_001
             online = item["phase"] == "online"
             item.loc[online, "normalized_return_mean"] += float(index)
             frames.append(item)
@@ -521,6 +559,21 @@ class ReportingRuleTest(unittest.TestCase):
         self.assertEqual(set(research["algorithm"]), set(MAIN_BASELINES))
         self.assertEqual(len(research), 5)
         self.assertEqual(set(research["status"]), {"completed"})
+        calql = research[research["algorithm"] == "cal_ql"].iloc[0]
+        self.assertEqual(int(calql["requested_online_steps"]), 40_000)
+        self.assertEqual(int(calql["actual_online_steps"]), 40_001)
+        self.assertEqual(int(calql["episode_boundary_overshoot"]), 1)
+        self.assertEqual(int(calql["completed_online_transitions"]), 40_001)
+        self.assertEqual(int(calql["pending_episode_length"]), 0)
+        self.assertEqual(
+            int(calql["effective_calql_training_transitions"]), 40_001
+        )
+        self.assertTrue(
+            research.loc[
+                research["algorithm"] != "cal_ql",
+                "effective_calql_training_transitions",
+            ].isna().all()
+        )
         self.assertEqual(
             int(
                 research.loc[
@@ -539,6 +592,34 @@ class ReportingRuleTest(unittest.TestCase):
             ),
             5.0,
         )
+
+    def test_research_summary_rejects_invalid_completed_calql_accounting(self):
+        frame = evaluation_frame(seeds=(0,))
+        frame["algorithm"] = "cal_ql"
+        frame["run_dir"] = "/tmp/cal_ql_seed_0"
+        frame["run_purpose"] = "research_benchmark"
+        frame["benchmark_role"] = "main"
+        frame["implementation_type"] = (
+            "source_aligned_locomotion_adaptation"
+        )
+        frame["uses_corruption_labels"] = False
+        frame["final_window_size"] = 3
+        frame["evaluation_corruption"] = "clean"
+        frame["requested_online_steps"] = 40_000
+        frame["online_budget_semantics"] = CALQL_ONLINE_BUDGET_SEMANTICS
+        frame["completed_online_transitions"] = 40_001
+        frame["pending_episode_length"] = 1
+        frame["effective_calql_training_transitions"] = 40_001
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                ReportingValidationError, "pending_episode_length"
+            ):
+                write_reporting_outputs(
+                    frame,
+                    Path(directory),
+                    strict=False,
+                    expected_seeds=[0],
+                )
 
     def test_incomplete_research_cohort_cannot_publish_subset_mean(self):
         frame = evaluation_frame()

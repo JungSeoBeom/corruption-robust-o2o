@@ -322,6 +322,137 @@ def _wsrl_runtime_metadata(
     return metadata
 
 
+def _restore_pqe_block_schedule(
+    config: ExperimentConfig,
+    resume_state: Optional[Dict[str, Any]],
+    start_env_step: int,
+) -> tuple[list[int], bool]:
+    """Restore the completed PQE update blocks without replaying a block.
+
+    New checkpoints persist every block's optimizer-update count.  A legacy
+    checkpoint is migratable only before any update or exactly after the first
+    1,000-step/5,000-update block.  Later legacy checkpoints contain
+    step-interleaved updates that cannot be reconstructed as official blocks,
+    so they fail closed instead of receiving an invented ledger.
+    """
+
+    if config.algorithm != "pessimistic_q_ensemble" or resume_state is None:
+        return [], False
+
+    raw_counts = resume_state.get("pqe_block_update_counts")
+    if raw_counts is not None:
+        if not isinstance(raw_counts, (list, tuple)):
+            raise TypeError("PQE block update counts must be a sequence")
+        counts = [int(value) for value in raw_counts]
+        if any(value < 0 for value in counts):
+            raise ValueError("PQE block update counts cannot be negative")
+        saved_count = int(
+            resume_state.get("pqe_completed_block_count", len(counts))
+        )
+        saved_next = int(resume_state.get("pqe_next_block_index", len(counts)))
+        if saved_count != len(counts) or saved_next != len(counts):
+            raise ValueError(
+                "PQE block schedule checkpoint is internally inconsistent"
+            )
+        block_size = int(config.pqe_first_online_block_steps)
+        expected_completed_blocks = start_env_step // block_size
+        if len(counts) != expected_completed_blocks:
+            raise ValueError(
+                "PQE checkpoint block ledger does not match the number of "
+                "fully collected blocks"
+            )
+        normal_count = int(block_size * config.updates_per_step)
+        expected_counts = (
+            [normal_count * config.pqe_first_epoch_multiplier]
+            + [normal_count] * (expected_completed_blocks - 1)
+            if expected_completed_blocks
+            else []
+        )
+        if counts != expected_counts:
+            raise ValueError(
+                "PQE checkpoint block update counts do not match the configured "
+                "epoch schedule"
+            )
+        saved_index = resume_state.get("pqe_block_index")
+        saved_steps = resume_state.get("pqe_steps_in_current_block")
+        if saved_index is not None and int(saved_index) != start_env_step // block_size:
+            raise ValueError("PQE checkpoint block index does not match phase_step")
+        if saved_steps is not None and int(saved_steps) != start_env_step % block_size:
+            raise ValueError(
+                "PQE checkpoint in-block step count does not match phase_step"
+            )
+        return counts, bool(
+            resume_state.get("pqe_block_schedule_inferred_from_legacy", False)
+        )
+
+    block_size = int(config.pqe_first_online_block_steps)
+    normal_count = int(
+        block_size * config.updates_per_step
+    )
+    expected_first_count = int(
+        normal_count * config.pqe_first_epoch_multiplier
+    )
+    first_applied = bool(
+        resume_state.get("pqe_first_block_updates_applied", False)
+    )
+    first_count = int(resume_state.get("pqe_first_block_update_count", 0))
+    explicit_count = int(resume_state.get("pqe_completed_block_count", 0))
+
+    # The retired controller applied one update after every environment step
+    # beyond step 1000. Once it crossed that boundary, a checkpoint no longer
+    # contains enough information to reconstruct an official block ledger.
+    # Inventing [5000, 1000, ...] would silently discard unknown interleaved
+    # updates, so fail closed instead of claiming a source-aligned resume.
+    if start_env_step > block_size:
+        raise ValueError(
+            "legacy PQE checkpoint after the first 1000-step block cannot be "
+            "safely resumed: old step-interleaved updates have no exact block ledger"
+        )
+    if start_env_step < block_size:
+        if first_applied or first_count != 0 or explicit_count != 0:
+            raise ValueError(
+                "legacy PQE checkpoint claims updates before its first full block"
+            )
+        return [], True
+
+    if (
+        not first_applied
+        or first_count != expected_first_count
+        or explicit_count not in (0, 1)
+    ):
+        raise ValueError(
+            "legacy PQE checkpoint at step 1000 must record exactly 5000 "
+            "first-block updates"
+        )
+    return [expected_first_count], True
+
+
+def _pqe_block_schedule_metadata(
+    config: ExperimentConfig,
+    block_update_counts: list[int],
+    *,
+    env_step: int,
+    inferred_from_legacy: bool,
+) -> Dict[str, Any]:
+    """Serialize both the complete block ledger and legacy first-block keys."""
+
+    completed = len(block_update_counts)
+    first_count = int(block_update_counts[0]) if completed else 0
+    block_size = int(config.pqe_first_online_block_steps)
+    return {
+        "pqe_steps_in_current_block": int(env_step % block_size),
+        "pqe_block_index": int(env_step // block_size),
+        "pqe_completed_block_count": completed,
+        "pqe_last_completed_block_index": completed - 1,
+        "pqe_next_block_index": completed,
+        "pqe_block_update_counts": [int(value) for value in block_update_counts],
+        "pqe_block_schedule_inferred_from_legacy": bool(inferred_from_legacy),
+        # Retained so existing readers and checkpoints continue to work.
+        "pqe_first_block_updates_applied": bool(completed),
+        "pqe_first_block_update_count": first_count,
+    }
+
+
 def bounded_executed_action(
     raw_policy_action: np.ndarray,
     action_low: np.ndarray,
@@ -1689,6 +1820,14 @@ def _run_online(
         config.implementation_profile == "official_code_reference"
         and config.algorithm in ("rpex", "riql_naive", "riql_pex")
     )
+    calql_episode_boundary_budget = bool(is_calql and config.online_steps > 0)
+    pqe_block_update_counts, pqe_schedule_inferred_from_legacy = (
+        _restore_pqe_block_schedule(
+            config,
+            resume_state if online_resume else None,
+            start_env_step,
+        )
+    )
     if online_resume:
         _validate_writer_positions(logger, resume_state)
         if not resume_state.get("episode_boundary"):
@@ -1706,6 +1845,10 @@ def _run_online(
                         "Cal-QL online resume is missing trajectory-return state"
                     )
                 calql_trajectory.load_state_dict(trajectory_state)
+                if calql_trajectory.pending_episode_length:
+                    raise ValueError(
+                        "completed Cal-QL resume contains a pending trajectory"
+                    )
             corruption_audit = OnlineCorruptionAudit(
                 resume_state.get("online_corruption_audit")
             )
@@ -1715,6 +1858,8 @@ def _run_online(
                     "online_budget_semantics": (
                         "rpex_official_episode_boundary_strict_greater_than"
                         if rpex_episode_boundary_budget
+                        else "calql_complete_current_episode_at_or_after_requested"
+                        if is_calql
                         else "exact_environment_steps"
                     ),
                     "requested_online_steps": config.online_steps,
@@ -1753,8 +1898,43 @@ def _run_online(
             )
             if is_calql:
                 online_corruption_metadata.update(calql_trajectory.metadata())
-            if is_pqe and hasattr(agent, "algorithm_metadata"):
-                online_corruption_metadata.update(agent.algorithm_metadata())
+                online_corruption_metadata[
+                    "effective_calql_training_transitions"
+                ] = int(
+                    calql_trajectory.completed_transitions
+                )
+                online_corruption_metadata["calql_online_cql_enabled"] = True
+                online_corruption_metadata[
+                    "calql_dynamic_offline_ratio"
+                ] = float(
+                    resume_state.get(
+                        "calql_dynamic_offline_ratio",
+                        offline.size
+                        / max(
+                            offline.size
+                            + calql_trajectory.completed_transitions,
+                            1,
+                        ),
+                    )
+                )
+                online_corruption_metadata[
+                    "online_calibration_bound_rate"
+                ] = float(
+                    resume_state.get(
+                        "calql_last_online_calibration_bound_rate", 0.0
+                    )
+                )
+            if is_pqe:
+                if hasattr(agent, "algorithm_metadata"):
+                    online_corruption_metadata.update(agent.algorithm_metadata())
+                online_corruption_metadata.update(
+                    _pqe_block_schedule_metadata(
+                        config,
+                        pqe_block_update_counts,
+                        env_step=start_env_step,
+                        inferred_from_legacy=pqe_schedule_inferred_from_legacy,
+                    )
+                )
             with (logger.run_dir / "online_corruption_manifest.json").open(
                 "w", encoding="utf-8"
             ) as stream:
@@ -1779,6 +1959,10 @@ def _run_online(
                     "Cal-QL online resume is missing trajectory-return state"
                 )
             calql_trajectory.load_state_dict(trajectory_state)
+            if calql_trajectory.pending_episode_length:
+                raise ValueError(
+                    "Cal-QL exact resume requires an empty pending trajectory"
+                )
         restore_global_rng_state(resume_state["global_rng"], rng, oracle)
         restore_environment_rng_state(env, resume_state["environment_rng"])
         raw_state = None
@@ -1837,12 +2021,10 @@ def _run_online(
         if is_pqe
         else 1.0
     )
-    pqe_first_block_updates_applied = bool(
-        resume_state.get("pqe_first_block_updates_applied", False)
-    ) if online_resume else False
-    pqe_first_block_update_count = int(
-        resume_state.get("pqe_first_block_update_count", 0)
-    ) if online_resume else 0
+    pqe_first_block_updates_applied = bool(pqe_block_update_counts)
+    pqe_first_block_update_count = (
+        int(pqe_block_update_counts[0]) if pqe_block_update_counts else 0
+    )
 
     def online_resume_snapshot(step: int) -> Dict[str, Any]:
         if not episode_boundary or raw_state is not None:
@@ -1868,8 +2050,26 @@ def _run_online(
             "calql_trajectory": (
                 calql_trajectory.state_dict() if is_calql else None
             ),
+            "calql_dynamic_offline_ratio": (
+                float(current_offline_ratio) if is_calql else None
+            ),
+            "calql_last_online_calibration_bound_rate": (
+                float(last_metrics.get("online_calibration_bound_rate", 0.0))
+                if is_calql
+                else None
+            ),
             "pqe_first_block_updates_applied": pqe_first_block_updates_applied,
             "pqe_first_block_update_count": pqe_first_block_update_count,
+            **(
+                _pqe_block_schedule_metadata(
+                    config,
+                    pqe_block_update_counts,
+                    env_step=step,
+                    inferred_from_legacy=pqe_schedule_inferred_from_legacy,
+                )
+                if is_pqe
+                else {}
+            ),
             "metric_accumulator": accumulator.values,
             "writer_append_position": _writer_positions(logger),
             "online_initial_actor_updates": online_initial_update_counts[
@@ -1885,7 +2085,7 @@ def _run_online(
 
     pending_checkpoint = False
     episode_boundary = True
-    if rpex_episode_boundary_budget:
+    if rpex_episode_boundary_budget or calql_episode_boundary_budget:
         import itertools
 
         online_step_iterator = itertools.count(start_env_step + 1)
@@ -1951,9 +2151,14 @@ def _run_online(
                 and replay.size >= required_online_samples
             )
         elif is_pqe:
+            full_block_boundary = (
+                env_step % config.pqe_first_online_block_steps == 0
+            )
             can_update = (
                 not before_transition
-                and env_step >= config.pqe_first_online_block_steps
+                and full_block_boundary
+                and env_step // config.pqe_first_online_block_steps
+                > len(pqe_block_update_counts)
                 and replay.size >= required_online_samples
             )
         elif before_transition:
@@ -1980,60 +2185,74 @@ def _run_online(
             accumulator.add(last_metrics)
             return
 
-        if is_pqe and not pqe_first_block_updates_applied:
-            normal_update_count = (
+        if is_pqe:
+            completed_blocks_at_boundary = int(
+                env_step // config.pqe_first_online_block_steps
+            )
+            normal_update_count = int(
                 config.pqe_first_online_block_steps * config.updates_per_step
             )
-            update_repeats = agent.online_update_count_for_block(
-                0, normal_update_count
-            )
-            pqe_first_block_updates_applied = True
-            pqe_first_block_update_count = update_repeats
-        else:
-            update_repeats = config.updates_per_step
-        for _ in range(update_repeats):
-            prioritized = (
-                is_pqe and config.pqe_replay_mode == "balanced_density"
-            )
-            if is_pqe:
-                (
-                    batch,
-                    density_offline_batch,
-                    density_online_batch,
-                ) = sample_pqe_update_batches(
-                    offline,
-                    replay,
-                    config.batch_size,
-                    offline_ratio,
-                    device,
-                    prioritized_rl=prioritized,
-                    density_batch_size=config.pqe_weight_batch_size,
-                )
-                last_metrics = agent.update(
-                    rl_batch=batch,
-                    density_offline_batch=density_offline_batch,
-                    density_online_batch=density_online_batch,
-                    rl_batch_prioritized=prioritized,
-                )
-            else:
-                batch = mixed_batch(
-                    offline,
-                    replay,
-                    update_batch_size,
-                    offline_ratio,
-                    device,
-                )
-                last_metrics = agent.update(batch)
-            accumulator.add(last_metrics)
-            if is_pqe:
-                priorities = agent.consume_priority_values()
-                if priorities is None:
-                    raise RuntimeError(
-                        "Pessimistic Q-Ensemble skipped a required priority update"
+            # The frozen research profile has exactly one block due here.  The
+            # range keeps explicitly non-reference miniature configurations
+            # well-defined if their density batch is larger than one block.
+            for block_index in range(
+                len(pqe_block_update_counts), completed_blocks_at_boundary
+            ):
+                update_repeats = int(
+                    agent.online_update_count_for_block(
+                        block_index, normal_update_count
                     )
-                priority_metrics = update_sample_priorities(
-                    offline, replay, batch, priorities
                 )
+                if update_repeats < 0:
+                    raise RuntimeError("PQE block update count cannot be negative")
+                for _ in range(update_repeats):
+                    (
+                        batch,
+                        density_offline_batch,
+                        density_online_batch,
+                    ) = sample_pqe_update_batches(
+                        offline,
+                        replay,
+                        config.batch_size,
+                        offline_ratio,
+                        device,
+                        prioritized_rl=(
+                            config.pqe_replay_mode == "balanced_density"
+                        ),
+                        density_batch_size=config.pqe_weight_batch_size,
+                    )
+                    last_metrics = agent.update(
+                        rl_batch=batch,
+                        density_offline_batch=density_offline_batch,
+                        density_online_batch=density_online_batch,
+                        rl_batch_prioritized=(
+                            config.pqe_replay_mode == "balanced_density"
+                        ),
+                    )
+                    accumulator.add(last_metrics)
+                    priorities = agent.consume_priority_values()
+                    if priorities is None:
+                        raise RuntimeError(
+                            "Pessimistic Q-Ensemble skipped a required priority update"
+                        )
+                    priority_metrics = update_sample_priorities(
+                        offline, replay, batch, priorities
+                    )
+                pqe_block_update_counts.append(update_repeats)
+                pqe_first_block_updates_applied = True
+                pqe_first_block_update_count = int(pqe_block_update_counts[0])
+            return
+
+        for _ in range(config.updates_per_step):
+            batch = mixed_batch(
+                offline,
+                replay,
+                update_batch_size,
+                offline_ratio,
+                device,
+            )
+            last_metrics = agent.update(batch)
+            accumulator.add(last_metrics)
 
     def perform_calql_trajectory_updates(completed: object) -> None:
         nonlocal last_metrics, current_offline_ratio
@@ -2333,13 +2552,15 @@ def _run_online(
                             "pqe_initial_online_priority": float(
                                 initial_online_priority
                             ),
-                            "pqe_first_block_updates_applied": float(
-                                pqe_first_block_updates_applied
-                            ),
-                            "pqe_first_block_update_count": float(
-                                pqe_first_block_update_count
-                            ),
                             "pqe_member_count": float(config.pqe_ensemble_size),
+                            **_pqe_block_schedule_metadata(
+                                config,
+                                pqe_block_update_counts,
+                                env_step=env_step,
+                                inferred_from_legacy=(
+                                    pqe_schedule_inferred_from_legacy
+                                ),
+                            ),
                         }
                         if is_pqe
                         else {}
@@ -2395,6 +2616,17 @@ def _run_online(
             and env_step > config.online_steps
         ):
             break
+        if (
+            calql_episode_boundary_budget
+            and episode_boundary
+            and env_step >= config.online_steps
+        ):
+            break
+
+    if is_calql and calql_trajectory.pending_episode_length:
+        raise RuntimeError(
+            "Cal-QL online phase ended before its pending trajectory completed"
+        )
 
     if (
         config.implementation_profile != "official_code_reference"
@@ -2440,6 +2672,8 @@ def _run_online(
             "online_budget_semantics": (
                 "rpex_official_episode_boundary_strict_greater_than"
                 if rpex_episode_boundary_budget
+                else "calql_complete_current_episode_at_or_after_requested"
+                if is_calql
                 else "exact_environment_steps"
             ),
             "requested_online_steps": config.online_steps,
@@ -2482,6 +2716,9 @@ def _run_online(
     )
     if is_calql:
         online_corruption_metadata.update(calql_trajectory.metadata())
+        online_corruption_metadata["effective_calql_training_transitions"] = int(
+            calql_trajectory.completed_transitions
+        )
         online_corruption_metadata["online_calibration_bound_rate"] = float(
             last_metrics.get("online_calibration_bound_rate", 0.0)
         )
@@ -2499,6 +2736,12 @@ def _run_online(
                 ),
                 "pqe_first_block_update_count": int(
                     pqe_first_block_update_count
+                ),
+                **_pqe_block_schedule_metadata(
+                    config,
+                    pqe_block_update_counts,
+                    env_step=actual_online_steps,
+                    inferred_from_legacy=pqe_schedule_inferred_from_legacy,
                 ),
                 "priority_replay_offline": offline.priority_statistics(),
                 "priority_replay_online": replay.priority_statistics(),

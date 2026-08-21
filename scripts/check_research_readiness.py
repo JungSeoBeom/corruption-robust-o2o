@@ -145,13 +145,14 @@ def _settings_for_suite(suite: str) -> tuple[tuple[str, str], ...]:
     if suite == "all":
         from robust_o2o.corruption import SUPPORTED_ADVERSARIAL_TARGETS
 
+        adversarial = tuple(
+            ("adversarial", target)
+            for target in SUPPORTED_ADVERSARIAL_TARGETS
+        )
         return (
             *clean,
+            *adversarial,
             *random,
-            *tuple(
-                ("adversarial", target)
-                for target in SUPPORTED_ADVERSARIAL_TARGETS
-            ),
         )
     raise ValueError(f"unknown corruption suite {suite!r}")
 
@@ -287,6 +288,11 @@ def _runtime_checks(
             "runtime",
         )
     else:
+        from robust_o2o.reporting import (
+            ReportingValidationError,
+            validate_calql_completion_accounting,
+        )
+
         completed_trajectories = int(
             calql.completion.get("completed_online_trajectories", 0)
         )
@@ -299,19 +305,41 @@ def _runtime_checks(
         online_updates = int(
             calql.completion.get("online_critic_gradient_updates", 0)
         )
+        try:
+            accounting = validate_calql_completion_accounting(
+                calql.completion, context=f"run {calql.run_dir}"
+            )
+        except ReportingValidationError as exc:
+            accounting = None
+            accounting_error = str(exc)
+        else:
+            accounting_error = None
         ok = (
             completed_trajectories > 0
             and completed_transitions > 0
             and math.isclose(valid_fraction, 1.0)
             and online_updates > 0
             and calql.completion.get("calql_online_cql_enabled") is True
+            and accounting is not None
+        )
+        accounting_detail = (
+            accounting_error
+            if accounting_error is not None
+            else (
+                f"requested={accounting['requested_online_steps']} "
+                f"actual={accounting['actual_online_steps']} "
+                f"overshoot={accounting['episode_boundary_overshoot']} "
+                f"pending={accounting['pending_episode_length']} "
+                "effective="
+                f"{accounting['effective_calql_training_transitions']}"
+            )
         )
         calql_check = Check(
             "CAL-QL ONLINE MC EVIDENCE",
             ok,
             f"run={calql.run_dir} trajectories={completed_trajectories} "
             f"transitions={completed_transitions} valid_fraction={valid_fraction:g} "
-            f"online_critic_updates={online_updates}",
+            f"online_critic_updates={online_updates}; {accounting_detail}",
             "runtime",
         )
 

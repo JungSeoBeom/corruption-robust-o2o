@@ -143,7 +143,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="random",
         help=(
             "random means clean plus the four replay-transition poisoning "
-            "targets; adversarial includes only targets declared supported"
+            "targets; adversarial includes only targets declared supported; "
+            "all runs clean, then adversarial, then random"
         ),
     )
     parser.add_argument(
@@ -458,7 +459,11 @@ def settings_for_suite(
     if suite == "adversarial":
         return adversarial
     if suite == "all":
-        return (*random, *adversarial)
+        clean = () if strict else CLEAN_SETTINGS
+        random_only = tuple(
+            setting for setting in random if setting[0] == "random"
+        )
+        return (*clean, *adversarial, *random_only)
     raise ValueError(f"unknown corruption suite {suite!r}")
 
 
