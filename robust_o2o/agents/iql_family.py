@@ -389,6 +389,8 @@ class IQLFamilyAgent(BaseAgent):
         if self.actor_scheduler is not None and not self.online_phase:
             self.actor_scheduler.step()
         self.total_updates += 1
+        self.actor_updates += 1
+        self.critic_updates += 1
         absolute_td = (targets.unsqueeze(0) - predicted).detach().abs().reshape(-1)
         threshold = 1.0 / (self.config.riql_sigma**2)
         saturated = weights.detach() >= 100.0 - 1e-6

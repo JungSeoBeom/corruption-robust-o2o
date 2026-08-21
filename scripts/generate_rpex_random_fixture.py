@@ -13,17 +13,26 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import subprocess
 import sys
 import types
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
-import torch
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
-PINNED_COMMIT = "35da71ee5151b6179d21b9a2b4ce1b6408aedd04"
+from rpex_fixture_provenance import (  # noqa: E402
+    numpy_rng_state_hash,
+    platform_metadata,
+    require_pinned_clean_upstream,
+    require_strict_runtime,
+    sha256_file,
+    torch_rng_state_hash,
+)
+
 TARGETS = {
     "observations": ("observations", "corrupt_obs"),
     "actions": ("actions", "corrupt_act"),
@@ -96,33 +105,58 @@ def load_upstream_attack(upstream: Path):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--upstream-dir", type=Path, required=True)
+    parser.add_argument(
+        "--diagnostic-allow-runtime-mismatch",
+        action="store_true",
+        help=(
+            "allow unsupported host versions for diagnostic output only; "
+            "the result receives a non-certifiable diagnostic fixture ID"
+        ),
+    )
     args = parser.parse_args()
     upstream = args.upstream_dir.expanduser().resolve()
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=upstream,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if commit != PINNED_COMMIT:
-        raise RuntimeError(f"upstream commit {commit} != pinned {PINNED_COMMIT}")
+    runtime = require_strict_runtime(
+        allow_diagnostic_mismatch=args.diagnostic_allow_runtime_mismatch
+    )
+    upstream_provenance = require_pinned_clean_upstream(upstream)
+    commit = str(upstream_provenance["commit"])
     module, source = load_upstream_attack(upstream)
     clean = synthetic_dataset()
     seed = 7
     rate = 0.3
     epsilon = 0.5
+    generator_path = Path(__file__).resolve()
+    helper_path = generator_path.with_name("rpex_fixture_provenance.py")
+    strict_generation = bool(runtime["passed"])
     payload: dict[str, object] = {
-        "fixture_schema_version": 1,
-        "fixture_id": "rpex_random_corruption_v1",
+        "fixture_schema_version": 2,
+        "fixture_id": (
+            "rpex_random_corruption_v2"
+            if strict_generation
+            else "rpex_random_corruption_diagnostic_v2"
+        ),
+        "certification_scope": (
+            "random corruption transformation fixture only; not learner, "
+            "evaluator, online RNG, or end-to-end parity"
+        ),
+        "strict_runtime_preflight_passed": strict_generation,
+        "runtime_preflight": runtime,
         "generator": "pinned attack.py Attack.sample_indexs + corrupt_* methods",
+        "generator_sha256": sha256_file(generator_path),
+        "provenance_helper_sha256": sha256_file(helper_path),
         "upstream_repository": "https://github.com/felix-thu/RPEX",
         "upstream_commit": commit,
+        "upstream_checkout_clean": upstream_provenance["clean"],
+        "upstream_status_sha256": upstream_provenance["status_sha256"],
         "upstream_source_sha256": sha256_bytes(source.read_bytes()),
-        "python_version": sys.version.split()[0],
-        "numpy_version": np.__version__,
-        "pytorch_version": torch.__version__,
+        "upstream_source_hashes": {
+            "attack.py": sha256_file(source),
+        },
+        "platform": platform_metadata(execution_device="cpu"),
         "dataset_hash": dataset_hash(clean),
+        "input_hashes": {"synthetic_dataset": dataset_hash(clean)},
+        "checkpoint_required": False,
+        "checkpoint_sha256": None,
         "seed": seed,
         "corruption_rate": rate,
         "epsilon": epsilon,
@@ -139,10 +173,12 @@ def main() -> int:
         attack.corruption_range = epsilon
         attack.corruption_random = True
         attack.corruption_tag = dataset_key
+        rng_before = numpy_rng_state_hash(attack._np_rng.get_state())
         indices, original_indices = attack.sample_indexs()
         attack.attack_indexs = indices
         attack.original_indexs = original_indices
         result, _ = getattr(attack, method_name)(result)
+        rng_after = numpy_rng_state_hash(attack._np_rng.get_state())
         values = np.asarray(result[dataset_key][indices])
         payload["targets"][target] = {
             "selected_indices": indices.astype(np.int64).tolist(),
@@ -151,6 +187,8 @@ def main() -> int:
             "corrupted_values_dtype": str(values.dtype),
             "corrupted_value_hash": value_hash(target, indices, values),
             "final_dataset_hash": dataset_hash(result),
+            "numpy_rng_state_before_sha256": rng_before,
+            "numpy_rng_state_after_sha256": rng_after,
         }
     online_inputs = {
         "observations": (
@@ -184,8 +222,10 @@ def main() -> int:
     )
     observation = np.asarray([0.1, -0.2, 0.3], dtype=np.float32)
     action = np.asarray([0.25, -0.5], dtype=np.float32)
+    torch_rng_before = torch_rng_state_hash()
     for target, (data, std, reward_target, upstream_tag) in online_inputs.items():
         np.random.seed(seed)
+        rng_before = numpy_rng_state_hash(np.random.get_state())
         values = []
         selected = []
         for _ in range(8):
@@ -203,11 +243,27 @@ def main() -> int:
             )
             values.append(np.asarray(value, dtype=np.float32).tolist())
             selected.append(int(flag))
+        rng_after_calls = numpy_rng_state_hash(np.random.get_state())
+        rng_tail = np.random.uniform(size=4).tolist()
         payload["online_random"][target] = {
             "selected": selected,
             "values": values,
-            "rng_tail": np.random.uniform(size=4).tolist(),
+            "rng_tail": rng_tail,
+            "numpy_rng_state_before_sha256": rng_before,
+            "numpy_rng_state_after_calls_sha256": rng_after_calls,
+            "numpy_rng_state_after_tail_sha256": numpy_rng_state_hash(
+                np.random.get_state()
+            ),
         }
+    payload["process_rng_state_hashes"] = {
+        "torch_cpu_before_sha256": torch_rng_before,
+        "torch_cpu_after_sha256": torch_rng_state_hash(),
+    }
+    if not strict_generation:
+        payload["diagnostic_only_reason"] = (
+            "unsupported runtime override was used; this output cannot satisfy "
+            "strict or publication eligibility"
+        )
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 

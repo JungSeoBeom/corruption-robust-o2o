@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the declared five-baseline diagnostic or strict eligible subset suite."""
+"""Launch the custom-budget research benchmark across corruption settings."""
 
 from __future__ import annotations
 
@@ -20,57 +20,55 @@ from robust_o2o.config import (
     LOCAL_PROTOCOL,
     PROTOCOLS,
 )
+from robust_o2o.corruption import SUPPORTED_ADVERSARIAL_TARGETS
 from robust_o2o.fidelity import (
     IMPLEMENTATION_PROFILES,
+    MAIN_BASELINES,
     ONLINE_CORRUPTION_SCALE_PROFILES,
+    OPTIONAL_BASELINES,
     RUN_PURPOSES,
     STRICT_FINAL_SEEDS,
     STRICT_FINAL_TASKS,
     SUITE_PROFILES,
     strict_final_algorithms,
 )
-from robust_o2o.final_gate import (
-    FinalAuditGateError,
-    ResearchLabelContractError,
-    require_final_benchmark_audit,
-    validate_research_label_contract,
-)
-
-
 ENV_NAME = "hopper-medium-replay-v2"
-ALGORITHMS = (
-    "rpex",
-    "riql_naive",
-    "wsrl",
-    "cal_ql",
-    "pessimistic_q_ensemble",
-)
+# Backward-compatible import name. The default suite is now intentionally
+# three main baselines; adaptations/approximations require an explicit option.
+ALGORITHMS = MAIN_BASELINES
 CORRUPTION_SUITES = ("clean", "random", "adversarial", "all")
 CLEAN_SETTINGS = (("clean", "none"),)
-RANDOM_SETTINGS = (
+DIAGNOSTIC_RANDOM_SETTINGS = (
     *CLEAN_SETTINGS,
     ("random", "observations"),
     ("random", "actions"),
     ("random", "rewards"),
     ("random", "dynamics"),
 )
-ADVERSARIAL_SETTINGS = (
-    ("adversarial", "observations"),
-    ("adversarial", "actions"),
-    ("adversarial", "rewards"),
-    ("adversarial", "dynamics"),
+STRICT_RANDOM_SETTINGS = (
+    ("random", "observations"),
+    ("random", "actions"),
+    ("random", "rewards"),
+    ("random", "dynamics"),
 )
-# The pinned upstream-derived adversarial certificate currently covers only
-# the observation optimizer core.  Other official RPEX targets remain useful
-# diagnostic conditions, but cannot enter a strict result until target-specific
-# fixtures are added.
-STRICT_ADVERSARIAL_SETTINGS = (("adversarial", "observations"),)
+# Backward-compatible name for callers that use the historical diagnostic
+# clean-plus-four matrix.
+RANDOM_SETTINGS = DIAGNOSTIC_RANDOM_SETTINGS
+ADVERSARIAL_SETTINGS = tuple(
+    ("adversarial", target)
+    for target in SUPPORTED_ADVERSARIAL_TARGETS
+)
+# The pinned upstream-derived adversarial fixture covers only the optimizer
+# core.  It is not an end-to-end condition certificate and therefore
+# authorizes no strict adversarial setting.
+STRICT_ADVERSARIAL_SETTINGS: tuple[tuple[str, str], ...] = ()
 # Backward-compatible import used by older callers; the default suite remains
 # clean plus the four random targets.
 SETTINGS = RANDOM_SETTINGS
 RESERVED_PASSTHROUGH_OPTIONS = {
     "--algorithm",
     "--algorithms",
+    "--optional-baselines",
     "--benchmark-seed-set",
     "--comparison-name",
     "--corruption",
@@ -87,6 +85,11 @@ RESERVED_PASSTHROUGH_OPTIONS = {
     "--protocol",
     "--seed",
     "--seeds",
+    "--evaluation-interval",
+    "--eval-period",
+    "--evaluation-episodes",
+    "--eval-episodes",
+    "--final-window-size",
 }
 
 
@@ -97,14 +100,24 @@ def _csv(value: str) -> list[str]:
 def _default_experiment_name(env_name: str) -> str:
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     domain = env_name.split("-", 1)[0]
-    return f"{domain}_5x5_{stamp}_{str(uuid.uuid4())[:8]}"
+    return f"{domain}_research_benchmark_{stamp}_{str(uuid.uuid4())[:8]}"
+
+
+def _selected_algorithms(args: argparse.Namespace) -> tuple[str, ...]:
+    if args.suite_profile == "primary_research_benchmark":
+        return tuple(
+            algorithm
+            for algorithm in args.algorithms
+            if algorithm in strict_final_algorithms()
+        )
+    return (*tuple(args.algorithms), *tuple(args.optional_baselines))
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the five diagnostic baselines, or the registry-approved "
-            "strict subset, on clean/random/adversarial RPEX conditions"
+            "Run the RPEX, RIQL-naive, and WSRL main benchmark. Cal-QL "
+            "locomotion and shared-actor PQE are explicit optional results."
         )
     )
     parser.add_argument("--env-name", choices=BENCHMARK_ENVS, default=ENV_NAME)
@@ -113,22 +126,54 @@ def build_parser() -> argparse.ArgumentParser:
         choices=CORRUPTION_SUITES,
         default="random",
         help=(
-            "clean; clean+four official random targets; four official "
-            "adversarial targets; or their union"
+            "random means clean plus the four replay-transition poisoning "
+            "targets; adversarial includes only targets declared supported"
+        ),
+    )
+    parser.add_argument(
+        "--algorithms",
+        type=_csv,
+        default=list(MAIN_BASELINES),
+        help="comma-separated subset of main baselines",
+    )
+    parser.add_argument(
+        "--optional-baselines",
+        type=_csv,
+        default=[],
+        help=(
+            "explicit opt-in list: cal_ql_locomotion_adaptation and/or "
+            "pqe_shared_actor_approx"
         ),
     )
     parser.add_argument("--seeds", type=_csv, default=["0"])
     parser.add_argument("--offline-steps", type=int, default=500_000)
     parser.add_argument("--online-steps", type=int, default=500_000)
+    parser.add_argument(
+        "--evaluation-interval",
+        "--eval-period",
+        dest="eval_period",
+        type=int,
+        default=10_000,
+    )
+    parser.add_argument(
+        "--evaluation-episodes",
+        "--eval-episodes",
+        dest="eval_episodes",
+        type=int,
+        default=10,
+    )
+    parser.add_argument("--final-window-size", type=int, default=3)
     parser.add_argument("--protocol", choices=PROTOCOLS, default=DEFAULT_PROTOCOL)
     parser.add_argument(
         "--implementation-profile", choices=IMPLEMENTATION_PROFILES
     )
     parser.add_argument(
         "--suite-profile", choices=SUITE_PROFILES,
-        default="common_budget_diagnostic",
+        default="research_benchmark",
     )
-    parser.add_argument("--run-purpose", choices=RUN_PURPOSES, default="diagnostic")
+    parser.add_argument(
+        "--run-purpose", choices=RUN_PURPOSES, default="research_benchmark"
+    )
     parser.add_argument(
         "--online-corruption-scale-profile",
         choices=ONLINE_CORRUPTION_SCALE_PROFILES,
@@ -163,25 +208,84 @@ def _validate_args(
             int(seed)
         except ValueError:
             parser.error(f"invalid seed: {seed!r}")
-    selected_algorithms = (
-        tuple(
-            algorithm
-            for algorithm in ALGORITHMS
-            if algorithm in strict_final_algorithms()
+    retired = {
+        "pessimistic_q_ensemble",
+        "pessimistic-q-ensemble",
+        "pqe",
+    }
+    requested = (*tuple(args.algorithms), *tuple(args.optional_baselines))
+    retired_requested = sorted(set(requested) & retired)
+    if retired_requested:
+        parser.error(
+            "exact Pessimistic Q-Ensemble is not implemented; the shared-actor "
+            "approximation must be explicitly selected as "
+            "--optional-baselines pqe_shared_actor_approx"
         )
-        if args.suite_profile == "primary_research_benchmark"
-        else ALGORITHMS
-    )
-    try:
-        validate_research_label_contract(
-            args.run_purpose,
-            args.suite_profile,
-            selected_algorithms,
+    retired_calql = sorted(set(requested) & {"cal_ql", "cal-ql", "calql"})
+    if retired_calql:
+        parser.error(
+            "Cal-QL locomotion is a task adaptation; select it explicitly as "
+            "--optional-baselines cal_ql_locomotion_adaptation"
         )
-    except ResearchLabelContractError as exc:
-        parser.error(str(exc))
+    unknown_main = sorted(set(args.algorithms) - set(MAIN_BASELINES))
+    if unknown_main:
+        parser.error(
+            "--algorithms accepts only main baselines "
+            f"{','.join(MAIN_BASELINES)}; invalid: {','.join(unknown_main)}"
+        )
+    unknown_optional = sorted(set(args.optional_baselines) - set(OPTIONAL_BASELINES))
+    if unknown_optional:
+        parser.error(
+            "--optional-baselines accepts only "
+            f"{','.join(OPTIONAL_BASELINES)}; invalid: {','.join(unknown_optional)}"
+        )
+    if not args.algorithms:
+        parser.error("--algorithms cannot be empty for a research benchmark")
+    if len(requested) != len(set(requested)):
+        parser.error("algorithm selections cannot contain duplicates")
+    if args.run_purpose == "research_benchmark" and args.suite_profile != "research_benchmark":
+        parser.error(
+            "--run-purpose research_benchmark requires "
+            "--suite-profile research_benchmark"
+        )
+    if args.suite_profile == "research_benchmark" and args.run_purpose != "research_benchmark":
+        parser.error(
+            "--suite-profile research_benchmark requires "
+            "--run-purpose research_benchmark"
+        )
+    if args.run_purpose == "research_benchmark":
+        if args.implementation_profile is None:
+            args.implementation_profile = "research_benchmark"
+        elif args.implementation_profile != "research_benchmark":
+            parser.error(
+                "research_benchmark requires "
+                "--implementation-profile research_benchmark"
+            )
+    selected_algorithms = _selected_algorithms(args)
+    if (
+        args.run_purpose in ("paper_reproduction", "final_benchmark")
+        or args.suite_profile == "primary_research_benchmark"
+    ):
+        # Strict publication infrastructure stays entirely outside the normal
+        # research path; importing it must never become a research prerequisite.
+        from robust_o2o.final_gate import (
+            ResearchLabelContractError,
+            validate_research_label_contract,
+        )
+
+        try:
+            validate_research_label_contract(
+                args.run_purpose,
+                args.suite_profile,
+                selected_algorithms,
+            )
+        except ResearchLabelContractError as exc:
+            parser.error(str(exc))
     if args.offline_steps < 0 or args.online_steps < 0:
         parser.error("--offline-steps and --online-steps cannot be negative")
+    for name in ("eval_period", "eval_episodes", "final_window_size"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.suite_profile == "method_fidelity":
         parser.error(
             "method_fidelity 5x5 is unavailable: Cal-QL locomotion is a task "
@@ -189,6 +293,24 @@ def _validate_args(
             "--suite-profile common_budget_diagnostic; no run will be mislabeled "
             "as paper reproduction."
         )
+    if args.suite_profile == "primary_research_benchmark":
+        if args.corruption_suite == "clean":
+            parser.error(
+                "primary_research_benchmark excludes clean: pinned RPEX has "
+                "no official clean config row or condition certificate"
+            )
+        if args.corruption_suite in ("adversarial", "all"):
+            parser.error(
+                "primary_research_benchmark adversarial is unavailable: the "
+                "registered fixture verifies only the optimizer core, not the "
+                "end-to-end corruption condition"
+            )
+        if not selected_algorithms:
+            parser.error(
+                "primary_research_benchmark has no strict-eligible algorithms; "
+                "complete an official-adapter or end-to-end parity certificate "
+                "before launching this suite"
+            )
     if args.run_purpose == "final_benchmark":
         required = {str(seed) for seed in STRICT_FINAL_SEEDS}
         if set(args.seeds) != required or len(args.seeds) != len(required):
@@ -209,19 +331,11 @@ def _validate_args(
             parser.error(
                 "final_benchmark permits only the three medium-replay-v2 tasks"
             )
-        if (
-            args.corruption_suite in ("adversarial", "all")
-            and args.env_name != "hopper-medium-replay-v2"
-        ):
-            parser.error(
-                "final_benchmark adversarial observations currently require "
-                "hopper-medium-replay-v2: the registered optimizer-core "
-                "fixture is bound to the Hopper EDAC checkpoint"
-            )
     if args.online_corruption_scale_profile is None:
         args.online_corruption_scale_profile = (
             "rpex_official_code"
-            if args.suite_profile == "primary_research_benchmark"
+            if args.suite_profile
+            in ("research_benchmark", "primary_research_benchmark")
             else "dataset_std_scaled_extension"
         )
     if args.protocol in (LOCAL_PROTOCOL, "local_gymnasium_v4") and not args.allow_diagnostic_protocol:
@@ -255,18 +369,11 @@ def commands(
     runner = Path(__file__).resolve().parent / "run_all_algorithms.py"
     scale_profile = args.online_corruption_scale_profile or (
         "rpex_official_code"
-        if args.suite_profile == "primary_research_benchmark"
+        if args.suite_profile
+        in ("research_benchmark", "primary_research_benchmark")
         else "dataset_std_scaled_extension"
     )
-    selected_algorithms = (
-        tuple(
-            algorithm
-            for algorithm in ALGORITHMS
-            if algorithm in strict_final_algorithms()
-        )
-        if args.suite_profile == "primary_research_benchmark"
-        else ALGORITHMS
-    )
+    selected_algorithms = _selected_algorithms(args)
     algorithm_csv = ",".join(selected_algorithms)
     seed_csv = ",".join(args.seeds)
     for corruption, target in settings_for_suite(
@@ -308,6 +415,12 @@ def commands(
                     str(args.offline_steps),
                     "--online-steps",
                     str(args.online_steps),
+                    "--eval-period",
+                    str(args.eval_period),
+                    "--eval-episodes",
+                    str(args.eval_episodes),
+                    "--final-window-size",
+                    str(args.final_window_size),
                 )
             )
         if args.implementation_profile:
@@ -336,15 +449,16 @@ def settings_for_suite(
     *,
     strict: bool = False,
 ) -> tuple[tuple[str, str], ...]:
+    random = STRICT_RANDOM_SETTINGS if strict else DIAGNOSTIC_RANDOM_SETTINGS
     adversarial = STRICT_ADVERSARIAL_SETTINGS if strict else ADVERSARIAL_SETTINGS
     if suite == "clean":
-        return CLEAN_SETTINGS
+        return () if strict else CLEAN_SETTINGS
     if suite == "random":
-        return RANDOM_SETTINGS
+        return random
     if suite == "adversarial":
         return adversarial
     if suite == "all":
-        return (*RANDOM_SETTINGS, *adversarial)
+        return (*random, *adversarial)
     raise ValueError(f"unknown corruption suite {suite!r}")
 
 
@@ -352,25 +466,23 @@ def main() -> int:
     parser = build_parser()
     args, passthrough = parser.parse_known_args()
     _validate_args(parser, args, passthrough)
-    try:
-        require_final_benchmark_audit(
-            args.run_purpose,
-            dry_run=args.dry_run,
+    if args.run_purpose == "final_benchmark":
+        from robust_o2o.final_gate import (
+            FinalAuditGateError,
+            require_final_benchmark_audit,
         )
-    except FinalAuditGateError as exc:
-        print(f"FINAL_BENCHMARK_AUDIT_GATE_FAILED: {exc}", file=sys.stderr)
-        return 2
+
+        try:
+            require_final_benchmark_audit(
+                args.run_purpose,
+                dry_run=args.dry_run,
+            )
+        except FinalAuditGateError as exc:
+            print(f"FINAL_BENCHMARK_AUDIT_GATE_FAILED: {exc}", file=sys.stderr)
+            return 2
     experiment_name = args.experiment_name or _default_experiment_name(args.env_name)
     generated_commands = list(commands(args, passthrough, experiment_name))
-    selected_algorithms = (
-        tuple(
-            algorithm
-            for algorithm in ALGORITHMS
-            if algorithm in strict_final_algorithms()
-        )
-        if args.suite_profile == "primary_research_benchmark"
-        else ALGORITHMS
-    )
+    selected_algorithms = _selected_algorithms(args)
     selected_settings = settings_for_suite(
         args.corruption_suite,
         strict=args.suite_profile == "primary_research_benchmark",
@@ -380,6 +492,12 @@ def main() -> int:
     print(f"EXPERIMENT_NAME: {experiment_name}", flush=True)
     print(f"ENVIRONMENT: {args.env_name}", flush=True)
     print(f"ALGORITHMS: {', '.join(selected_algorithms)}", flush=True)
+    print(f"MAIN_BASELINES: {', '.join(args.algorithms)}", flush=True)
+    print(
+        "OPTIONAL_BASELINES: "
+        + (", ".join(args.optional_baselines) if args.optional_baselines else "none"),
+        flush=True,
+    )
     print(f"CORRUPTION_SUITE: {args.corruption_suite}", flush=True)
     print(
         "SETTINGS: "
@@ -401,7 +519,9 @@ def main() -> int:
         )
     else:
         print(
-            f"SCHEDULE: offline={args.offline_steps:,}, online={args.online_steps:,}",
+            f"SCHEDULE: offline={args.offline_steps:,}, online={args.online_steps:,}, "
+            f"eval_interval={args.eval_period:,}, eval_episodes={args.eval_episodes}, "
+            f"final_window={args.final_window_size}",
             flush=True,
         )
     print(f"SUITE_PROFILE: {args.suite_profile}", flush=True)
@@ -409,6 +529,8 @@ def main() -> int:
     if args.run_purpose in ("smoke", "diagnostic"):
         print("NOT A PAPER REPRODUCTION RUN", flush=True)
         print("NOT PUBLICATION-ELIGIBLE", flush=True)
+    elif args.run_purpose == "research_benchmark":
+        print("CUSTOM RESEARCH BENCHMARK (NOT OFFICIAL PAPER REPRODUCTION)", flush=True)
     print(
         f"ONLINE_CORRUPTION_SCALE_PROFILE: {args.online_corruption_scale_profile}",
         flush=True,

@@ -68,7 +68,7 @@ class SACEnsembleAgent(BaseAgent):
                 config.sac_num_critics,
                 layer_norm=False,
             )
-            if self.variant == "pessimistic_q_ensemble"
+            if self.variant == "pqe_shared_actor_approx"
             else None
         )
         self.target_critic2 = (
@@ -80,7 +80,7 @@ class SACEnsembleAgent(BaseAgent):
             DensityRatioNetwork(
                 state_dim, action_dim, config.hidden_dim, config.hidden_layers
             )
-            if self.variant == "pessimistic_q_ensemble"
+            if self.variant == "pqe_shared_actor_approx"
             else None
         )
         alpha_parameter_init = (
@@ -138,6 +138,14 @@ class SACEnsembleAgent(BaseAgent):
         return -(
             self.log_alpha * (log_prob + target_entropy).detach()
         ).mean()
+
+    def _cql_loss_enabled(self) -> bool:
+        """CQL is an offline pretrainer only for WSRL and the PQE port."""
+
+        return (
+            self.variant in ("wsrl", "pqe_shared_actor_approx")
+            and not self.online_phase
+        )
 
     def select_action(
         self,
@@ -411,42 +419,64 @@ class SACEnsembleAgent(BaseAgent):
         next_states = batch["next_observations"]
         terminals = batch["terminals"].reshape(-1)
 
-        sampled_actions, log_prob, _, policy_std = self.actor(
-            states, need_log_prob=True
-        )
-        temperature_log_prob = log_prob
-        if (
-            update_actor_temperature
-            and self.variant == "wsrl"
-            and self.config.wsrl_entropy_profile
-            == "official_negative_action_dim"
-        ):
-            # Upstream SACAgent.temperature_loss_fn samples from next observations.
-            _, temperature_log_prob, _, _ = self.actor(
-                next_states, need_log_prob=True
-            )
-        alpha_loss = self._temperature_loss(temperature_log_prob)
-        if update_actor_temperature:
-            self.alpha_optimizer.zero_grad(set_to_none=True)
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
-
-        policy_values = self.critic(states, sampled_actions)
-        if self.critic2 is not None:
-            policy_values = torch.minimum(
-                policy_values, self.critic2(states, sampled_actions)
-            )
-            policy_q = policy_values.mean(dim=0)
-        else:
-            policy_q = self._q_for_policy(policy_values)
-        actor_loss = (self.alpha.detach() * log_prob - policy_q).mean()
+        # A high-UTD critic-only step in upstream WSRL does not execute the
+        # actor/temperature loss functions.  Besides wasting work, sampling an
+        # unused policy action here would advance PyTorch's learner RNG before
+        # target-action and REDQ-subset sampling.
+        log_prob = states.new_zeros(len(states))
+        policy_std = states.new_ones((len(states), actions.shape[-1]))
+        policy_q = states.new_zeros(len(states))
+        actor_loss = states.new_zeros(())
+        alpha_loss = states.new_zeros(())
         policy_smoothness = states.new_tensor(0.0)
-        if self.variant == "ro2o" and not self.online_phase:
-            policy_smoothness = self._ro2o_policy_smoothness(states)
-            actor_loss = actor_loss + policy_smoothness
         actor_grad_norm = states.new_zeros(())
         actor_grad_norm_after = states.new_zeros(())
+        defer_actor_temperature_step = (
+            self.variant == "wsrl"
+            and update_actor_temperature
+            and update_critic
+        )
         if update_actor_temperature:
+            actor_alpha = self.alpha.detach().clone()
+            sampled_actions, log_prob, _, policy_std = self.actor(
+                states, need_log_prob=True
+            )
+            temperature_log_prob = log_prob
+            if (
+                self.variant == "wsrl"
+                and self.config.wsrl_entropy_profile
+                == "official_negative_action_dim"
+            ):
+                # Upstream temperature_loss_fn samples from next observations.
+                _, temperature_log_prob, _, _ = self.actor(
+                    next_states, need_log_prob=True
+                )
+            alpha_loss = self._temperature_loss(temperature_log_prob)
+            self.alpha_optimizer.zero_grad(set_to_none=True)
+            alpha_loss.backward()
+            if not defer_actor_temperature_step:
+                self.alpha_optimizer.step()
+
+            policy_values = self.critic(states, sampled_actions)
+            if self.critic2 is not None:
+                policy_values = torch.minimum(
+                    policy_values, self.critic2(states, sampled_actions)
+                )
+                policy_q = policy_values.mean(dim=0)
+            else:
+                policy_q = self._q_for_policy(policy_values)
+            # Flax computes actor and temperature gradients from one old
+            # parameter tree.  Preserve that temperature value for WSRL even
+            # though these disjoint PyTorch optimizers are stepped serially.
+            entropy_coefficient = (
+                actor_alpha
+                if self.variant == "wsrl"
+                else self.alpha.detach()
+            )
+            actor_loss = (entropy_coefficient * log_prob - policy_q).mean()
+            if self.variant == "ro2o" and not self.online_phase:
+                policy_smoothness = self._ro2o_policy_smoothness(states)
+                actor_loss = actor_loss + policy_smoothness
             self.actor_optimizer.zero_grad(set_to_none=True)
             actor_loss.backward()
             actor_grad_norm = (
@@ -457,7 +487,8 @@ class SACEnsembleAgent(BaseAgent):
                 )
             )
             actor_grad_norm_after = gradient_norm(self.actor.parameters())
-            self.actor_optimizer.step()
+            if not defer_actor_temperature_step:
+                self.actor_optimizer.step()
 
         if not update_critic:
             if not update_actor_temperature:
@@ -483,6 +514,10 @@ class SACEnsembleAgent(BaseAgent):
                 "policy_log_std_mean": float(policy_std.log().mean().item()),
                 "policy_log_std_min": float(policy_std.log().min().item()),
                 "policy_log_std_max": float(policy_std.log().max().item()),
+                "cql_loss_enabled": float(self._cql_loss_enabled()),
+                "wsrl_online_cql_disabled": float(
+                    self.variant == "wsrl" and self.online_phase
+                ),
             }
 
         with torch.no_grad():
@@ -585,7 +620,8 @@ class SACEnsembleAgent(BaseAgent):
             critic_loss = per_sample_td.mean()
 
         cql_penalty = states.new_tensor(0.0)
-        if self.variant in ("wsrl", "pessimistic_q_ensemble") and not self.online_phase:
+        cql_loss_enabled = self._cql_loss_enabled()
+        if cql_loss_enabled:
             cql_penalty = self.config.cql_alpha * self._cql_penalty(
                 states, next_states, actions
             )
@@ -624,6 +660,13 @@ class SACEnsembleAgent(BaseAgent):
                     self.critic2,
                     self.config.target_update_rate,
                 )
+        if defer_actor_temperature_step:
+            # Upstream applies critic, actor, and temperature gradients from
+            # one immutable Flax parameter tree.  Delay the disjoint PyTorch
+            # optimizer steps until every WSRL loss has been evaluated from
+            # the same pre-update parameters.
+            self.actor_optimizer.step()
+            self.alpha_optimizer.step()
 
         density_value = states.new_tensor(0.0)
         density_batches_available = (
@@ -683,6 +726,10 @@ class SACEnsembleAgent(BaseAgent):
             "alpha_loss": float(alpha_loss.item()),
             "alpha": float(self.alpha.item()),
             "cql_penalty": float(cql_penalty.item()),
+            "cql_loss_enabled": float(cql_loss_enabled),
+            "wsrl_online_cql_disabled": float(
+                self.variant == "wsrl" and self.online_phase
+            ),
             "uncertainty_mean": float(uncertainty_mean.item()),
             "q_smoothness": float(q_smoothness.item()),
             "policy_smoothness": float(policy_smoothness.item()),

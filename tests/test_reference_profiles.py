@@ -157,7 +157,7 @@ class ReferenceProfileTest(unittest.TestCase):
 
     def test_calql_reference_defaults_and_first_actor_update(self):
         config = ExperimentConfig(
-            "cal_ql",
+            "cal_ql_locomotion_adaptation",
             "hopper-medium-replay-v2",
             hidden_dim=16,
             hidden_layers=2,
@@ -174,7 +174,9 @@ class ReferenceProfileTest(unittest.TestCase):
 
     def test_calql_legacy_keeps_bc100k(self):
         config = ExperimentConfig(
-            "cal_ql", "hopper-medium-replay-v2", algorithm_profile="legacy_current"
+            "cal_ql_locomotion_adaptation",
+            "hopper-medium-replay-v2",
+            algorithm_profile="legacy_current",
         )
         self.assertEqual(config.calql_bc_warmup_steps, 100_000)
         self.assertFalse(config.cql_max_target_backup)
@@ -182,7 +184,7 @@ class ReferenceProfileTest(unittest.TestCase):
 
     def test_oracle_mode_is_never_plain_calql_profile(self):
         config = ExperimentConfig(
-            "cal_ql",
+            "cal_ql_locomotion_adaptation",
             "hopper-medium-replay-v2",
             calibration_mask_mode="oracle_exclude_corrupted",
         )
@@ -294,7 +296,7 @@ class ReferenceProfileTest(unittest.TestCase):
     def test_learner_initialization_ignores_corruption_seed(self):
         configs = [
             ExperimentConfig(
-                "cal_ql",
+                "cal_ql_locomotion_adaptation",
                 "hopper-medium-replay-v2",
                 learner_seed=5,
                 corruption_seed=seed,
@@ -328,11 +330,13 @@ class ReferenceProfileTest(unittest.TestCase):
         self.assertEqual(config.protocol, LOCAL_PROTOCOL)
 
     def test_checkpoint_fingerprint_and_profile_mismatch_are_hard_errors(self):
-        config = ExperimentConfig("cal_ql", "hopper-medium-replay-v2")
+        config = ExperimentConfig(
+            "cal_ql_locomotion_adaptation", "hopper-medium-replay-v2"
+        )
         config._environment_fingerprint = "current"
         config._environment_fingerprint_payload = {"dataset_sha256": "new"}
         payload = {
-            "algorithm": "cal_ql",
+            "algorithm": "cal_ql_locomotion_adaptation",
             "algorithm_profile": config.implementation_profile,
             "implementation_profile": config.implementation_profile,
             "env_name": config.env_name,

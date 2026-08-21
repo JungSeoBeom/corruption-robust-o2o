@@ -11,14 +11,49 @@ UPSTREAM_REPOSITORIES = {
     "riql_naive": "https://github.com/felix-thu/RPEX",
     "riql_pex": "https://github.com/felix-thu/RPEX",
     "wsrl": "https://github.com/zhouzypaul/wsrl",
-    "cal_ql": "https://github.com/nakamotoo/Cal-QL",
-    "pessimistic_q_ensemble": "https://github.com/shlee94/Off2OnRL",
+    "cal_ql_locomotion_adaptation": "https://github.com/nakamotoo/Cal-QL",
+    "pqe_shared_actor_approx": "https://github.com/shlee94/Off2OnRL",
 }
+
+
+def _benchmark_classification(
+    algorithm: str, resolved: Mapping[str, Any]
+) -> tuple[str, str]:
+    defaults = {
+        "rpex": ("source_aligned_port", "main"),
+        "riql_naive": ("source_aligned_port", "main"),
+        "wsrl": ("framework_port", "main"),
+        "cal_ql_locomotion_adaptation": (
+            "task_adaptation",
+            "optional_adapted",
+        ),
+        "pqe_shared_actor_approx": (
+            "approximation",
+            "optional_diagnostic",
+        ),
+    }
+    default_type, default_role = defaults.get(
+        algorithm, ("diagnostic_extension", "diagnostic")
+    )
+    return (
+        str(resolved.get("implementation_type") or default_type),
+        str(resolved.get("benchmark_role") or default_role),
+    )
 
 
 def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
     algorithm = str(resolved["algorithm"])
     policy_distribution = str(resolved.get("action_distribution"))
+    implementation_type, benchmark_role = _benchmark_classification(
+        algorithm, resolved
+    )
+    uses_corruption_labels = bool(
+        resolved.get(
+            "uses_corruption_labels",
+            resolved.get("calibration_mask_mode") == "oracle_exclude_corrupted",
+        )
+    )
+    offline_corruption = resolved.get("offline_corruption", {})
     hyperparameter_fields = (
         "stage",
         "batch_size",
@@ -149,6 +184,12 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
             else "non_publication_run"
         ),
         "algorithm": algorithm,
+        "implementation_type": implementation_type,
+        "benchmark_role": benchmark_role,
+        "main_table_eligible": bool(
+            benchmark_role == "main" and not uses_corruption_labels
+        ),
+        "uses_corruption_labels": uses_corruption_labels,
         "paper_title": resolved.get("paper_title"),
         "implementation_profile": resolved.get("implementation_profile"),
         "algorithm_profile": resolved.get("resolved_algorithm_profile"),
@@ -213,6 +254,15 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "online_replay_profile": resolved.get("online_replay_profile"),
         "attack_semantics": resolved.get("random_attack_semantics"),
         "attack_timing": resolved.get("attack_timing"),
+        "corruption_application_contract": resolved.get(
+            "corruption_application_contract",
+            offline_corruption.get(
+                "corruption_application_contract",
+                "replay_transition_poisoning",
+            ),
+        ),
+        "environment_interaction_corrupted": False,
+        "evaluation_corruption": resolved.get("evaluation_corruption", "clean"),
         "attack_implementation": resolved.get("adversarial_attack_profile"),
         "adversarial_attack_profile": resolved.get("adversarial_attack_profile"),
         "online_corruption_scale_profile": resolved.get(
@@ -227,9 +277,18 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "attack_implementation_version": resolved.get(
             "offline_corruption", {}
         ).get("attack_implementation_version"),
-        "attacker_checkpoint_sha256": resolved.get(
-            "offline_corruption", {}
-        ).get("attack_checkpoint_fingerprint"),
+        "attacker_checkpoint_path": offline_corruption.get(
+            "attacker_checkpoint_path"
+        ),
+        "attacker_checkpoint_sha256": offline_corruption.get(
+            "attack_checkpoint_fingerprint"
+        ),
+        "attacker_checkpoint_environment": offline_corruption.get(
+            "oracle_environment"
+        ),
+        "attacker_checkpoint_strict_load": offline_corruption.get(
+            "strict_checkpoint_load_verified"
+        ),
         "attacker_checkpoint_source": resolved.get("attack_checkpoint_source"),
         "attacker_checkpoint_expected_sha256": resolved.get(
             "attack_checkpoint_expected_sha256"
@@ -264,6 +323,12 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "corruption_artifact_hash": resolved.get("offline_corruption", {}).get(
             "final_artifact_sha256"
+        ),
+        "offline_corruption_artifact_cache_key": offline_corruption.get(
+            "cache_key"
+        ),
+        "offline_corruption_artifact_path": offline_corruption.get(
+            "cache_file"
         ),
         "corruption_rng_implementation": resolved.get(
             "offline_corruption", {}
@@ -322,8 +387,22 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "evaluation_interval": resolved.get("eval_period"),
         "evaluation_episodes": resolved.get("eval_episodes"),
+        "final_window_size": resolved.get("final_window_size", 3),
+        "critic_gradient_updates": resolved.get("critic_gradient_updates"),
+        "actor_gradient_updates": resolved.get("actor_gradient_updates"),
+        "temperature_updates": resolved.get("temperature_updates"),
+        "configured_utd": resolved.get(
+            "configured_utd", resolved.get("utd_ratio")
+        ),
+        "actual_utd": resolved.get("actual_utd"),
         "reporting_rule": resolved.get("reporting_rule"),
         "reporting_rule_verified": resolved.get("reporting_rule_verified"),
+        "learner_parity_verified": resolved.get(
+            "learner_parity_verified", False
+        ),
+        "condition_certificate_verified": resolved.get(
+            "condition_certificate_verified", False
+        ),
         "publication_eligible": resolved.get("publication_eligible", False),
         "paper_reproduction_eligible": resolved.get(
             "paper_reproduction_eligible", False

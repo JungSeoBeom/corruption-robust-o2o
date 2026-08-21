@@ -35,7 +35,9 @@ from robust_o2o.config import (
 )
 from robust_o2o.fidelity import (
     IMPLEMENTATION_PROFILES,
+    MAIN_BASELINES,
     ONLINE_CORRUPTION_SCALE_PROFILES,
+    OPTIONAL_BASELINES,
     RUN_PURPOSES,
     STRICT_FINAL_SEEDS,
     SUITE_PROFILES,
@@ -43,15 +45,6 @@ from robust_o2o.fidelity import (
     strict_final_algorithms,
 )
 from robust_o2o.environment import preflight_runtime
-from robust_o2o.final_gate import (
-    AUDIT_RECEIPT_ENV,
-    AUDIT_RECEIPT_SHA256_ENV,
-    FinalAuditGateError,
-    ResearchLabelContractError,
-    require_final_benchmark_audit,
-    validate_research_label_contract,
-    write_final_audit_evidence,
-)
 from robust_o2o.logging_utils import format_duration, format_timestamp
 from robust_o2o.paths import comparison_directory
 
@@ -62,10 +55,10 @@ ALGORITHM_DISPLAY_NAMES = {
     "riql_naive": "RIQL naive",
     "uwmsg": "UWMSG",
     "pex": "PEX",
-    "cal_ql": "Cal-QL",
+    "cal_ql_locomotion_adaptation": "Cal-QL locomotion adaptation",
     "wsrl": "WSRL",
     "ro2o": "RO2O",
-    "pessimistic_q_ensemble": "PQE shared-actor approximation",
+    "pqe_shared_actor_approx": "PQE shared-actor approximation",
 }
 
 TIMING_FIELDS = (
@@ -122,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("OBS", "ACT", "REW", "DYN"),
         default=(0.25, 0.25, 0.25, 0.25),
     )
-    parser.add_argument("--algorithms", type=_csv, default=list(ALGORITHMS))
+    parser.add_argument("--algorithms", type=_csv)
     parser.add_argument("--seeds", type=_csv, default=["0"])
     parser.add_argument(
         "--benchmark-seed-set",
@@ -156,6 +149,12 @@ def _validate_args(
     args: argparse.Namespace,
     passthrough: Iterable[str] = (),
 ) -> None:
+    if args.algorithms is None:
+        args.algorithms = list(
+            MAIN_BASELINES
+            if args.run_purpose == "research_benchmark"
+            else ALGORITHMS
+        )
     if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
         args.protocol = LOCAL_PROTOCOL
     original_env_name = args.env_name
@@ -175,6 +174,29 @@ def _validate_args(
         parser.error(f"unknown algorithms: {', '.join(unknown_algorithms)}")
     if not args.algorithms:
         parser.error("--algorithms cannot be empty")
+    if args.run_purpose == "research_benchmark":
+        if args.suite_profile != "research_benchmark":
+            parser.error(
+                "--run-purpose research_benchmark requires "
+                "--suite-profile research_benchmark"
+            )
+        if args.implementation_profile is None:
+            args.implementation_profile = "research_benchmark"
+        elif args.implementation_profile != "research_benchmark":
+            parser.error(
+                "research_benchmark requires "
+                "--implementation-profile research_benchmark"
+            )
+        unsupported_research = sorted(
+            set(args.algorithms) - set((*MAIN_BASELINES, *OPTIONAL_BASELINES))
+        )
+        if unsupported_research:
+            parser.error(
+                "research_benchmark supports only main baselines "
+                f"{','.join(MAIN_BASELINES)} and explicit optional baselines "
+                f"{','.join(OPTIONAL_BASELINES)}; invalid: "
+                + ",".join(unsupported_research)
+            )
     if not args.seeds:
         parser.error("--seeds cannot be empty")
     for seed in args.seeds:
@@ -192,14 +214,23 @@ def _validate_args(
             "these child identity/provenance options cannot be overridden: "
             + ", ".join(conflicts)
         )
-    try:
-        validate_research_label_contract(
-            args.run_purpose,
-            args.suite_profile,
-            args.algorithms,
+    if (
+        args.run_purpose == "final_benchmark"
+        or args.suite_profile == "primary_research_benchmark"
+    ):
+        from robust_o2o.final_gate import (
+            ResearchLabelContractError,
+            validate_research_label_contract,
         )
-    except ResearchLabelContractError as exc:
-        parser.error(str(exc))
+
+        try:
+            validate_research_label_contract(
+                args.run_purpose,
+                args.suite_profile,
+                args.algorithms,
+            )
+        except ResearchLabelContractError as exc:
+            parser.error(str(exc))
     if args.run_purpose == "final_benchmark":
         required = {str(seed) for seed in STRICT_FINAL_SEEDS}
         if set(args.seeds) != required or len(args.seeds) != len(required):
@@ -291,6 +322,7 @@ def _validate_args(
         args.online_corruption_scale_profile = (
             "rpex_official_code"
             if args.suite_profile in (
+                "research_benchmark",
                 "method_fidelity",
                 "primary_research_benchmark",
             )
@@ -332,7 +364,10 @@ def _comparison_directory(args: argparse.Namespace) -> Path:
         args.corruption_target,
         name,
         args.protocol,
-        f"{args.suite_profile}__{args.implementation_profile or 'auto'}",
+        (
+            f"{args.run_purpose}__{args.suite_profile}__"
+            f"{args.implementation_profile or 'auto'}"
+        ),
     )
 
 
@@ -344,7 +379,8 @@ def commands(
     script = Path(__file__).resolve().parent / "run_experiment.py"
     scale_profile = args.online_corruption_scale_profile or (
         "rpex_official_code"
-        if args.suite_profile in ("method_fidelity", "primary_research_benchmark")
+        if args.suite_profile
+        in ("research_benchmark", "method_fidelity", "primary_research_benchmark")
         else "dataset_std_scaled_extension"
     )
     for algorithm in args.algorithms:
@@ -457,6 +493,13 @@ def _remove_invalid_canonical_artifacts(comparison_dir: Path) -> None:
         "paper_reproduction_summary.csv",
         "common_per_seed_final_scores.csv",
         "common_benchmark_summary.csv",
+        "seed_run_status.csv",
+        "research_per_seed_final_scores.csv",
+        "research_summary.csv",
+        "adapted_baselines_per_seed_final_scores.csv",
+        "adapted_baselines_summary.csv",
+        "diagnostic_per_seed_final_scores.csv",
+        "diagnostic_summary.csv",
     }
     for phase in ("offline_online", "offline", "online"):
         names.add(f"comparison_{phase}.png")
@@ -469,14 +512,21 @@ def main() -> int:
     parser = build_parser()
     args, passthrough = parser.parse_known_args()
     _validate_args(parser, args, passthrough)
-    try:
-        audit_receipt = require_final_benchmark_audit(
-            args.run_purpose,
-            dry_run=args.dry_run,
+    audit_receipt = None
+    if args.run_purpose == "final_benchmark":
+        from robust_o2o.final_gate import (
+            FinalAuditGateError,
+            require_final_benchmark_audit,
         )
-    except FinalAuditGateError as exc:
-        print(f"FINAL_BENCHMARK_AUDIT_GATE_FAILED: {exc}", file=sys.stderr)
-        return 2
+
+        try:
+            audit_receipt = require_final_benchmark_audit(
+                args.run_purpose,
+                dry_run=args.dry_run,
+            )
+        except FinalAuditGateError as exc:
+            print(f"FINAL_BENCHMARK_AUDIT_GATE_FAILED: {exc}", file=sys.stderr)
+            return 2
     comparison_dir = _comparison_directory(args)
     runs_dir = comparison_dir / "runs"
     generated_commands = list(commands(args, passthrough, runs_dir))
@@ -521,15 +571,24 @@ def main() -> int:
     if args.run_purpose in ("smoke", "diagnostic"):
         print("NOT A PAPER REPRODUCTION RUN", flush=True)
         print("NOT PUBLICATION-ELIGIBLE", flush=True)
+    elif args.run_purpose == "research_benchmark":
+        print(
+            "CUSTOM RESEARCH BENCHMARK (NOT OFFICIAL PAPER REPRODUCTION)",
+            flush=True,
+        )
     for index, command in enumerate(generated_commands, start=1):
         print(f"[{index}/{len(generated_commands)}] {shlex.join(command)}", flush=True)
     if args.dry_run:
         return 0
 
     comparison_dir.mkdir(parents=True, exist_ok=False)
-    audit_evidence_path = write_final_audit_evidence(
-        comparison_dir, audit_receipt
-    )
+    audit_evidence_path = None
+    if audit_receipt is not None:
+        from robust_o2o.final_gate import write_final_audit_evidence
+
+        audit_evidence_path = write_final_audit_evidence(
+            comparison_dir, audit_receipt
+        )
     start_wall = datetime.now().astimezone()
     start_monotonic = time.perf_counter()
     run_records = []
@@ -647,18 +706,7 @@ def main() -> int:
         "implementation_profile": args.implementation_profile or "auto",
         "suite_profile": args.suite_profile,
         "run_purpose": args.run_purpose,
-        "final_audit": (
-            None
-            if audit_receipt is None
-            else {
-                "context_token": audit_receipt["context_token"],
-                "issued_at_utc": audit_receipt["issued_at_utc"],
-                "receipt_source": os.environ.get(AUDIT_RECEIPT_ENV),
-                "receipt_sha256": os.environ.get(AUDIT_RECEIPT_SHA256_ENV),
-                "evidence_path": str(audit_evidence_path),
-                "audit_result": audit_receipt["audit_result"],
-            }
-        ),
+        "final_audit": None,
         "online_corruption_scale_profile": args.online_corruption_scale_profile,
         "environment": args.env_name,
         "corruption": args.corruption,
@@ -682,6 +730,20 @@ def main() -> int:
         "aggregation_error": aggregation_error,
         "benchmark_valid": not failures and aggregation_error is None,
     }
+    if audit_receipt is not None:
+        from robust_o2o.final_gate import (
+            AUDIT_RECEIPT_ENV,
+            AUDIT_RECEIPT_SHA256_ENV,
+        )
+
+        manifest["final_audit"] = {
+            "context_token": audit_receipt["context_token"],
+            "issued_at_utc": audit_receipt["issued_at_utc"],
+            "receipt_source": os.environ.get(AUDIT_RECEIPT_ENV),
+            "receipt_sha256": os.environ.get(AUDIT_RECEIPT_SHA256_ENV),
+            "evidence_path": str(audit_evidence_path),
+            "audit_result": audit_receipt["audit_result"],
+        }
     with (comparison_dir / "manifest.json").open("w", encoding="utf-8") as stream:
         json.dump(manifest, stream, indent=2, ensure_ascii=False)
 

@@ -3,19 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sys
 import traceback
 from typing import Any
 
 from robust_o2o.config import build_parser, config_from_args
 from robust_o2o.experiment import run_experiment
-from robust_o2o.final_gate import (
-    AUDIT_RECEIPT_SHA256_ENV,
-    FinalAuditGateError,
-    RECEIPT_SCHEMA,
-    require_final_benchmark_audit,
-)
 from robust_o2o.logging_utils import RunLogger, resolve_resume_run_directory
 from robust_o2o.manifest import verify_experiment_manifest
 
@@ -42,6 +35,8 @@ def inherit_verified_final_resume_attestation(
 
     if config.run_purpose != "final_benchmark" or not config.resume_run:
         return
+    from robust_o2o.final_gate import RECEIPT_SCHEMA
+
     if not isinstance(audit_receipt, dict):
         raise ValueError("strict final resume requires a verified current audit receipt")
     current_receipt_digest = getattr(
@@ -128,24 +123,38 @@ def inherit_verified_final_resume_attestation(
 
 def main() -> int:
     config = config_from_args(build_parser().parse_args())
-    try:
-        audit_receipt = require_final_benchmark_audit(config.run_purpose)
-    except FinalAuditGateError as exc:
-        print(f"FINAL_BENCHMARK_AUDIT_GATE_FAILED: {exc}", file=sys.stderr)
-        return 2
-    config._controller_seed_cohort_attested = bool(
-        audit_receipt is not None
-        and int(audit_receipt.get("origin_pid", os.getpid())) != os.getpid()
-    )
-    config._final_audit_context_token = (
-        audit_receipt.get("context_token") if audit_receipt is not None else None
-    )
-    config._final_audit_receipt_sha256 = os.environ.get(
-        AUDIT_RECEIPT_SHA256_ENV
-    )
+    audit_receipt = None
+    config._controller_seed_cohort_attested = False
+    config._final_audit_context_token = None
+    config._final_audit_receipt_sha256 = None
+    if config.run_purpose == "final_benchmark":
+        import os
+
+        from robust_o2o.final_gate import (
+            AUDIT_RECEIPT_SHA256_ENV,
+            FinalAuditGateError,
+            require_final_benchmark_audit,
+        )
+
+        try:
+            audit_receipt = require_final_benchmark_audit(config.run_purpose)
+        except FinalAuditGateError as exc:
+            print(f"FINAL_BENCHMARK_AUDIT_GATE_FAILED: {exc}", file=sys.stderr)
+            return 2
+        config._controller_seed_cohort_attested = bool(
+            audit_receipt is not None
+            and int(audit_receipt.get("origin_pid", os.getpid())) != os.getpid()
+        )
+        config._final_audit_context_token = audit_receipt.get("context_token")
+        config._final_audit_receipt_sha256 = os.environ.get(
+            AUDIT_RECEIPT_SHA256_ENV
+        )
     if config.run_purpose in ("smoke", "diagnostic"):
         print("NOT A PAPER REPRODUCTION RUN", flush=True)
         print("NOT PUBLICATION-ELIGIBLE", flush=True)
+    elif config.run_purpose == "research_benchmark":
+        print("CUSTOM RESEARCH BENCHMARK RUN", flush=True)
+        print("NOT AN OFFICIAL PAPER REPRODUCTION", flush=True)
     logger = None
     try:
         inherit_verified_final_resume_attestation(config, audit_receipt)

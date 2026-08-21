@@ -9,12 +9,20 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from robust_o2o.config import ExperimentConfig  # noqa: E402
+from robust_o2o.certificates import (  # noqa: E402
+    CertificateContextError,
+    CertificateSpec,
+    build_certificate_context,
+    certificate_directory,
+    validate_certificate_receipt,
+)
 from robust_o2o.fidelity import (  # noqa: E402
     BASELINE_REPRODUCTION_REGISTRY,
     REPORTING_RULES,
@@ -42,20 +50,273 @@ EXPECTED_BASELINES = {
     "rpex",
     "riql_naive",
     "wsrl",
-    "cal_ql",
-    "pessimistic_q_ensemble",
+    "cal_ql_locomotion_adaptation",
+    "pqe_shared_actor_approx",
 }
 
 CERTIFIED_STRICT_CONDITIONS = (
-    ("clean", "none"),
     ("random", "observations"),
     ("random", "actions"),
     ("random", "rewards"),
     ("random", "dynamics"),
-    ("adversarial", "observations"),
 )
-SAVE_RESUME_COVERED_CELLS = {
-    ("riql_naive", "random", "observations"),
+SAVE_RESUME_REQUIRED_CELLS = [
+    f"{algorithm}/{corruption}/{target}"
+    for algorithm in ("rpex", "riql_naive")
+    for corruption, target in CERTIFIED_STRICT_CONDITIONS
+]
+SAVE_RESUME_REQUIRED_STATE = [
+    "actor_parameters",
+    "critic_parameters",
+    "value_parameters",
+    "target_critic_parameters",
+    "optimizer_states",
+    "scheduler_states",
+    "replay_buffer_content_and_order",
+    "environment_state",
+    "current_observation",
+    "episode_return_and_length",
+    "python_rng",
+    "numpy_rng",
+    "torch_cpu_cuda_rng",
+    "corruption_rng",
+    "action_selection_rng",
+    "evaluation_counter",
+    "metrics_sequence",
+    "final_manifest",
+]
+RPEX_UPSTREAM = BASELINE_REPRODUCTION_REGISTRY["rpex"]
+WSRL_UPSTREAM = BASELINE_REPRODUCTION_REGISTRY["wsrl"]
+CALQL_UPSTREAM = BASELINE_REPRODUCTION_REGISTRY[
+    "cal_ql_locomotion_adaptation"
+]
+PQE_UPSTREAM = BASELINE_REPRODUCTION_REGISTRY["pqe_shared_actor_approx"]
+CERTIFICATE_SPECS: dict[str, CertificateSpec] = {
+    "rpex_riql_learner_parity": CertificateSpec(
+        "rpex_riql_learner_parity",
+        "rpex_riql_learner_parity.json",
+        RPEX_UPSTREAM.upstream_repository,
+        RPEX_UPSTREAM.upstream_commit,
+        (
+            "tests/fixtures/rpex_riql_offline_update_v1.json",
+            "tests/fixtures/rpex_online_transition_v1.json",
+        ),
+        required_claims={
+            "algorithms": ["rpex", "riql_naive"],
+            "parity_status": "end_to_end_verified",
+            "scope": "offline_and_online_learner_end_to_end",
+        },
+    ),
+    "rpex_online_rng_parity": CertificateSpec(
+        "rpex_online_rng_parity",
+        "rpex_online_rng_parity.json",
+        RPEX_UPSTREAM.upstream_repository,
+        RPEX_UPSTREAM.upstream_commit,
+        ("tests/fixtures/rpex_online_rng_trajectory_v1.json",),
+        required_claims={
+            "algorithms": ["rpex", "riql_naive"],
+            "scope": "fresh_process_full_online_rng_trajectory",
+        },
+    ),
+    "rpex_evaluation_schedule_parity": CertificateSpec(
+        "rpex_evaluation_schedule_parity",
+        "rpex_evaluation_schedule_parity.json",
+        RPEX_UPSTREAM.upstream_repository,
+        RPEX_UPSTREAM.upstream_commit,
+        ("tests/fixtures/rpex_evaluation_schedule_v1.json",),
+        required_claims={
+            "algorithms": ["rpex", "riql_naive"],
+            "scope": "official_training_env_evaluation_rng_schedule",
+        },
+    ),
+    "rpex_riql_reporting_parity": CertificateSpec(
+        "rpex_riql_reporting_parity",
+        "rpex_riql_reporting_parity.json",
+        RPEX_UPSTREAM.upstream_repository,
+        RPEX_UPSTREAM.upstream_commit,
+        ("tests/fixtures/rpex_reporting_v1.json",),
+        required_claims={
+            "algorithms": ["rpex", "riql_naive"],
+            "scope": "upstream_final_three_reporting",
+        },
+    ),
+    "wsrl_learner_parity": CertificateSpec(
+        "wsrl_learner_parity",
+        "wsrl_learner_parity.json",
+        WSRL_UPSTREAM.upstream_repository,
+        WSRL_UPSTREAM.upstream_commit,
+        ("tests/fixtures/wsrl_fixed_batch_end_to_end_v1.json",),
+        required_claims={
+            "algorithm": "wsrl",
+            "parity_status": "end_to_end_verified",
+            "scope": "official_jax_adapter_or_full_fixed_batch_parity",
+        },
+    ),
+    "wsrl_reporting_parity": CertificateSpec(
+        "wsrl_reporting_parity",
+        "wsrl_reporting_parity.json",
+        WSRL_UPSTREAM.upstream_repository,
+        WSRL_UPSTREAM.upstream_commit,
+        ("tests/fixtures/wsrl_reporting_v1.json",),
+        required_claims={
+            "algorithm": "wsrl",
+            "scope": "upstream_reporting_end_to_end",
+        },
+    ),
+    "calql_locomotion_parity": CertificateSpec(
+        "calql_locomotion_parity",
+        "calql_locomotion_parity.json",
+        CALQL_UPSTREAM.upstream_repository,
+        CALQL_UPSTREAM.upstream_commit,
+        ("tests/fixtures/calql_locomotion_end_to_end_v1.json",),
+        required_claims={
+            "algorithm": "cal_ql_locomotion_adaptation",
+            "official_task_support": "d4rl_mujoco_locomotion",
+            "parity_status": "official_adapter_verified",
+        },
+    ),
+    "calql_reporting_parity": CertificateSpec(
+        "calql_reporting_parity",
+        "calql_reporting_parity.json",
+        CALQL_UPSTREAM.upstream_repository,
+        CALQL_UPSTREAM.upstream_commit,
+        ("tests/fixtures/calql_reporting_v1.json",),
+        required_claims={
+            "algorithm": "cal_ql_locomotion_adaptation",
+            "scope": "upstream_reporting_end_to_end",
+        },
+    ),
+    "pqe_independent_ensemble_parity": CertificateSpec(
+        "pqe_independent_ensemble_parity",
+        "pqe_independent_ensemble_parity.json",
+        PQE_UPSTREAM.upstream_repository,
+        PQE_UPSTREAM.upstream_commit,
+        ("tests/fixtures/pqe_independent_ensemble_end_to_end_v1.json",),
+        required_claims={
+            "algorithm": "pqe_shared_actor_approx",
+            "ensemble_size": 5,
+            "independent_actors_and_twin_critics": True,
+            "parity_status": "end_to_end_verified",
+        },
+    ),
+    "pqe_reporting_parity": CertificateSpec(
+        "pqe_reporting_parity",
+        "pqe_reporting_parity.json",
+        PQE_UPSTREAM.upstream_repository,
+        PQE_UPSTREAM.upstream_commit,
+        ("tests/fixtures/pqe_reporting_v1.json",),
+        required_claims={
+            "algorithm": "pqe_shared_actor_approx",
+            "scope": "upstream_reporting_end_to_end",
+        },
+    ),
+    "strict_runtime_random_fixture_alignment": CertificateSpec(
+        "strict_runtime_random_fixture_alignment",
+        "strict_runtime_random_fixture_alignment.json",
+        RPEX_UPSTREAM.upstream_repository,
+        RPEX_UPSTREAM.upstream_commit,
+        (
+            "tests/fixtures/rpex_random_corruption_v2.json",
+            "tests/fixtures/rpex_riql_offline_update_v1.json",
+            "tests/fixtures/rpex_online_transition_v1.json",
+        ),
+        required_claims={
+            "runtime_profile": "requirements-rpex-v2.txt",
+            "scope": "random_and_learner_fixtures",
+        },
+    ),
+    "strict_runtime_adversarial_fixture_alignment": CertificateSpec(
+        "strict_runtime_adversarial_fixture_alignment",
+        "strict_runtime_adversarial_fixture_alignment.json",
+        RPEX_UPSTREAM.upstream_repository,
+        RPEX_UPSTREAM.upstream_commit,
+        (
+            "tests/fixtures/rpex_adversarial_observation_offline_v2.json",
+            "tests/fixtures/rpex_adversarial_observation_online_v2.json",
+        ),
+        required_claims={
+            "runtime_profile": "requirements-rpex-v2.txt",
+            "scope": "adversarial_observation_fixtures",
+        },
+    ),
+    "random_corruption_end_to_end": CertificateSpec(
+        "random_corruption_end_to_end",
+        "random_corruption_end_to_end.json",
+        RPEX_UPSTREAM.upstream_repository,
+        RPEX_UPSTREAM.upstream_commit,
+        ("tests/fixtures/rpex_random_corruption_v2.json",),
+        required_claims={
+            "algorithms": ["rpex", "riql_naive"],
+            "targets": ["observations", "actions", "rewards", "dynamics"],
+            "scope": "offline_and_online_end_to_end",
+        },
+    ),
+    "save_resume_coverage": CertificateSpec(
+        "save_resume_coverage",
+        "save_resume_coverage.json",
+        RPEX_UPSTREAM.upstream_repository,
+        RPEX_UPSTREAM.upstream_commit,
+        ("tests/fixtures/rpex_riql_save_resume_v1.json",),
+        required_claims={
+            "cells": SAVE_RESUME_REQUIRED_CELLS,
+            "state_fields": SAVE_RESUME_REQUIRED_STATE,
+            "fresh_process_reload": True,
+            "comparison": "uninterrupted_vs_resumed",
+        },
+    ),
+    "adversarial_observation_end_to_end": CertificateSpec(
+        "adversarial_observation_end_to_end",
+        "adversarial_observation_end_to_end.json",
+        RPEX_UPSTREAM.upstream_repository,
+        RPEX_UPSTREAM.upstream_commit,
+        (
+            "tests/fixtures/rpex_adversarial_observation_offline_v2.json",
+            "tests/fixtures/rpex_adversarial_observation_online_v2.json",
+        ),
+        required_claims={
+            "algorithms": ["rpex", "riql_naive"],
+            "target": "observations",
+            "scope": "offline_and_online_full_wrapper_end_to_end",
+        },
+    ),
+    "strict_environment_preflight": CertificateSpec(
+        "strict_environment_preflight",
+        "strict_environment_preflight.json",
+        RPEX_UPSTREAM.upstream_repository,
+        RPEX_UPSTREAM.upstream_commit,
+        required_claims={
+            "platform_system": "Linux",
+            "platform_machine": "x86_64",
+            "tasks": list(STRICT_FINAL_TASKS),
+            "scope": "strict_preflight_and_dataset_environment_smoke",
+        },
+    ),
+}
+CERTIFICATE_CAPABILITIES: dict[str, tuple[str, ...]] = {
+    "rpex_riql_learner": (
+        "rpex_riql_learner_parity",
+        "rpex_online_rng_parity",
+        "rpex_evaluation_schedule_parity",
+        "rpex_riql_reporting_parity",
+    ),
+    "five_baseline_learners": (
+        "wsrl_learner_parity",
+        "wsrl_reporting_parity",
+        "calql_locomotion_parity",
+        "calql_reporting_parity",
+        "pqe_independent_ensemble_parity",
+        "pqe_reporting_parity",
+    ),
+    "random_corruption": (
+        "strict_runtime_random_fixture_alignment",
+        "random_corruption_end_to_end",
+    ),
+    "adversarial_corruption": (
+        "strict_runtime_adversarial_fixture_alignment",
+        "adversarial_observation_end_to_end",
+    ),
+    "save_resume": ("save_resume_coverage",),
+    "strict_environment": ("strict_environment_preflight",),
 }
 
 
@@ -65,6 +326,65 @@ class Check:
     passed: bool
     detail: str
     blocking: bool = True
+    evidence: dict[str, Any] | None = None
+
+
+def certificate_checks() -> list[Check]:
+    """Validate every required receipt against one immutable current context."""
+
+    fixture_paths = {
+        path
+        for spec in CERTIFICATE_SPECS.values()
+        for path in spec.required_fixture_paths
+    }
+    try:
+        context = build_certificate_context(ROOT, fixture_paths=fixture_paths)
+        directory = certificate_directory(ROOT)
+    except CertificateContextError as exc:
+        return [
+            Check(
+                "certificate_context",
+                False,
+                str(exc),
+                evidence={"status": "invalid", "valid": False},
+            )
+        ]
+    validations = [
+        validate_certificate_receipt(
+            spec,
+            certificate_dir=directory,
+            context=context,
+        )
+        for spec in CERTIFICATE_SPECS.values()
+    ]
+    checks = [
+        Check(
+            f"certificate:{validation.certificate_id}",
+            validation.valid,
+            f"status={validation.status}; {validation.detail}",
+            blocking=(
+                validation.certificate_id
+                not in CERTIFICATE_CAPABILITIES["adversarial_corruption"]
+            ),
+            evidence=validation.to_dict(),
+        )
+        for validation in validations
+    ]
+    checks.append(
+        Check(
+            "repository_clean",
+            context.repository.get("clean") is True,
+            (
+                f"commit={context.repository.get('commit')} "
+                f"tree={context.repository.get('tree_sha256')} "
+                f"source_tree={context.repository.get('source_tree_sha256')}"
+                if context.repository.get("clean") is True
+                else "tracked or untracked working-tree changes are present"
+            ),
+            evidence=dict(context.repository),
+        )
+    )
+    return checks
 
 
 def fixture_check(filename: str, fixture_id: str) -> Check:
@@ -234,6 +554,9 @@ def manifest_check() -> Check:
 def strict_config_contract_check() -> Check:
     failures: list[str] = []
     for algorithm in ("rpex", "riql_naive"):
+        declared_eligible = BASELINE_REPRODUCTION_REGISTRY[
+            algorithm
+        ].strict_final_eligible
         try:
             config = ExperimentConfig(
                 algorithm,
@@ -245,7 +568,13 @@ def strict_config_contract_check() -> Check:
                 benchmark_seed_set=STRICT_FINAL_SEEDS,
             )
         except Exception as exc:
-            failures.append(f"{algorithm}: {type(exc).__name__}: {exc}")
+            if declared_eligible:
+                failures.append(f"{algorithm}: {type(exc).__name__}: {exc}")
+            continue
+        if not declared_eligible:
+            failures.append(
+                f"uncertified baseline was accepted in final mode: {algorithm}"
+            )
             continue
         actual = (
             config.offline_steps,
@@ -273,7 +602,7 @@ def strict_config_contract_check() -> Check:
         )
         if actual != required:
             failures.append(f"{algorithm}: actual={actual!r} required={required!r}")
-    base = {
+    base: dict[str, Any] = {
         "algorithm": "rpex",
         "env_name": "hopper-medium-replay-v2",
         "corruption": "random",
@@ -292,12 +621,15 @@ def strict_config_contract_check() -> Check:
         "replay_seed": 1,
         "initialize_from_checkpoint": "/tmp/unverified.pt",
     }.items():
-        try:
-            ExperimentConfig(**{**base, field: value})
-        except Exception:
-            pass
-        else:
-            failures.append(f"strict override was accepted: {field}={value!r}")
+        if BASELINE_REPRODUCTION_REGISTRY["rpex"].strict_final_eligible:
+            try:
+                ExperimentConfig(**{**base, field: value})
+            except Exception:
+                pass
+            else:
+                failures.append(
+                    f"strict override was accepted: {field}={value!r}"
+                )
     for target in ("actions", "rewards", "dynamics"):
         try:
             ExperimentConfig(
@@ -335,8 +667,9 @@ def strict_config_contract_check() -> Check:
     return Check(
         "strict_config_contract",
         not failures,
-        "RPEX/RIQL budgets, hyperparameters, seed cohort, target/task-specific "
-        "fixture scope, and profile passed"
+        "uncertified baselines are rejected; any future certified RPEX/RIQL "
+        "configuration must satisfy exact budgets, hyperparameters, seed "
+        "cohort, target/task-specific fixture scope, and profile"
         if not failures
         else " | ".join(failures),
     )
@@ -402,7 +735,12 @@ def run_strict_preflight() -> tuple[Check, Check]:
         )
     return (
         Check("strict_d4rl_preflight", passed, d4rl_detail),
-        Check("save_resume_smoke", passed, resume_detail),
+        Check(
+            "save_resume_smoke",
+            passed,
+            resume_detail,
+            blocking=False,
+        ),
     )
 
 
@@ -420,7 +758,8 @@ def audit(*, static_only: bool) -> list[Check]:
         name
         for name, record in BASELINE_REPRODUCTION_REGISTRY.items()
         if record.reproduction_status == "exact_upstream_port"
-        and record.parity_status != "verified"
+        and record.parity_status
+        not in {"end_to_end_verified", "official_adapter_verified"}
     ]
     checks.append(
         Check(
@@ -484,41 +823,30 @@ def audit(*, static_only: bool) -> list[Check]:
     checks.append(strict_config_contract_check())
     checks.append(
         Check(
-            "rpex_online_phase_rng_parity",
-            False,
-            "RPEX/RIQL fresh online Adam state now matches the pinned phase "
-            "transition, but the fresh-process Torch RNG consumption order "
-            "(policy/critic/value and adversarial oracle construction before "
-            "the first stochastic action) has no upstream parity fixture",
-            blocking=True,
-        )
-    )
-    checks.append(
-        Check(
-            "rpex_evaluation_rng_parity",
-            False,
-            "epsilon-greedy sample/mask call order now matches pinned RPEX, "
-            "but strict evaluation intentionally uses a separate clean env "
-            "and deterministic per-episode reseeding; pinned attack_online.py "
-            "reuses the training env and advances its seeded RNG sequentially",
-            blocking=True,
+            "rpex_riql_registry_eligibility",
+            set(strict_final_algorithms()) == {"rpex", "riql_naive"},
+            "strict_final_algorithms=" + repr(strict_final_algorithms()),
         )
     )
     checks.append(
         Check(
             "calql_locomotion_excluded",
-            not BASELINE_REPRODUCTION_REGISTRY["cal_ql"].strict_final_eligible,
-            BASELINE_REPRODUCTION_REGISTRY["cal_ql"].reproduction_status,
+            not BASELINE_REPRODUCTION_REGISTRY[
+                "cal_ql_locomotion_adaptation"
+            ].strict_final_eligible,
+            BASELINE_REPRODUCTION_REGISTRY[
+                "cal_ql_locomotion_adaptation"
+            ].reproduction_status,
         )
     )
     checks.append(
         Check(
             "pqe_shared_actor_excluded",
             not BASELINE_REPRODUCTION_REGISTRY[
-                "pessimistic_q_ensemble"
+                "pqe_shared_actor_approx"
             ].strict_final_eligible,
             BASELINE_REPRODUCTION_REGISTRY[
-                "pessimistic_q_ensemble"
+                "pqe_shared_actor_approx"
             ].reproduction_status,
         )
     )
@@ -526,8 +854,11 @@ def audit(*, static_only: bool) -> list[Check]:
         Check(
             "wsrl_fixed_batch_parity",
             BASELINE_REPRODUCTION_REGISTRY["wsrl"].parity_status
-            == "framework_port_verified",
-            BASELINE_REPRODUCTION_REGISTRY["wsrl"].parity_status,
+            in {"end_to_end_verified", "official_adapter_verified"}
+            and REPORTING_RULES["wsrl"].verified,
+            "parity="
+            + BASELINE_REPRODUCTION_REGISTRY["wsrl"].parity_status
+            + f" reporting_verified={REPORTING_RULES['wsrl'].verified}",
             blocking=False,
         )
     )
@@ -539,26 +870,7 @@ def audit(*, static_only: bool) -> list[Check]:
             blocking=False,
         )
     )
-    required_save_resume_cells = {
-        (algorithm, corruption, target)
-        for algorithm in strict_final_algorithms()
-        for corruption, target in CERTIFIED_STRICT_CONDITIONS
-    }
-    missing_save_resume_cells = sorted(
-        required_save_resume_cells - SAVE_RESUME_COVERED_CELLS
-    )
-    checks.append(
-        Check(
-            "save_resume_full_benchmark_coverage",
-            not missing_save_resume_cells,
-            "covered=RIQL-naive/random observation "
-            "(common_budget_diagnostic, offline checkpoint only; online "
-            "checkpoint and full resume-state comparison not exercised); "
-            "missing="
-            + ",".join("/".join(cell) for cell in missing_save_resume_cells),
-            blocking=True,
-        )
-    )
+    checks.extend(certificate_checks())
     checks.append(manifest_check())
     run55_text = (ROOT / "run_55_experiment.py").read_text(encoding="utf-8")
     checks.append(
@@ -579,7 +891,12 @@ def audit(*, static_only: bool) -> list[Check]:
             )
         )
         checks.append(
-            Check("save_resume_smoke", False, "not executed (--static-only)")
+            Check(
+                "save_resume_smoke",
+                False,
+                "not executed (--static-only)",
+                blocking=False,
+            )
         )
     else:
         checks.extend(run_strict_preflight())
@@ -611,33 +928,125 @@ def audit(*, static_only: bool) -> list[Check]:
 
 
 def summarize_audit(checks: list[Check]) -> dict[str, object]:
-    """Return distinct status for the eligible subset and the five-baseline goal."""
+    """Compute capability statuses without promoting a partial PASS to READY."""
 
-    eligible_subset_ready = all(
-        check.passed or not check.blocking for check in checks
-    )
     by_name = {check.name: check for check in checks}
-    five_baseline_ready = eligible_subset_ready and all(
-        by_name[name].passed
-        for name in ("wsrl_fixed_batch_parity", "five_baseline_final_coverage")
+
+    def passed(name: str) -> bool:
+        check = by_name.get(name)
+        return bool(check is not None and check.passed)
+
+    certificate_statuses: dict[str, dict[str, Any]] = {}
+    for certificate_id in CERTIFICATE_SPECS:
+        check = by_name.get(f"certificate:{certificate_id}")
+        if check is None or check.evidence is None:
+            certificate_statuses[certificate_id] = {
+                "certificate_id": certificate_id,
+                "status": "invalid",
+                "valid": False,
+                "detail": "certificate validation did not run",
+            }
+        else:
+            certificate_statuses[certificate_id] = dict(check.evidence)
+
+    verified_certificate_ids = sorted(
+        certificate_id
+        for certificate_id, validation in certificate_statuses.items()
+        if validation.get("valid") is True
     )
-    eligible_subset = list(strict_final_algorithms())
+    capability_certificates = {
+        capability: {
+            "required_certificate_ids": list(required_ids),
+            "verified": all(
+                certificate_id in verified_certificate_ids
+                for certificate_id in required_ids
+            ),
+        }
+        for capability, required_ids in CERTIFICATE_CAPABILITIES.items()
+    }
+
+    common_integrity_ready = all(
+        passed(name)
+        for name in (
+            "baseline_registry",
+            "no_unverified_exact_labels",
+            "source_commits",
+            "reporting_registry",
+            "final_seed_contract",
+            "strict_task_contract",
+            "strict_config_contract",
+            "manifest_provenance",
+            "repository_clean",
+        )
+    )
+    subset_ready = (
+        common_integrity_ready
+        and passed("rpex_riql_registry_eligibility")
+        and capability_certificates["rpex_riql_learner"]["verified"]
+    )
+    random_ready = (
+        common_integrity_ready
+        and capability_certificates["random_corruption"]["verified"]
+    )
+    strict_adversarial_enabled = any(
+        corruption == "adversarial"
+        for corruption, _target in CERTIFIED_STRICT_CONDITIONS
+    )
+    adversarial_ready = (
+        common_integrity_ready
+        and capability_certificates["adversarial_corruption"]["verified"]
+    )
+    adversarial_status = (
+        "EXCLUDED"
+        if not strict_adversarial_enabled
+        else "READY"
+        if adversarial_ready
+        else "NOT READY"
+    )
+    save_resume_ready = (
+        common_integrity_ready
+        and capability_certificates["save_resume"]["verified"]
+    )
+    strict_environment_ready = (
+        common_integrity_ready
+        and capability_certificates["strict_environment"]["verified"]
+        and passed("strict_d4rl_preflight")
+    )
+    five_baseline_ready = (
+        subset_ready
+        and passed("wsrl_fixed_batch_parity")
+        and passed("five_baseline_final_coverage")
+        and capability_certificates["five_baseline_learners"]["verified"]
+    )
+    final_ready = (
+        subset_ready
+        and five_baseline_ready
+        and random_ready
+        and save_resume_ready
+        and strict_environment_ready
+        and adversarial_status in {"READY", "EXCLUDED"}
+    )
+
+    def readiness(value: bool) -> str:
+        return "READY" if value else "NOT READY"
+
     return {
         "checks": [asdict(check) for check in checks],
-        "reproducibility_audit": (
-            "PASS" if eligible_subset_ready else "FAIL"
-        ),
-        # Kept for compatibility. Its scope is explicitly recorded below.
-        "final_benchmark_status": (
-            "READY" if eligible_subset_ready else "NOT READY"
-        ),
-        "final_benchmark_scope": eligible_subset,
-        "eligible_subset_benchmark_status": (
-            "READY" if eligible_subset_ready else "NOT READY"
-        ),
-        "five_baseline_benchmark_status": (
-            "READY" if five_baseline_ready else "NOT READY"
-        ),
+        "certificate_statuses": certificate_statuses,
+        "verified_certificate_ids": verified_certificate_ids,
+        "certificate_capabilities": capability_certificates,
+        "reproducibility_audit": "PASS" if final_ready else "FAIL",
+        "rpex_riql_eligible_subset_status": readiness(subset_ready),
+        "five_baseline_status": readiness(five_baseline_ready),
+        "random_corruption_status": readiness(random_ready),
+        "adversarial_corruption_status": adversarial_status,
+        "save_resume_status": readiness(save_resume_ready),
+        "strict_environment_status": readiness(strict_environment_ready),
+        "final_benchmark_status": readiness(final_ready),
+        "final_benchmark_scope": list(BASELINE_REPRODUCTION_REGISTRY),
+        # Compatibility aliases carry the same explicitly named scope.
+        "eligible_subset_benchmark_status": readiness(subset_ready),
+        "five_baseline_benchmark_status": readiness(five_baseline_ready),
     }
 
 
@@ -652,7 +1061,7 @@ def main() -> int:
     args = parser.parse_args()
     checks = audit(static_only=args.static_only)
     summary = summarize_audit(checks)
-    ready = summary["eligible_subset_benchmark_status"] == "READY"
+    ready = summary["final_benchmark_status"] == "READY"
     if args.json:
         print(json.dumps(summary, indent=2, ensure_ascii=False))
     else:
@@ -668,20 +1077,32 @@ def main() -> int:
             )
         print(f"REPRODUCIBILITY AUDIT: {summary['reproducibility_audit']}")
         print(
-            "FINAL BENCHMARK SCOPE: "
-            + ",".join(summary["final_benchmark_scope"])
+            "RPEX/RIQL ELIGIBLE SUBSET STATUS: "
+            f"{summary['rpex_riql_eligible_subset_status']}"
         )
         print(
-            "ELIGIBLE-SUBSET BENCHMARK STATUS: "
-            f"{summary['eligible_subset_benchmark_status']}"
+            "FIVE-BASELINE STATUS: "
+            f"{summary['five_baseline_status']}"
+        )
+        print(
+            "RANDOM CORRUPTION STATUS: "
+            f"{summary['random_corruption_status']}"
+        )
+        print(
+            "ADVERSARIAL CORRUPTION STATUS: "
+            f"{summary['adversarial_corruption_status']}"
+        )
+        print(
+            "SAVE/RESUME STATUS: "
+            f"{summary['save_resume_status']}"
+        )
+        print(
+            "STRICT ENVIRONMENT STATUS: "
+            f"{summary['strict_environment_status']}"
         )
         print(
             "FINAL BENCHMARK STATUS: "
             f"{summary['final_benchmark_status']}"
-        )
-        print(
-            "FIVE-BASELINE BENCHMARK STATUS: "
-            f"{summary['five_baseline_benchmark_status']}"
         )
     return 0 if ready else 1
 

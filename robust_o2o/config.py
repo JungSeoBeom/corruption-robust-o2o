@@ -28,11 +28,15 @@ from .fidelity import (
     UPSTREAM_COMMITS,
     WSRL_ENTROPY_PROFILES,
     BASELINE_REPRODUCTION_REGISTRY,
+    COMMON_BENCHMARK_REPORTING_RULE,
     FinalBenchmarkValidationError,
+    MAIN_BASELINES,
+    OPTIONAL_BASELINES,
     REPORTING_RULES,
     RPEX_GOLDEN_FIXTURE_CERTIFICATES,
     STRICT_FINAL_SEEDS,
     STRICT_FINAL_TASKS,
+    baseline_record_is_strict_eligible,
     resolve_riql_reference_row,
     validate_reproduction_fixture,
 )
@@ -44,10 +48,10 @@ ALGORITHMS = (
     "riql_naive",
     "uwmsg",
     "pex",
-    "cal_ql",
+    "cal_ql_locomotion_adaptation",
     "wsrl",
     "ro2o",
-    "pessimistic_q_ensemble",
+    "pqe_shared_actor_approx",
 )
 
 LEGACY_PROTOCOL = "rpex_d4rl_v2_legacy"
@@ -70,12 +74,14 @@ ALGORITHM_TITLES = {
     "riql_naive": "Towards Robust Offline Reinforcement Learning under Diverse Data Corruption",
     "uwmsg": "Corruption-Robust Offline Reinforcement Learning with General Function Approximation",
     "pex": "Policy Expansion for Bridging Offline-to-Online Reinforcement Learning",
-    "cal_ql": "Cal-QL: Calibrated Offline RL Pre-Training for Efficient Online Fine-Tuning",
+    "cal_ql_locomotion_adaptation": (
+        "Cal-QL locomotion task adaptation (not an official locomotion recipe)"
+    ),
     "wsrl": "Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data",
     "ro2o": "Towards Robust Offline-to-Online Reinforcement Learning via Uncertainty and Smoothness",
-    "pessimistic_q_ensemble": (
-        "Offline-to-Online Reinforcement Learning via Balanced Replay "
-        "and Pessimistic Q-Ensemble"
+    "pqe_shared_actor_approx": (
+        "Shared-actor approximation of Balanced Replay and Pessimistic "
+        "Q-Ensemble (not the official independent-policy implementation)"
     ),
 }
 
@@ -84,12 +90,15 @@ ALGORITHM_ALIASES = {
     "riql-pex": "riql_pex",
     "riql_naive": "riql_naive",
     "riql-naive": "riql_naive",
-    "cal-ql": "cal_ql",
-    "calql": "cal_ql",
-    "pqe": "pessimistic_q_ensemble",
-    "pqe_shared_actor": "pessimistic_q_ensemble",
-    "pessimistic-q-ensemble": "pessimistic_q_ensemble",
 }
+
+RETIRED_ALGORITHM_NAMES = {
+    "pessimistic_q_ensemble",
+    "pessimistic-q-ensemble",
+    "pqe",
+    "pqe_shared_actor",
+}
+RETIRED_CALQL_NAMES = {"cal_ql", "cal-ql", "calql"}
 
 CORRUPTION_MODES = ("clean", "random", "adversarial")
 INDIVIDUAL_CORRUPTION_TARGETS = (
@@ -178,6 +187,7 @@ class ExperimentConfig:
     replay_size: int = 1_000_000
     eval_period: int = 10_000
     eval_episodes: int = 10
+    final_window_size: int = 3
     checkpoint_period: int = 100_000
     offline_checkpoint_period: Optional[int] = None
     online_checkpoint_period: Optional[int] = None
@@ -290,7 +300,21 @@ class ExperimentConfig:
     offline_ratio: Optional[float] = None
 
     def __post_init__(self) -> None:
-        self.algorithm = ALGORITHM_ALIASES.get(self.algorithm.lower(), self.algorithm.lower())
+        requested_algorithm = self.algorithm.strip().lower()
+        if requested_algorithm in RETIRED_ALGORITHM_NAMES:
+            raise ValueError(
+                "Exact Pessimistic Q-Ensemble is not implemented. The local "
+                "shared-actor method is only an approximation; select "
+                "algorithm='pqe_shared_actor_approx' explicitly. The retired "
+                "name 'pessimistic_q_ensemble' is never silently aliased."
+            )
+        if requested_algorithm in RETIRED_CALQL_NAMES:
+            raise ValueError(
+                "The available locomotion implementation is a task adaptation, "
+                "not an official Cal-QL locomotion recipe; select "
+                "algorithm='cal_ql_locomotion_adaptation' explicitly."
+            )
+        self.algorithm = ALGORITHM_ALIASES.get(requested_algorithm, requested_algorithm)
         self.env_name = normalize_env_name(self.env_name)
         self.corruption = self.corruption.lower()
         self.corruption_target = self.corruption_target.lower()
@@ -349,7 +373,7 @@ class ExperimentConfig:
         self.pqe_replay_mode = self.pqe_replay_mode.lower()
         self.implementation_variant = (
             "pqe_shared_actor_approx"
-            if self.algorithm == "pessimistic_q_ensemble"
+            if self.algorithm == "pqe_shared_actor_approx"
             else None
         )
         self.pqe_member_checkpoints = tuple(self.pqe_member_checkpoints)
@@ -376,7 +400,8 @@ class ExperimentConfig:
         if self.online_corruption_scale_profile is None:
             self.online_corruption_scale_profile = (
                 "rpex_official_code"
-                if self.implementation_profile == "official_code_reference"
+                if self.implementation_profile
+                in ("official_code_reference", "research_benchmark")
                 else "dataset_std_scaled_extension"
             )
         if self.offline_adversarial_reward_rule is None:
@@ -421,6 +446,12 @@ class ExperimentConfig:
                 in ("official_code_reference", "paper_reference")
                 else "deterministic_diagnostic"
             )
+        if self.run_purpose == "research_benchmark":
+            # A common clean deterministic evaluation protocol is part of the
+            # custom benchmark contract; method-specific stochastic reporting
+            # policies are intentionally not used here.
+            self.evaluation_mode = "deterministic_diagnostic"
+            self.evaluation_policy_profile = "deterministic_diagnostic"
 
         if not self.normalize_states:
             self.state_normalization = "none"
@@ -610,6 +641,7 @@ class ExperimentConfig:
         for name in (
             "eval_period",
             "eval_episodes",
+            "final_window_size",
             "train_log_period",
             "max_episode_steps",
             "replay_size",
@@ -641,12 +673,88 @@ class ExperimentConfig:
             )
         if self.run_purpose == "final_benchmark":
             self._validate_final_benchmark()
+        elif self.run_purpose == "research_benchmark":
+            self._validate_research_benchmark()
         elif self.run_purpose == "paper_reproduction":
             raise FinalBenchmarkValidationError(
                 "paper_reproduction is reserved until a paper-specific task, seed, "
                 "budget, environment, and reporting contract is certified. Use "
                 "run_purpose=diagnostic for exploratory/common-budget runs or "
                 "run_purpose=final_benchmark for the audited strict suite."
+            )
+
+    def _validate_research_benchmark(self) -> None:
+        """Validate the practical custom-budget benchmark contract.
+
+        This path intentionally does not inspect parity certificates, exact
+        RNG trajectories, upstream step budgets, or a fixed seed cohort.  It
+        protects the interpretation of the common benchmark instead.
+        """
+
+        if self.suite_profile != "research_benchmark":
+            raise ValueError(
+                "run_purpose=research_benchmark requires "
+                "suite_profile=research_benchmark so research and diagnostic "
+                "outputs cannot share a result namespace"
+            )
+        if self.implementation_profile != "research_benchmark":
+            raise ValueError(
+                "run_purpose=research_benchmark requires "
+                "implementation_profile=research_benchmark"
+            )
+        if self.algorithm not in (*MAIN_BASELINES, *OPTIONAL_BASELINES):
+            raise ValueError(
+                "research_benchmark supports main baselines "
+                f"{MAIN_BASELINES} and explicit optional baselines "
+                f"{OPTIONAL_BASELINES}; got {self.algorithm!r}"
+            )
+        if self.stage != "both":
+            raise ValueError("research_benchmark requires stage='both'")
+        if self.calibration_mask_mode == "oracle_exclude_corrupted":
+            raise ValueError(
+                "research_benchmark forbids oracle_exclude_corrupted: "
+                "corruption masks/labels must not be passed to the learner"
+            )
+        if self.evaluation_mode != "deterministic_diagnostic":
+            raise ValueError(
+                "research_benchmark requires clean deterministic evaluation"
+            )
+        if self.evaluation_policy_profile != "deterministic_diagnostic":
+            raise ValueError(
+                "research_benchmark requires a common deterministic evaluation policy"
+            )
+        if self.attack_timing != "official_code_post_transition_replay_poisoning":
+            raise ValueError(
+                "research_benchmark uses replay-transition poisoning, not "
+                "simulator/sensor/actuator corruption"
+            )
+        if self.random_attack_semantics != "post_transition_replay_poisoning":
+            raise ValueError(
+                "research_benchmark requires post_transition_replay_poisoning"
+            )
+        if self.corruption == "adversarial":
+            if self.corruption_target == "mixed":
+                raise ValueError(
+                    "research_benchmark adversarial conditions select one "
+                    "explicit supported target; mixed is unsupported"
+                )
+            # Imported lazily to avoid the config <-> corruption module cycle.
+            # Resolution verifies existence and the environment-bound SHA before
+            # any environment or training state is created.
+            from .corruption import (
+                resolve_attack_checkpoint,
+                validate_adversarial_target,
+            )
+
+            validate_adversarial_target(self)
+            if self.corruption_target != "rewards":
+                resolve_attack_checkpoint(self)
+        if self.algorithm == "wsrl" and not math.isclose(
+            self.effective_offline_ratio, 0.0
+        ):
+            raise ValueError(
+                "WSRL main results require offline_ratio=0 during online "
+                "training; a nonzero ratio must use a separately named adaptation"
             )
 
     def _validate_final_benchmark(self) -> None:
@@ -706,10 +814,18 @@ class ExperimentConfig:
             "primary_research_benchmark",
         )
         require(
-            record is not None and record.strict_final_eligible,
+            record is not None and baseline_record_is_strict_eligible(record),
             "baseline_registry",
-            None if record is None else record.reproduction_status,
-            "strict_final_eligible exact/verified or allowlisted source-aligned baseline",
+            (
+                None
+                if record is None
+                else {
+                    "reproduction_status": record.reproduction_status,
+                    "parity_status": record.parity_status,
+                    "strict_final_eligible": record.strict_final_eligible,
+                }
+            ),
+            "explicit end_to_end_verified or official_adapter_verified baseline",
         )
         require(
             self.implementation_profile == "official_code_reference",
@@ -719,10 +835,15 @@ class ExperimentConfig:
         )
         require(
             self.implementation_fidelity
-            in ("exact_upstream_port", "framework_port_verified", "source_aligned_port"),
+            in (
+                "exact_upstream_port",
+                "framework_port_verified",
+                "end_to_end_verified",
+                "official_adapter_verified",
+            ),
             "implementation_fidelity",
             self.implementation_fidelity,
-            "exact_upstream_port/framework_port_verified/source_aligned_port",
+            "verified end-to-end port or verified official adapter",
         )
         required_budget = {
             "rpex": (2_000_001, 1_000_001),
@@ -847,6 +968,12 @@ class ExperimentConfig:
             None,
             False,
         )
+        require(
+            not self.riql_config_extension,
+            "riql_config_extension",
+            self.riql_config_extension,
+            False,
+        )
         if self.corruption != "clean":
             require(
                 math.isclose(self.offline_corruption_rate, 0.3),
@@ -871,12 +998,6 @@ class ExperimentConfig:
                 "corruption_target",
                 self.corruption_target,
                 INDIVIDUAL_CORRUPTION_TARGETS,
-            )
-            require(
-                not self.riql_config_extension,
-                "riql_config_extension",
-                self.riql_config_extension,
-                False,
             )
         require(
             self.online_corruption_scale_profile == "rpex_official_code",
@@ -910,6 +1031,19 @@ class ExperimentConfig:
                 self.eval_episodes,
                 reporting.evaluation_episodes,
             )
+        require(
+            self.condition_status
+            not in (
+                "diagnostic_extension",
+                "non_publication_diagnostic",
+                "paper_condition_fixture_unverified",
+                "adversarial_optimizer_core_diagnostic",
+            ),
+            "condition_status",
+            self.condition_status,
+            "condition backed by an end-to-end algorithm-condition certificate",
+            False,
+        )
         fixture_id = self.corruption_fixture_id
         if self.corruption != "clean":
             require(
@@ -1045,6 +1179,7 @@ class ExperimentConfig:
             "common_budget_robustness",
             "common_budget_diagnostic",
         )
+        research_suite = self.suite_profile == "research_benchmark"
         if self.algorithm_profile == "reference":
             raise ValueError(
                 "The generic algorithm_profile='reference' was removed because it "
@@ -1063,8 +1198,21 @@ class ExperimentConfig:
         if self.implementation_profile is None:
             self.implementation_profile = self.algorithm_profile
 
-        if primary_suite:
-            if self.algorithm == "pessimistic_q_ensemble":
+        if research_suite:
+            if self.algorithm not in (*MAIN_BASELINES, *OPTIONAL_BASELINES):
+                raise ValueError(
+                    f"algorithm {self.algorithm!r} is not part of the "
+                    "research_benchmark registry"
+                )
+            if self.implementation_profile is None:
+                self.implementation_profile = "research_benchmark"
+            if self.implementation_profile != "research_benchmark":
+                raise ValueError(
+                    "suite_profile=research_benchmark requires "
+                    "implementation_profile=research_benchmark"
+                )
+        elif primary_suite:
+            if self.algorithm == "pqe_shared_actor_approx":
                 error_type = (
                     FinalBenchmarkValidationError
                     if self.run_purpose == "final_benchmark"
@@ -1075,7 +1223,7 @@ class ExperimentConfig:
                     "the local implementation is pqe_shared_actor_approx, not the "
                     "official N=5 independently pretrained ensemble"
                 )
-            if self.algorithm == "cal_ql":
+            if self.algorithm == "cal_ql_locomotion_adaptation":
                 error_type = (
                     FinalBenchmarkValidationError
                     if self.run_purpose == "final_benchmark"
@@ -1089,11 +1237,14 @@ class ExperimentConfig:
                 )
             if self.suite_profile == "primary_research_benchmark":
                 record = BASELINE_REPRODUCTION_REGISTRY.get(self.algorithm)
-                if record is None or not record.strict_final_eligible:
+                if record is None or not baseline_record_is_strict_eligible(record):
                     status = (
                         "unregistered"
                         if record is None
-                        else record.reproduction_status
+                        else (
+                            f"{record.reproduction_status}/"
+                            f"{record.parity_status}"
+                        )
                     )
                     raise FinalBenchmarkValidationError(
                         "primary_research_benchmark excludes non-allowlisted "
@@ -1119,13 +1270,14 @@ class ExperimentConfig:
         else:
             if self.implementation_profile is None:
                 self.implementation_profile = "common_budget_robustness"
-            if self.algorithm == "pessimistic_q_ensemble":
+            if self.algorithm == "pqe_shared_actor_approx":
                 self.implementation_profile = "experimental_approximation"
 
         official_status = BASELINE_REPRODUCTION_REGISTRY.get(
             self.algorithm
         ).reproduction_status if self.algorithm in BASELINE_REPRODUCTION_REGISTRY else "source_aligned_port"
         fidelity = {
+            "research_benchmark": official_status,
             "official_code_reference": official_status,
             "paper_reference": "paper_code_conflict",
             "common_budget_robustness": "diagnostic_extension",
@@ -1135,9 +1287,11 @@ class ExperimentConfig:
         }[self.implementation_profile]
         if common_budget_suite and fidelity not in ("approximation", "legacy_unknown"):
             fidelity = (
-                "task_port" if self.algorithm == "cal_ql" else "diagnostic_extension"
+                "task_port"
+                if self.algorithm == "cal_ql_locomotion_adaptation"
+                else "diagnostic_extension"
             )
-        if self.algorithm == "cal_ql" and fidelity in (
+        if self.algorithm == "cal_ql_locomotion_adaptation" and fidelity in (
             "exact_upstream_port",
             "source_aligned_port",
             "framework_port_verified",
@@ -1179,21 +1333,26 @@ class ExperimentConfig:
             and self.implementation_profile not in ("legacy_current",)
         ):
             self.action_distribution = "official_unsquashed_gaussian"
-        if self.algorithm == "cal_ql":
+        if self.algorithm == "cal_ql_locomotion_adaptation":
             self.task_profile = "d4rl_locomotion_port"
         elif self.task_profile is None:
             self.task_profile = "official_supported_task"
         if self.policy_extraction is None:
             self.policy_extraction = (
-                "align_iql"
-                if self.algorithm in ("rpex", "riql_naive", "riql_pex")
-                and self.implementation_profile != "official_code_reference"
-                and self.corruption_target == "observations"
-                else "awr"
+                "awr"
+                if self.implementation_profile
+                in ("official_code_reference", "research_benchmark")
+                else (
+                    "align_iql"
+                    if self.algorithm in ("rpex", "riql_naive", "riql_pex")
+                    and self.corruption_target == "observations"
+                    else "awr"
+                )
             )
         if (
             self.algorithm in ("rpex", "riql_naive", "riql_pex")
-            and self.implementation_profile == "official_code_reference"
+            and self.implementation_profile
+            in ("official_code_reference", "research_benchmark")
             and self.policy_extraction != "awr"
         ):
             error_type = (
@@ -1207,15 +1366,17 @@ class ExperimentConfig:
             )
 
         if self.algorithm in ("rpex", "riql_naive", "riql_pex"):
-            row_key, row = resolve_riql_reference_row(
-                self.env_name,
-                self.corruption,
-                self.corruption_target,
-                allow_extension=(
-                    common_budget_suite
-                    or self.suite_profile == "primary_research_benchmark"
-                ),
-            )
+            try:
+                row_key, row = resolve_riql_reference_row(
+                    self.env_name,
+                    self.corruption,
+                    self.corruption_target,
+                    allow_extension=common_budget_suite or research_suite,
+                )
+            except ValueError as exc:
+                if self.run_purpose == "final_benchmark":
+                    raise FinalBenchmarkValidationError(str(exc)) from exc
+                raise
             self.riql_config_row = row_key
             self.riql_config_extension = row.extension
             self.riql_sigma = row.sigma
@@ -1233,6 +1394,7 @@ class ExperimentConfig:
 
     def _resolve_algorithm_profile(self) -> None:
         reference = self.implementation_profile in (
+            "research_benchmark",
             "official_code_reference",
             "paper_reference",
             "locomotion_port",
@@ -1240,7 +1402,8 @@ class ExperimentConfig:
         )
         reference_actor_lr = (
             1e-4
-            if self.algorithm in ("cal_ql", "wsrl") and reference
+            if self.algorithm in ("cal_ql_locomotion_adaptation", "wsrl")
+            and reference
             else self.learning_rate
         )
         self.actor_learning_rate = (
@@ -1313,9 +1476,9 @@ class ExperimentConfig:
                 )
         if self.algorithm not in ("rpex", "riql_pex"):
             self.evaluation_policy_profile = "deterministic_diagnostic"
-        if self.algorithm in ("pex", "cal_ql"):
+        if self.algorithm in ("pex", "cal_ql_locomotion_adaptation"):
             self.online_replay_profile = "fixed_offline_online_mixture"
-        elif self.algorithm == "pessimistic_q_ensemble":
+        elif self.algorithm == "pqe_shared_actor_approx":
             self.online_replay_profile = (
                 "balanced_density_replay"
                 if self.pqe_replay_mode == "balanced_density"
@@ -1324,7 +1487,7 @@ class ExperimentConfig:
 
     @property
     def resolved_algorithm_profile(self) -> str:
-        if self.algorithm == "cal_ql":
+        if self.algorithm == "cal_ql_locomotion_adaptation":
             base = (
                 "calql_locomotion_port"
                 if self.implementation_profile != "legacy_current"
@@ -1341,7 +1504,7 @@ class ExperimentConfig:
                 if self.implementation_profile != "legacy_current"
                 else "wsrl_legacy_min10"
             )
-        if self.algorithm == "pessimistic_q_ensemble":
+        if self.algorithm == "pqe_shared_actor_approx":
             return "pqe_shared_actor_approx"
         return f"{self.algorithm}_{self.implementation_profile}"
 
@@ -1374,10 +1537,10 @@ class ExperimentConfig:
             "riql_naive": 0.0,
             "uwmsg": 0.0,
             "pex": 0.5,
-            "cal_ql": 0.5,
+            "cal_ql_locomotion_adaptation": 0.5,
             "wsrl": 0.0,
             "ro2o": 0.0,
-            "pessimistic_q_ensemble": 0.5,
+            "pqe_shared_actor_approx": 0.5,
         }[self.algorithm]
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1386,6 +1549,8 @@ class ExperimentConfig:
         # such a mutation must never leave a publication-eligible manifest.
         if self.run_purpose == "final_benchmark":
             self._validate_final_benchmark()
+        elif self.run_purpose == "research_benchmark":
+            self._validate_research_benchmark()
         result = asdict(self)
         result["effective_offline_ratio"] = self.effective_offline_ratio
         official_replay_sampling = (
@@ -1431,7 +1596,11 @@ class ExperimentConfig:
         result["evaluation_action_sampling"] = (
             "rpex_epsilon_greedy_sample_then_cpu_mask"
             if official_replay_sampling and self.algorithm == "rpex"
-            else "algorithm_profile_default"
+            else (
+                "deterministic_policy_mean"
+                if self.run_purpose == "research_benchmark"
+                else "algorithm_profile_default"
+            )
         )
         result["evaluation_env_strategy"] = "separate_clean_environment"
         result["evaluation_seed_schedule"] = (
@@ -1456,9 +1625,42 @@ class ExperimentConfig:
         result["utd_ratio"] = (
             self.wsrl_utd_ratio if self.algorithm == "wsrl" else self.updates_per_step
         )
-        result["not_paper_reproduction"] = (
-            self.suite_profile
-            in ("common_budget_robustness", "common_budget_diagnostic")
+        record = BASELINE_REPRODUCTION_REGISTRY.get(self.algorithm)
+        reporting = (
+            COMMON_BENCHMARK_REPORTING_RULE
+            if self.run_purpose == "research_benchmark"
+            else REPORTING_RULES.get(self.algorithm)
+        )
+        condition_status = self.condition_status
+        result["implementation_type"] = (
+            record.implementation_type if record is not None else "unregistered"
+        )
+        result["benchmark_role"] = (
+            record.benchmark_role if record is not None else "diagnostic"
+        )
+        result["main_table_eligible"] = bool(
+            self.run_purpose == "research_benchmark"
+            and record is not None
+            and record.main_table_eligible
+            and self.calibration_mask_mode != "oracle_exclude_corrupted"
+        )
+        result["research_benchmark_eligible"] = result["main_table_eligible"]
+        result["uses_corruption_labels"] = (
+            self.calibration_mask_mode == "oracle_exclude_corrupted"
+        )
+        result["corruption_application_contract"] = (
+            "replay_transition_poisoning"
+        )
+        result["clean_evaluation"] = True
+        result["normalized_score_rule"] = "d4rl_normalized_return"
+        result["parity_status"] = (
+            record.parity_status if record is not None else "unverified"
+        )
+        result["learner_parity_verified"] = bool(
+            record is not None and baseline_record_is_strict_eligible(record)
+        )
+        result["config_extension_active"] = bool(
+            self.riql_config_extension
             or self.implementation_fidelity
             in (
                 "task_port",
@@ -1466,14 +1668,27 @@ class ExperimentConfig:
                 "diagnostic_extension",
                 "framework_port_unverified",
                 "source_aligned_port",
+                "paper_code_conflict",
+                "legacy_unknown",
+            )
+            or condition_status
+            in (
+                "diagnostic_extension",
+                "non_publication_diagnostic",
+                "paper_condition_fixture_unverified",
+                "adversarial_optimizer_core_diagnostic",
             )
         )
-        result["paper_reproduction_eligible"] = (
-            self.implementation_fidelity
-            in ("exact_upstream_port", "framework_port_verified")
-            and self.suite_profile
-            in ("method_fidelity", "primary_research_benchmark")
-            and self.condition_status == "paper_reproduction_condition"
+        result["diagnostic_profile_active"] = bool(
+            self.diagnostic_mode
+            or self.run_purpose in ("smoke", "diagnostic")
+            or self.suite_profile
+            in ("common_budget_robustness", "common_budget_diagnostic")
+        )
+        result["not_paper_reproduction"] = bool(
+            result["config_extension_active"]
+            or result["diagnostic_profile_active"]
+            or condition_status != "paper_reproduction_condition"
         )
         result["condition_status"] = self.condition_status
         result["corruption_protocol_source"] = (
@@ -1503,17 +1718,40 @@ class ExperimentConfig:
             and self.corruption_target != "rewards"
             else None
         )
-        result["reporting_rule"] = REPORTING_RULES.get(self.algorithm).rule_id
-        result["reporting_rule_verified"] = REPORTING_RULES.get(
-            self.algorithm
-        ).verified
-        result["corruption_fixture_id"] = self.corruption_fixture_id
-        result["corruption_fixture_verified"] = (
-            self.corruption == "clean"
-            or (
+        result["reporting_rule"] = (
+            reporting.rule_id if reporting is not None else "unregistered"
+        )
+        result["reporting_rule_verified"] = bool(
+            reporting is not None and reporting.verified
+        )
+        if self.run_purpose == "research_benchmark":
+            # Golden fixtures belong exclusively to strict/paper diagnostics;
+            # the practical benchmark neither loads nor requires them.
+            result["corruption_fixture_id"] = None
+            result["corruption_fixture_verified"] = False
+        else:
+            result["corruption_fixture_id"] = self.corruption_fixture_id
+            result["corruption_fixture_verified"] = bool(
                 self.corruption_fixture_id is not None
                 and self._corruption_fixture_is_verified()
             )
+        # These are runtime/certificate facts, not configuration claims.  A
+        # config is serialized before the dataset, worktree and receipts are
+        # verified, so it must never self-attest them.  The manifest layer may
+        # promote each field only after validating its bound executable receipt.
+        result["condition_certificate_verified"] = False
+        result["strict_runtime_fixture_verified"] = False
+        result["strict_environment_preflight_verified"] = False
+        result["save_resume_certificate_verified"] = False
+        result["audit_receipt_verified"] = False
+        result["repository_worktree_clean"] = False
+        result["dataset_hash_recorded"] = False
+        result["required_checkpoint_hashes_verified"] = False
+        upstream_commit = UPSTREAM_COMMITS.get(self.algorithm)
+        result["source_commit_pinned"] = bool(
+            isinstance(upstream_commit, str)
+            and len(upstream_commit) == 40
+            and all(character in "0123456789abcdef" for character in upstream_commit)
         )
         result["controller_seed_cohort_attested"] = bool(
             getattr(self, "_controller_seed_cohort_attested", False)
@@ -1524,20 +1762,44 @@ class ExperimentConfig:
         result["final_audit_receipt_sha256"] = getattr(
             self, "_final_audit_receipt_sha256", None
         )
-        result["publication_eligible"] = bool(
+        eligibility_evidence_verified = bool(
             self.run_purpose == "final_benchmark"
             and self.benchmark_seed_set == STRICT_FINAL_SEEDS
             and result["controller_seed_cohort_attested"]
-            and self.algorithm in BASELINE_REPRODUCTION_REGISTRY
-            and BASELINE_REPRODUCTION_REGISTRY[
-                self.algorithm
-            ].strict_final_eligible
-            and result["corruption_fixture_verified"]
+            and result["learner_parity_verified"]
+            and result["reporting_rule_verified"]
+            and result["condition_certificate_verified"]
+            and result["strict_runtime_fixture_verified"]
+            and result["strict_environment_preflight_verified"]
+            and result["save_resume_certificate_verified"]
+            and result["audit_receipt_verified"]
+            and result["repository_worktree_clean"]
+            and result["dataset_hash_recorded"]
+            and result["required_checkpoint_hashes_verified"]
+            and result["source_commit_pinned"]
+            and not result["config_extension_active"]
+            and not result["diagnostic_profile_active"]
+            and (
+                self.corruption == "clean"
+                or result["corruption_fixture_verified"]
+            )
+        )
+        result["paper_reproduction_eligible"] = bool(
+            eligibility_evidence_verified
+            and condition_status == "paper_reproduction_condition"
+        )
+        result["common_benchmark_eligible"] = bool(
+            eligibility_evidence_verified
+            and condition_status == "benchmark_transfer"
+        )
+        result["publication_eligible"] = bool(
+            result["paper_reproduction_eligible"]
+            or result["common_benchmark_eligible"]
         )
         result["oracle_information"] = (
             self.calibration_mask_mode == "oracle_exclude_corrupted"
         )
-        result["upstream_commit"] = UPSTREAM_COMMITS.get(self.algorithm)
+        result["upstream_commit"] = upstream_commit
         result["score_semantics"] = (
             "d4rl_normalized_return"
             if self.protocol == LEGACY_PROTOCOL
@@ -1561,7 +1823,7 @@ class ExperimentConfig:
                     * self.wsrl_per_critic_batch_size,
                 }
             )
-        if self.algorithm == "cal_ql":
+        if self.algorithm == "cal_ql_locomotion_adaptation":
             result["calql_actor_update_mode_at_start"] = (
                 "bc_warmup" if self.calql_bc_warmup_steps > 0 else "sac"
             )
@@ -1582,7 +1844,7 @@ class ExperimentConfig:
     def _corruption_fixture_is_verified(self) -> bool:
         fixture_id = self.corruption_fixture_id
         if fixture_id is None:
-            return True
+            return False
         path = (
             Path(__file__).resolve().parents[1]
             / "tests"
@@ -1597,9 +1859,16 @@ class ExperimentConfig:
 
     @property
     def condition_status(self) -> str:
-        if self.algorithm == "cal_ql":
+        if self.run_purpose == "research_benchmark":
+            role = BASELINE_REPRODUCTION_REGISTRY[self.algorithm].benchmark_role
+            return {
+                "main": "research_benchmark_condition",
+                "optional_adapted": "research_optional_task_adaptation",
+                "optional_diagnostic": "research_optional_approximation",
+            }[role]
+        if self.algorithm == "cal_ql_locomotion_adaptation":
             return "non_publication_diagnostic"
-        if self.algorithm == "pessimistic_q_ensemble":
+        if self.algorithm == "pqe_shared_actor_approx":
             return "diagnostic_extension"
         if self.algorithm in ("rpex", "riql_naive", "riql_pex"):
             if (
@@ -1612,7 +1881,7 @@ class ExperimentConfig:
                 and self.corruption_target == "observations"
                 and self.corruption_fixture_id is not None
             ):
-                return "paper_reproduction_condition"
+                return "adversarial_optimizer_core_diagnostic"
             if self.corruption == "adversarial":
                 return "paper_condition_fixture_unverified"
             return "benchmark_transfer"
@@ -1715,6 +1984,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--replay-size", type=int, default=1_000_000)
     parser.add_argument("--eval-period", type=int, default=10_000)
     parser.add_argument("--eval-episodes", type=int, default=10)
+    parser.add_argument(
+        "--final-window-size",
+        type=int,
+        default=3,
+        help="last K evaluations averaged within each seed before aggregation",
+    )
     parser.add_argument(
         "--checkpoint-period",
         type=int,

@@ -43,6 +43,9 @@ def evaluation_frame(
                 "upstream_commit": "35da71e",
                 "publication_eligible": True,
                 "paper_reproduction_eligible": False,
+                "learner_parity_verified": True,
+                "reporting_rule_verified": True,
+                "condition_certificate_verified": True,
                 "condition_status": "paper_reproduction_condition",
                 "run_purpose": "final_benchmark",
                 "planned_online_steps": 40_000,
@@ -75,6 +78,9 @@ def evaluation_frame(
                     "upstream_commit": "35da71e",
                     "publication_eligible": True,
                     "paper_reproduction_eligible": False,
+                    "learner_parity_verified": True,
+                    "reporting_rule_verified": True,
+                    "condition_certificate_verified": True,
                     "condition_status": "paper_reproduction_condition",
                     "run_purpose": "final_benchmark",
                     "planned_online_steps": 40_000,
@@ -347,6 +353,136 @@ class ReportingRuleTest(unittest.TestCase):
         self.assertEqual(common["reproduction_status"].tolist(), [
             "source_aligned_port"
         ])
+
+    def test_paper_summary_requires_all_three_verification_flags(self):
+        for column in (
+            "learner_parity_verified",
+            "reporting_rule_verified",
+            "condition_certificate_verified",
+        ):
+            with self.subTest(column=column):
+                frame = evaluation_frame(seeds=(0,))
+                frame["paper_reproduction_eligible"] = True
+                frame[column] = False
+                with tempfile.TemporaryDirectory() as directory:
+                    outputs = write_reporting_outputs(
+                        frame,
+                        Path(directory),
+                        strict=False,
+                        expected_seeds=None,
+                    )
+                    paper = pd.read_csv(
+                        outputs["paper_reproduction_summary"]
+                    )
+                self.assertTrue(paper.empty)
+
+    def test_upstream_verified_run_can_enter_paper_summary(self):
+        frame = evaluation_frame(seeds=(0,))
+        frame["paper_reproduction_eligible"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            outputs = write_reporting_outputs(
+                frame,
+                Path(directory),
+                strict=False,
+                expected_seeds=None,
+            )
+            paper = pd.read_csv(outputs["paper_reproduction_summary"])
+        self.assertEqual(len(paper), 1)
+        self.assertTrue(bool(paper.iloc[0]["learner_parity_verified"]))
+        self.assertTrue(bool(paper.iloc[0]["reporting_rule_verified"]))
+        self.assertTrue(
+            bool(paper.iloc[0]["condition_certificate_verified"])
+        )
+
+    def test_unverified_reporting_is_excluded_from_source_outputs(self):
+        frame = evaluation_frame(seeds=(0,))
+        frame["paper_reproduction_eligible"] = True
+        frame["reporting_rule_verified"] = False
+        with tempfile.TemporaryDirectory() as directory:
+            outputs = write_reporting_outputs(
+                frame,
+                Path(directory),
+                strict=False,
+                expected_seeds=None,
+            )
+            source_seed = pd.read_csv(outputs["per_seed_final_scores"])
+            paper = pd.read_csv(outputs["paper_reproduction_summary"])
+            common = pd.read_csv(outputs["common_benchmark_summary"])
+        self.assertTrue(source_seed.empty)
+        self.assertTrue(paper.empty)
+        self.assertEqual(len(common), 1)
+
+    def test_failed_seed_is_retained_and_marks_summary_incomplete(self):
+        frame = evaluation_frame()
+        frame.loc[frame["seed"] == 1, "run_status"] = "failed"
+        frame["error_message"] = ""
+        frame.loc[frame["seed"] == 1, "error_message"] = "optimizer diverged"
+        _, summary = aggregate_seed_scores(
+            frame,
+            rule_by_algorithm=REPORTING_RULES,
+            strict=False,
+            expected_seeds=[0, 1],
+        )
+        self.assertEqual(int(summary.iloc[0]["num_seeds"]), 1)
+        self.assertEqual(summary.iloc[0]["completed_seeds"], "0")
+        self.assertEqual(summary.iloc[0]["failed_seeds"], "1")
+        self.assertEqual(summary.iloc[0]["summary_status"], "incomplete")
+        self.assertFalse(bool(summary.iloc[0]["result_eligible"]))
+
+        with tempfile.TemporaryDirectory() as directory:
+            outputs = write_reporting_outputs(
+                frame,
+                Path(directory),
+                strict=False,
+                expected_seeds=[0, 1],
+            )
+            statuses = pd.read_csv(outputs["seed_run_status"])
+        failed = statuses[statuses["run_status"] == "failed"].iloc[0]
+        self.assertEqual(int(failed["seed"]), 1)
+        self.assertEqual(failed["error_message"], "optimizer diverged")
+
+    def test_research_adapted_and_diagnostic_summaries_are_separate(self):
+        main = evaluation_frame(seeds=(0,))
+        main["run_purpose"] = "research_benchmark"
+        main["benchmark_role"] = "main"
+        main["implementation_type"] = "source_aligned_port"
+        main["uses_corruption_labels"] = False
+        main["final_window_size"] = 3
+
+        adapted = main.copy()
+        adapted["algorithm"] = "cal_ql_locomotion_adaptation"
+        adapted["run_dir"] = "/tmp/calql_adapted_seed_0"
+        adapted["benchmark_role"] = "optional_adapted"
+        adapted["implementation_type"] = "task_adaptation"
+
+        diagnostic = main.copy()
+        diagnostic["algorithm"] = "pqe_shared_actor_approx"
+        diagnostic["run_dir"] = "/tmp/pqe_approx_seed_0"
+        diagnostic["benchmark_role"] = "optional_diagnostic"
+        diagnostic["implementation_type"] = "approximation"
+
+        frame = pd.concat([main, adapted, diagnostic], ignore_index=True)
+        with tempfile.TemporaryDirectory() as directory:
+            outputs = write_reporting_outputs(
+                frame,
+                Path(directory),
+                strict=False,
+                expected_seeds=[0],
+            )
+            research = pd.read_csv(outputs["research_summary"])
+            adapted_result = pd.read_csv(
+                outputs["adapted_baselines_summary"]
+            )
+            diagnostic_result = pd.read_csv(outputs["diagnostic_summary"])
+        self.assertEqual(research["algorithm"].tolist(), ["rpex"])
+        self.assertEqual(
+            adapted_result["algorithm"].tolist(),
+            ["cal_ql_locomotion_adaptation"],
+        )
+        self.assertEqual(
+            diagnostic_result["algorithm"].tolist(),
+            ["pqe_shared_actor_approx"],
+        )
 
 
 if __name__ == "__main__":

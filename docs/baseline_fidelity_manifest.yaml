@@ -1,23 +1,41 @@
-schema_version: 2
+schema_version: 3
 audit_date: "2026-08-21"
 status_note: >-
   This manifest records source provenance and conservative implementation
-  status. No run_55 learner currently carries an exact_upstream_port label.
-  Strict eligibility is controlled by BASELINE_REPRODUCTION_REGISTRY, not by
-  an implementation-profile name.
+  status. The custom research_benchmark path does not claim exact upstream
+  reproduction and does not require parity or certificate evidence. Strict
+  final_benchmark eligibility remains controlled by executable evidence and
+  BASELINE_REPRODUCTION_REGISTRY, not by an implementation-profile name or a
+  hand-edited boolean. Documentation never grants eligibility.
+research_benchmark_contract:
+  run_purpose: research_benchmark
+  main_baselines: [rpex, riql_naive, wsrl]
+  optional_adapted_baselines: [cal_ql_locomotion_adaptation]
+  optional_approximation_baselines: [pqe_shared_actor_approx]
+  corruption_application_contract: replay_transition_poisoning
+  default_offline_corruption_rate: 0.3
+  default_online_corruption_rate: 0.5
+  default_epsilon: 1.0
+  clean_deterministic_evaluation: true
+  default_final_evaluation_window: 3
+  parity_certificate_required: false
+  official_paper_reproduction: false
 benchmark_status:
   complete_five_baseline_final: NOT_READY
-  strict_eligible_subset: [rpex, riql_naive]
-  strict_eligible_subset_current_status: NOT_READY
-  subset_implementation_fidelity: source_aligned_port
-  subset_launch_condition: >-
-    First establish save/resume equivalence for every eligible baseline and
-    certified condition pair, reproduce the fresh-process online-constructor
-    RNG trajectory, match the upstream evaluation environment/RNG schedule,
-    and regenerate/review the golden fixtures under the pinned strict numeric
-    runtime. Then run scripts/audit_reproducibility.py on the intended
-    supported Linux x86_64 host and require ELIGIBLE-SUBSET BENCHMARK STATUS
-    READY before launch. The current macOS host is diagnostic-only.
+  rpex_riql_eligible_subset: []
+  rpex_riql_eligible_subset_status: NOT_READY
+  five_baseline_status: NOT_READY
+  random_corruption_status: NOT_READY
+  adversarial_corruption_status: EXCLUDED
+  save_resume_status: NOT_READY
+  strict_environment_status: NOT_READY
+  final_benchmark_status: NOT_READY
+  strict_final_algorithms: []
+  launch_condition: >-
+    No final launch is authorized. Eligibility requires validated external
+    executable receipts for learner, condition, RNG/evaluation, save/resume,
+    reporting, and strict Linux environment parity, all bound to the exact
+    clean repository state and pinned upstream/runtime artifacts.
 strict_execution_contract:
   run_purpose: final_benchmark
   exact_seed_set: [0, 1, 2, 3, 4]
@@ -25,11 +43,26 @@ strict_execution_contract:
   requested_online_steps: 1000001
   environment_protocol: rpex_d4rl_v2_legacy
   audit_gate_required: true
+  clean_repository_required: true
+  allow_extension: false
+  strict_random_conditions:
+    - random_observations
+    - random_actions
+    - random_rewards
+    - random_dynamics
+  strict_adversarial_conditions: []
 diagnostic_contract:
   run_purpose: diagnostic
   default_offline_updates: 500000
   default_online_steps: 500000
   publication_eligible: false
+  random_suite_conditions:
+    - clean
+    - random_observations
+    - random_actions
+    - random_rewards
+    - random_dynamics
+  clean_status: benchmark_transfer_not_auto_certified
 paper_reproduction_contract:
   run_purpose_status: reserved_and_rejected
   reason: >-
@@ -48,7 +81,49 @@ save_resume_verification:
   online_checkpoint_resume_exercised: false
   full_resume_state_compared: false
   full_baseline_condition_coverage: false
-  status: blocking_strict_gate
+  executable_certificate_present: false
+  status: diagnostic_smoke_only_blocking_strict_gate
+required_external_receipts:
+  validation_contract: >-
+    Each receipt must bind the repository commit and clean worktree, pinned
+    upstream commit, fixture/dataset/checkpoint hashes, runtime and platform,
+    exact command, return code, and timestamp. Missing, malformed, stale, dirty,
+    source-mismatched, or runtime-mismatched receipts fail closed.
+  rpex_end_to_end_learner_parity: missing
+  riql_naive_end_to_end_learner_parity: missing
+  rpex_online_constructor_rng_parity: missing
+  rpex_evaluation_environment_rng_parity: missing
+  random_corruption_strict_runtime_v2: missing
+  adversarial_end_to_end_wrapper: missing
+  complete_save_resume_matrix: missing
+  strict_linux_environment: missing
+  wsrl_fixed_batch_and_reporting: missing
+  missing_upstream_fixture_artifacts:
+    - tests/fixtures/rpex_riql_offline_update_v1.json
+    - tests/fixtures/rpex_online_transition_v1.json
+    - tests/fixtures/rpex_online_rng_trajectory_v1.json
+    - tests/fixtures/rpex_evaluation_schedule_v1.json
+    - tests/fixtures/rpex_reporting_v1.json
+    - tests/fixtures/rpex_riql_save_resume_v1.json
+fixture_inventory:
+  rpex_random_corruption_v1:
+    status: diagnostic_runtime_mismatch
+    strict_authority: false
+    generated_with: "NumPy 2.2.6 / PyTorch 2.13.0"
+    strict_runtime: "NumPy 1.23.5 / PyTorch 2.5.1"
+  rpex_adversarial_core_v1:
+    status: diagnostic_optimizer_core_only_runtime_mismatch
+    strict_authority: false
+    scope: hopper_observations_optimizer_core_only
+  required_random_v2:
+    path: tests/fixtures/rpex_random_corruption_v2.json
+    status: missing
+  required_adversarial_offline_v2:
+    path: tests/fixtures/rpex_adversarial_observation_offline_v2.json
+    status: missing
+  required_adversarial_online_v2:
+    path: tests/fixtures/rpex_adversarial_observation_online_v2.json
+    status: missing
 baselines:
   rpex_riql:
     paper_title: "RPEX: Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption"
@@ -85,15 +160,16 @@ baselines:
       - robust_o2o/experiment.py
     implementation_type: "handwritten PyTorch source-aligned port"
     reproduction_status: source_aligned_port
-    parity_status: >-
-      partial_formula_and_random_fixture_plus_adversarial_observation_optimizer_core_only
-    strict_final_eligible: true
+    parity_status: fixed_batch_partial
+    strict_final_eligible: false
+    reporting_rule_verified: true
+    reporting_note: >-
+      The source-backed RPEX final-three rule is verified as a rule, but does
+      not compensate for missing learner and condition parity.
     strict_eligibility_scope: >-
-      Conditional allowlist for RPEX and RIQL-naive only. The strict D4RL
-      preflight and audit gate, required corruption fixtures, official
-      2000001/1000001 budget, exact 0..4 seed set, and reporting checks must all
-      pass before a final run starts. This is not a paper-reproduction or
-      exact-port claim.
+      Excluded until an official adapter or upstream-executed end-to-end learner
+      certificate establishes parity. Source alignment and partial fixtures are
+      insufficient.
     implementation_status: >-
       Source-aligned policy/loss/config-table implementation with explicit
       paper/code conflict profiles. The official profile uses AWR for every
@@ -102,9 +178,9 @@ baselines:
       action sampling. It is not a thin wrapper and is not certified by a
       complete fixed-batch optimizer parity test.
     condition_status:
-      random_single_target: paper_reproduction_condition
+      random_single_target: upstream_protocol_row_uncertified
       adversarial_observations:
-        hopper-medium-replay-v2: paper_reproduction_condition
+        hopper-medium-replay-v2: optimizer_core_v1_diagnostic_only
         halfcheetah-medium-replay-v2: paper_condition_fixture_unverified_diagnostic_only
         walker2d-medium-replay-v2: paper_condition_fixture_unverified_diagnostic_only
       adversarial_actions: paper_condition_fixture_unverified_diagnostic_only
@@ -120,14 +196,14 @@ baselines:
       - "500k/500k is labelled common-budget diagnostic, never paper reproduction"
       - "clean and mixed have no RIQL_TRAIN_CONFIG.py row and are explicit extensions or unsupported"
       - "The pinned public code has no mixed-corruption implementation/config; rpex_paper_mixed therefore fails instead of guessing"
-      - "The adversarial golden fixture certifies only the observation-target optimizer core; actions/rewards/dynamics are diagnostic-only"
+      - "The adversarial v1 fixture checks only the observation-target optimizer core and certifies no strict condition"
     remaining_differences:
       - "Handwritten unified learner/controller rather than a thin wrapper around the pinned source"
       - "No end-to-end fixed-batch optimizer parity certificate for the complete learner"
       - "Online optimizer state is reset, but the complete fresh-process constructor RNG consumption order is not reproduced"
       - "Action-level epsilon-greedy sampling is matched, but the separate local evaluation environment and per-episode reset seed schedule differ from upstream"
       - "The adversarial observation fixture is tied to the Hopper EDAC checkpoint and cannot certify HalfCheetah or Walker2d"
-      - "Golden fixtures were generated with NumPy/PyTorch versions different from the pinned strict runtime and must be regenerated there"
+      - "v1 fixtures were generated with NumPy/PyTorch versions different from the pinned strict runtime; required strict-runtime v2 receipts are missing"
       - "Clean/mixed RIQL rows are explicit task extensions, not upstream rows"
       - "Save/resume equivalence is not yet covered for every strict baseline/condition"
     attacker_checkpoints:
@@ -163,10 +239,13 @@ baselines:
       - robust_o2o/networks.py
       - robust_o2o/cql.py
       - robust_o2o/experiment.py
-    implementation_type: "JAX/Flax-to-PyTorch framework port"
+    implementation_type: framework_port
+    benchmark_role: main
+    main_table_eligible: true
     reproduction_status: framework_port_unverified
     parity_status: fixed_batch_numerical_parity_missing
     strict_final_eligible: false
+    reporting_rule_verified: false
     strict_eligibility_scope: >-
       Excluded until an upstream-exported fixed-batch test verifies TD target,
       CQL penalty, actor loss, temperature loss, target update, and optimizer
@@ -187,9 +266,9 @@ baselines:
       - "PyTorch port rather than upstream JAX/Flax"
       - "No upstream-exported fixed-batch or optimizer-step parity fixture"
 
-  cal_ql:
+  cal_ql_locomotion_adaptation:
     paper_title: "Cal-QL: Calibrated Offline RL Pre-Training for Efficient Online Fine-Tuning"
-    algorithm_name: Cal-QL
+    algorithm_name: Cal-QL locomotion adaptation
     upstream_repository: "https://github.com/nakamotoo/Cal-QL"
     upstream_commit: "ac6eafec22e8d60836573e1f488c7f626ce8a77e"
     upstream_files:
@@ -206,24 +285,27 @@ baselines:
       - robust_o2o/agents/calql.py
       - robust_o2o/cql.py
       - robust_o2o/config.py
-    implementation_type: "D4RL locomotion task port"
+    implementation_type: task_adaptation
+    benchmark_role: optional_adapted
+    main_table_eligible: false
     reproduction_status: task_port
     parity_status: unsupported_official_task
     strict_final_eligible: false
     strict_eligibility_scope: "Excluded from strict locomotion runs; diagnostic only"
+    reporting_rule_verified: false
     implementation_status: "D4RL locomotion task port; non-publication diagnostic"
     condition_status:
       locomotion: non_publication_diagnostic
     known_paper_code_conflicts: []
     local_divergences:
       - "Hopper/HalfCheetah/Walker2d are always labelled d4rl_locomotion_port/task_port"
-      - "oracle_exclude_corrupted calibration is an oracle diagnostic and is not aggregated with all-data calibration"
+      - "research_benchmark rejects oracle_exclude_corrupted and never passes corruption labels to the learner"
     remaining_differences:
       - "D4RL locomotion is outside the official task recipes"
 
-  pessimistic_q_ensemble:
+  pqe_shared_actor_approx:
     paper_title: "Offline-to-Online Reinforcement Learning via Balanced Replay and Pessimistic Q-Ensemble"
-    algorithm_name: Pessimistic Q-Ensemble
+    algorithm_name: PQE shared-actor approximation
     upstream_repository: "https://github.com/shlee94/Off2OnRL"
     upstream_commit: "6f298fa9ef040d725067d0f2775022bd2900d635"
     upstream_files:
@@ -240,11 +322,14 @@ baselines:
     local_files:
       - robust_o2o/agents/sac_family.py
       - robust_o2o/replay.py
-    implementation_type: "shared-actor approximation"
+    implementation_type: approximation
+    benchmark_role: optional_diagnostic
+    main_table_eligible: false
     reproduction_status: approximation
     parity_status: official_independent_policy_ensemble_missing
     strict_final_eligible: false
     strict_eligibility_scope: "Excluded from strict runs; diagnostic only"
+    reporting_rule_verified: false
     implementation_status: "pqe_shared_actor_approx only; strict final fail-fast"
     condition_status:
       all_local_conditions: diagnostic_extension

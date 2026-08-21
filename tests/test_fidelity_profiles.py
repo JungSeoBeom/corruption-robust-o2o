@@ -78,7 +78,7 @@ def _assert_nested_equal(test: unittest.TestCase, first, second) -> None:
 class FidelityProfileTest(unittest.TestCase):
     def test_primary_suite_keeps_ports_explicit_and_rejects_pqe(self):
         calql = ExperimentConfig(
-            "cal_ql",
+            "cal_ql_locomotion_adaptation",
             "hopper-medium-replay-v2",
             implementation_profile="locomotion_port",
         )
@@ -86,20 +86,16 @@ class FidelityProfileTest(unittest.TestCase):
         self.assertEqual(calql.implementation_fidelity, "task_port")
         with self.assertRaisesRegex(ValueError, "Cal-QL locomotion"):
             ExperimentConfig(
-                "cal_ql",
+                "cal_ql_locomotion_adaptation",
                 "hopper-medium-replay-v2",
                 suite_profile="primary_research_benchmark",
             )
-        clean_rpex = ExperimentConfig(
-            "rpex",
-            "hopper-medium-replay-v2",
-            suite_profile="primary_research_benchmark",
-        )
-        self.assertTrue(clean_rpex.riql_config_extension)
-        self.assertEqual(
-            clean_rpex.implementation_fidelity, "source_aligned_port"
-        )
-        self.assertEqual(clean_rpex.condition_status, "benchmark_transfer")
+        with self.assertRaisesRegex(ValueError, "source_aligned_port"):
+            ExperimentConfig(
+                "rpex",
+                "hopper-medium-replay-v2",
+                suite_profile="primary_research_benchmark",
+            )
         with self.assertRaisesRegex(ValueError, "shared_actor"):
             ExperimentConfig(
                 "pessimistic_q_ensemble",

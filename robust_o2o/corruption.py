@@ -6,7 +6,7 @@ import os
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -20,12 +20,110 @@ from .config import (
     default_attack_checkpoint_sha256,
 )
 from .device import clear_accelerator_cache
-from .environment import Dataset
+from .environment import Dataset, EXPECTED_LOCOMOTION_DIMS
 from .networks import VectorizedLinear
 
 
-ATTACK_IMPLEMENTATION_VERSION = "corruption_v6_rpex_legacy_rng_and_split_semantics"
+ATTACK_IMPLEMENTATION_VERSION = "corruption_v7_replay_transition_poisoning"
 ATTACK_OBJECTIVE = "minimize_edac_ensemble_mean_q"
+CORRUPTION_APPLICATION_CONTRACT = "replay_transition_poisoning"
+
+# Pinned RPEX defines target-specific EDAC objectives for observations,
+# actions, and next observations. Reward poisoning is a separate public-code
+# rule (offline ``-epsilon * reward``; online uniform replacement), not a
+# gradient attack. We preserve that distinction instead of pretending all
+# four targets share one optimizer.
+SUPPORTED_ADVERSARIAL_TARGETS = INDIVIDUAL_CORRUPTION_TARGETS
+
+
+def validate_adversarial_target(config: ExperimentConfig) -> None:
+    """Fail before training for any adversarial condition we cannot support."""
+
+    if config.corruption != "adversarial":
+        return
+    if config.corruption_target == "mixed":
+        requested = tuple(
+            target
+            for target, ratio in zip(
+                INDIVIDUAL_CORRUPTION_TARGETS, config.mixed_ratios
+            )
+            if ratio > 0.0
+        )
+    else:
+        requested = (config.corruption_target,)
+    unsupported = [
+        target for target in requested if target not in SUPPORTED_ADVERSARIAL_TARGETS
+    ]
+    if unsupported:
+        raise ValueError(
+            "unsupported adversarial corruption target(s): "
+            f"{', '.join(unsupported)}. Supported targets: "
+            + ", ".join(SUPPORTED_ADVERSARIAL_TARGETS)
+        )
+
+
+def _load_checkpoint_payload(
+    checkpoint: Path, device: torch.device
+) -> Mapping[str, Any]:
+    try:
+        payload = torch.load(checkpoint, map_location=device, weights_only=True)
+    except TypeError:  # pragma: no cover - compatibility with older PyTorch
+        payload = torch.load(checkpoint, map_location=device)
+    if not isinstance(payload, Mapping):
+        raise ValueError("adversarial oracle checkpoint must contain a mapping")
+    return payload
+
+
+def _validate_checkpoint_architecture(
+    payload: Mapping[str, Any], state_dim: int, action_dim: int
+) -> tuple[Mapping[str, torch.Tensor], Mapping[str, torch.Tensor]]:
+    actor_state = payload.get("actor")
+    critic_state = payload.get("critic")
+    if not isinstance(actor_state, Mapping) or not isinstance(critic_state, Mapping):
+        raise ValueError(
+            "adversarial oracle checkpoint must contain actor and critic state_dicts"
+        )
+    expected_shapes = {
+        "actor.trunk.0.weight": ((256, state_dim), actor_state, "trunk.0.weight"),
+        "actor.mu.weight": ((action_dim, 256), actor_state, "mu.weight"),
+        "actor.log_sigma.weight": (
+            (action_dim, 256),
+            actor_state,
+            "log_sigma.weight",
+        ),
+        "critic.critic.0.weight": (
+            (10, state_dim + action_dim, 256),
+            critic_state,
+            "critic.0.weight",
+        ),
+        "critic.critic.6.weight": ((10, 256, 1), critic_state, "critic.6.weight"),
+    }
+    mismatches = []
+    for label, (expected, state, key) in expected_shapes.items():
+        value = state.get(key)
+        actual = tuple(value.shape) if isinstance(value, torch.Tensor) else None
+        if actual != expected:
+            mismatches.append(f"{label}: expected={expected}, actual={actual}")
+    if mismatches:
+        raise ValueError(
+            "adversarial oracle checkpoint architecture/dimension mismatch: "
+            + "; ".join(mismatches)
+        )
+    return actor_state, critic_state
+
+
+def _declared_checkpoint_environment(payload: Mapping[str, Any]) -> str | None:
+    for key in ("env_name", "environment", "dataset_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    metadata = payload.get("metadata")
+    if isinstance(metadata, Mapping):
+        for key in ("env_name", "environment", "dataset_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
 
 
 class EDACActor(nn.Module):
@@ -88,11 +186,23 @@ class AttackOracle:
         implementation_profile: str = "experimental_sign_pgd",
         *,
         record_trace: bool = False,
+        env_name: str | None = None,
     ):
         if not checkpoint.exists():
             raise FileNotFoundError(f"Adversarial attack checkpoint not found: {checkpoint}")
         self.device = device
         self.checkpoint = checkpoint.resolve()
+        self.checkpoint_sha256 = _sha256_file(self.checkpoint)
+        self.env_name = env_name
+        if env_name is not None:
+            domain = env_name.split("-", 1)[0]
+            expected_dimensions = EXPECTED_LOCOMOTION_DIMS.get(domain)
+            if expected_dimensions != (state_dim, action_dim):
+                raise ValueError(
+                    "adversarial oracle environment/dimension mismatch: "
+                    f"env={env_name}, expected={expected_dimensions}, "
+                    f"actual={(state_dim, action_dim)}"
+                )
         self.implementation_profile = implementation_profile
         self.record_trace = record_trace
         self.attack_traces: list[Dict[str, Any]] = []
@@ -103,9 +213,34 @@ class AttackOracle:
         self.generator.manual_seed(int(seed))
         self.actor = EDACActor(state_dim, action_dim, max_action).to(device).eval()
         self.critic = EDACCritic(state_dim, action_dim).to(device).eval()
-        state = torch.load(checkpoint, map_location=device)
-        self.actor.load_state_dict(state["actor"])
-        self.critic.load_state_dict(state["critic"])
+        state = _load_checkpoint_payload(self.checkpoint, device)
+        actor_state, critic_state = _validate_checkpoint_architecture(
+            state, state_dim, action_dim
+        )
+        if env_name is not None:
+            declared_environment = _declared_checkpoint_environment(state)
+            pinned_hash = default_attack_checkpoint_sha256(env_name)
+            hash_binds_environment = (
+                pinned_hash is not None
+                and self.checkpoint_sha256.lower() == pinned_hash.lower()
+            )
+            if declared_environment is not None and declared_environment != env_name:
+                raise ValueError(
+                    "adversarial oracle checkpoint environment mismatch: "
+                    f"declared={declared_environment}, requested={env_name}"
+                )
+            if declared_environment is None and not hash_binds_environment:
+                raise ValueError(
+                    "custom adversarial oracle checkpoint has no environment "
+                    "metadata and does not match the pinned hash for "
+                    f"{env_name}"
+                )
+        # Explicit ``strict=True`` ensures missing and unexpected network keys
+        # are never ignored. Root-level optimizer state is intentionally not a
+        # network state_dict and is irrelevant to the frozen oracle.
+        self.actor.load_state_dict(actor_state, strict=True)
+        self.critic.load_state_dict(critic_state, strict=True)
+        self.strict_checkpoint_load_verified = True
         for parameter in self.actor.parameters():
             parameter.requires_grad_(False)
         for parameter in self.critic.parameters():
@@ -269,6 +404,17 @@ def resolve_attack_checkpoint(config: ExperimentConfig) -> Path:
             "Attacker checkpoint SHA256 mismatch: "
             f"expected={expected_sha256.lower()} actual={actual_sha256.lower()}"
         )
+    if config.run_purpose == "research_benchmark":
+        pinned_environment_hash = default_attack_checkpoint_sha256(config.env_name)
+        if (
+            pinned_environment_hash is None
+            or actual_sha256.lower() != pinned_environment_hash.lower()
+        ):
+            raise ValueError(
+                "research_benchmark requires the environment-specific pinned "
+                f"adversarial oracle checkpoint for {config.env_name}; "
+                f"actual_sha256={actual_sha256.lower()}"
+            )
     return candidate
 
 
@@ -281,18 +427,17 @@ def make_attack_oracle(
 ) -> Optional[AttackOracle]:
     if config.corruption != "adversarial":
         return None
+    validate_adversarial_target(config)
     if config.corruption_target == "rewards":
         return None
-    if config.corruption_target == "mixed":
-        gradient_ratios = (
-            ratio
-            for target, ratio in zip(
-                INDIVIDUAL_CORRUPTION_TARGETS, config.mixed_ratios
-            )
-            if target != "rewards"
+    if config.corruption_target == "mixed" and not any(
+        ratio > 0.0
+        for target, ratio in zip(
+            INDIVIDUAL_CORRUPTION_TARGETS, config.mixed_ratios
         )
-        if not any(ratio > 0.0 for ratio in gradient_ratios):
-            return None
+        if target != "rewards"
+    ):
+        return None
     if config.corruption_target == "none":
         return None
     return AttackOracle(
@@ -303,6 +448,7 @@ def make_attack_oracle(
         device,
         config.corruption_seed,
         config.adversarial_attack_profile,
+        env_name=config.env_name,
     )
 
 
@@ -328,11 +474,30 @@ def dataset_fingerprint(dataset: Dataset) -> str:
 def make_numpy_corruption_rng(
     config: ExperimentConfig,
 ) -> np.random.RandomState | np.random.Generator:
-    """Construct the profile-specific NumPy stream without hidden offsets."""
+    """Construct the corruption stream used to build a shared artifact.
 
-    if config.implementation_profile == "official_code_reference":
+    Research-benchmark artifacts intentionally use one implementation across
+    every baseline. Legacy exact-code diagnostics retain RandomState so old
+    fixture checks remain isolated from the fair benchmark path.
+    """
+
+    if (
+        config.implementation_profile == "official_code_reference"
+        and config.run_purpose != "research_benchmark"
+    ):
         return np.random.RandomState(int(config.corruption_seed))
     return np.random.default_rng(int(config.corruption_seed))
+
+
+def corruption_rng_implementation(config: ExperimentConfig) -> str:
+    return (
+        "numpy.random.RandomState"
+        if (
+            config.implementation_profile == "official_code_reference"
+            and config.run_purpose != "research_benchmark"
+        )
+        else "numpy.random.Generator(PCG64)"
+    )
 
 
 def numpy_rng_state(
@@ -367,31 +532,17 @@ def corruption_cache_fingerprint(
     oracle: Optional[AttackOracle],
 ) -> Tuple[str, Dict[str, Any]]:
     dataset_hash = dataset_fingerprint(dataset)
-    checkpoint_hash = (
-        _sha256_file(oracle.checkpoint) if oracle is not None else "none"
-    )
-    states = np.concatenate(
-        (dataset["observations"], dataset["next_observations"]), axis=0
-    )
-    if config.state_normalization == "standard":
-        location = states.mean(axis=0)
-        scale_values = (
-            states.std(axis=0) + np.float32(1e-3)
-            if config.implementation_profile == "official_code_reference"
-            else np.maximum(states.std(axis=0), 1e-3)
+    checkpoint_hash = "none"
+    if oracle is not None:
+        checkpoint_hash = str(
+            getattr(oracle, "checkpoint_sha256", _sha256_file(oracle.checkpoint))
         )
-    elif config.state_normalization == "robust_median_mad":
-        location = np.median(states, axis=0)
-        scale_values = np.maximum(
-            1.4826 * np.median(np.abs(states - location), axis=0), 1e-3
-        )
-    else:
-        location = np.zeros(states.shape[1], dtype=np.float32)
-        scale_values = np.ones(states.shape[1], dtype=np.float32)
-    normalizer_digest = hashlib.sha256(config.state_normalization.encode("utf-8"))
-    normalizer_digest.update(np.ascontiguousarray(location).tobytes())
-    normalizer_digest.update(np.ascontiguousarray(scale_values).tobytes())
+    # The key describes the generated corruption values only. Learner profile,
+    # normalization, online settings, budgets, and Cal-QL return bookkeeping do
+    # not affect those values and would incorrectly create per-baseline copies.
     metadata = {
+        "artifact_schema": "offline_corruption_artifact_v4",
+        "environment": config.env_name,
         "dataset_fingerprint": dataset_hash,
         "attack_checkpoint_fingerprint": checkpoint_hash,
         "corruption": config.corruption,
@@ -400,38 +551,49 @@ def corruption_cache_fingerprint(
         "offline_corruption_rate": config.offline_corruption_rate,
         "seed": config.corruption_seed,
         "attack_seed": config.corruption_seed,
-        "rng_implementation": (
-            "numpy.random.RandomState"
-            if config.implementation_profile == "official_code_reference"
-            else "numpy.random.Generator(PCG64)"
-        ),
-        "offline_attack_steps": config.offline_attack_steps,
-        "online_attack_steps": config.online_attack_steps,
-        "attack_step_size": config.attack_step_size,
-        "online_attack_step_size": config.online_attack_step_size,
-        "attack_min_step_size": config.attack_min_step_size,
-        "attack_norm": config.attack_norm,
+        "rng_implementation": corruption_rng_implementation(config),
         "mixed_ratios": list(config.mixed_ratios),
         "attack_implementation_version": ATTACK_IMPLEMENTATION_VERSION,
-        "attack_implementation_profile": config.adversarial_attack_profile,
-        "online_corruption_scale_profile": config.online_corruption_scale_profile,
-        "offline_adversarial_reward_rule": config.offline_adversarial_reward_rule,
-        "online_adversarial_reward_rule": config.online_adversarial_reward_rule,
-        "attack_objective": ATTACK_OBJECTIVE,
-        "attack_optimizer": (
-            "adam_reinitialized_each_step"
-            if config.adversarial_attack_profile == "rpex_official_adam"
-            else "sign_gradient_descent"
-        ),
-        "attack_timing": config.attack_timing,
-        "random_attack_semantics": config.random_attack_semantics,
-        "mixed_corruption_profile": config.mixed_corruption_profile,
-        "device": str(getattr(oracle, "device", "unknown")) if oracle is not None else "numpy",
+        "corruption_application_contract": CORRUPTION_APPLICATION_CONTRACT,
         "source_commit": "35da71ee5151b6179d21b9a2b4ce1b6408aedd04",
-        "normalizer_sha256": normalizer_digest.hexdigest(),
-        "mc_return_source": config.mc_return_source,
-        "discount": config.discount,
     }
+    if config.corruption == "random":
+        metadata.update(
+            {
+                "noise_distribution": "uniform[-epsilon,+epsilon]",
+                "vector_scale": "target_field_dataset_std",
+                "clipping": "none",
+            }
+        )
+    elif config.corruption == "adversarial":
+        validate_adversarial_target(config)
+        metadata.update(
+            {
+                "offline_attack_steps": config.offline_attack_steps,
+                "attack_step_size": config.attack_step_size,
+                "attack_norm": config.attack_norm,
+                "attack_implementation_profile": config.adversarial_attack_profile,
+                "offline_adversarial_reward_rule": (
+                    config.offline_adversarial_reward_rule
+                ),
+                "attack_objective": ATTACK_OBJECTIVE,
+                "attack_optimizer": (
+                    "adam_reinitialized_each_step"
+                    if config.adversarial_attack_profile == "rpex_official_adam"
+                    else "sign_gradient_descent"
+                ),
+                "device": str(getattr(oracle, "device", "none_reward_rule")),
+                "oracle_environment": getattr(oracle, "env_name", None),
+                "attacker_checkpoint_path": (
+                    str(oracle.checkpoint)
+                    if oracle is not None
+                    else None
+                ),
+                "strict_checkpoint_load_verified": bool(
+                    getattr(oracle, "strict_checkpoint_load_verified", False)
+                ),
+            }
+        )
     encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest(), metadata
 
@@ -603,14 +765,13 @@ class OnlineCorruptionAudit:
             "online_corruption_rate": config.online_corruption_rate,
             "corruption_range": config.corruption_range,
             "corruption_seed": config.corruption_seed,
-            "rng_implementation": (
-                "numpy.random.RandomState"
-                if config.implementation_profile == "official_code_reference"
-                else "numpy.random.Generator(PCG64)"
-            ),
+            "rng_implementation": corruption_rng_implementation(config),
             "upstream_source_commit": "35da71ee5151b6179d21b9a2b4ce1b6408aedd04",
             "attack_semantics": config.random_attack_semantics,
             "attack_timing": config.attack_timing,
+            "corruption_application_contract": CORRUPTION_APPLICATION_CONTRACT,
+            "environment_interaction_corrupted": False,
+            "evaluation_corruption": "clean",
             "online_corruption_scale_profile": config.online_corruption_scale_profile,
             **reward_corruption_metadata(config, "online"),
         }
@@ -630,6 +791,7 @@ def _corruption_stats(
         "loaded_from_cache": float(loaded_from_cache),
         "attack_semantics": config.random_attack_semantics,
         "attack_timing": config.attack_timing,
+        "corruption_application_contract": CORRUPTION_APPLICATION_CONTRACT,
         "corruption_seed": config.corruption_seed,
         "corruption_rate": config.offline_corruption_rate,
         "corruption_range": config.corruption_range,
@@ -852,6 +1014,7 @@ def _load_cached_corruption(
         cache_hit=True,
         cache_miss=False,
         cache_key=cache_key,
+        cache_file=str(cache_file.resolve()),
         **cache_metadata,
     )
     stats["corruption_value_sha256"] = _corruption_value_sha256(
@@ -977,6 +1140,7 @@ def corrupt_offline_dataset(
     oracle: Optional[AttackOracle],
     cache_root: Path,
 ) -> Tuple[Dataset, Dict[str, Any]]:
+    validate_adversarial_target(config)
     if config.corruption == "clean":
         result = {key: value.copy() for key, value in dataset.items()}
         result["mc_calibration_valid"] = np.ones(
@@ -991,6 +1155,7 @@ def corrupt_offline_dataset(
             "cache_miss": False,
             "attack_semantics": config.random_attack_semantics,
             "attack_timing": config.attack_timing,
+            "corruption_application_contract": CORRUPTION_APPLICATION_CONTRACT,
             "corruption_seed": config.corruption_seed,
             "corruption_rate": config.offline_corruption_rate,
             "corruption_range": config.corruption_range,
@@ -999,11 +1164,7 @@ def corrupt_offline_dataset(
             "selected_transition_indices_sha256": hashlib.sha256(b"").hexdigest(),
             "corruption_value_sha256": hashlib.sha256(b"").hexdigest(),
             "final_artifact_sha256": dataset_fingerprint(result),
-            "rng_implementation": (
-                "numpy.random.RandomState"
-                if config.implementation_profile == "official_code_reference"
-                else "numpy.random.Generator(PCG64)"
-            ),
+            "rng_implementation": corruption_rng_implementation(config),
         }
 
     cache_file, cache_key, cache_metadata = _cache_file(
@@ -1052,7 +1213,7 @@ def _generate_and_cache_corruption(
         target_indices = {config.corruption_target: indices}
 
     cache_payload = {
-        "format_version": np.asarray(3, dtype=np.int64),
+        "format_version": np.asarray(4, dtype=np.int64),
         "cache_key": np.asarray(cache_key, dtype=np.str_),
         "metadata_json": np.asarray(
             json.dumps(cache_metadata, sort_keys=True, separators=(",", ":")),
@@ -1079,6 +1240,7 @@ def _generate_and_cache_corruption(
         cache_hit=False,
         cache_miss=True,
         cache_key=cache_key,
+        cache_file=str(cache_file.resolve()),
         **cache_metadata,
     )
     stats["corruption_value_sha256"] = _corruption_value_sha256(
@@ -1102,26 +1264,82 @@ def corrupt_online_transition(
     selected_target: Optional[str] = None,
     selection_already_sampled: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]:
-    if selected_target is None and not selection_already_sampled:
+    """Poison one replay transition after a clean environment interaction.
+
+    ``action`` must be the action already executed in the clean training
+    environment and ``raw_next_state`` must be that environment's response.
+    This function never returns a value intended for ``env.step`` and never
+    mutates any input array.
+    """
+
+    validate_adversarial_target(config)
+    if selected_target is None:
+        if selection_already_sampled:
+            # Legacy official-code diagnostics preserve RPEX's quirk where a
+            # non-selected random transition still consumes the candidate
+            # corruption draw.  The fair research path deliberately has no
+            # exact-RNG requirement and does not perform this ghost draw.
+            legacy_official_rng = (
+                config.implementation_profile == "official_code_reference"
+                and config.run_purpose != "research_benchmark"
+                and config.corruption != "clean"
+            )
+            ghost_target = (
+                config.corruption_target
+                if config.corruption_target in INDIVIDUAL_CORRUPTION_TARGETS
+                else None
+            )
+            if legacy_official_rng and ghost_target == "rewards":
+                corrupt_online_reward_value(reward, config, rng)
+            elif (
+                legacy_official_rng
+                and ghost_target is not None
+                and config.corruption == "random"
+            ):
+                original = {
+                    "observations": raw_state,
+                    "actions": action,
+                    "dynamics": raw_next_state,
+                }[ghost_target]
+                rng.uniform(
+                    -config.corruption_range,
+                    config.corruption_range,
+                    size=original.shape,
+                )
+            return (
+                raw_state.copy(),
+                action.copy(),
+                float(reward),
+                raw_next_state.copy(),
+                False,
+            )
         selected_target = sample_online_corruption_target(config, rng)
-    if selected_target is None and config.corruption == "clean":
-        return raw_state, action, reward, raw_next_state, False
+    if selected_target is None:
+        return (
+            raw_state.copy(),
+            action.copy(),
+            float(reward),
+            raw_next_state.copy(),
+            False,
+        )
+    if selected_target not in INDIVIDUAL_CORRUPTION_TARGETS:
+        raise ValueError(f"unknown replay corruption target: {selected_target!r}")
+    if (
+        config.corruption_target != "mixed"
+        and selected_target != config.corruption_target
+    ):
+        raise ValueError(
+            "selected replay target does not match the configured condition: "
+            f"selected={selected_target}, configured={config.corruption_target}"
+        )
 
     state = raw_state.copy()
     stored_action = action.copy()
     stored_reward = float(reward)
     next_state = raw_next_state.copy()
-    target = selected_target or (
-        config.corruption_target
-        if config.corruption_target in INDIVIDUAL_CORRUPTION_TARGETS
-        else None
-    )
-    if target is None:
-        return raw_state, action, reward, raw_next_state, False
+    target = selected_target
     if target == "rewards":
         candidate_reward = corrupt_online_reward_value(reward, config, rng)
-        if selected_target is None:
-            return state, stored_action, stored_reward, next_state, False
         return state, stored_action, candidate_reward, next_state, True
 
     original = {
@@ -1139,8 +1357,6 @@ def corrupt_online_transition(
             size=original.shape,
         ) * std
     else:
-        if selected_target is None:
-            return state, stored_action, stored_reward, next_state, False
         if oracle is None:
             raise RuntimeError("An AttackOracle is required for adversarial corruption")
         attacked = oracle.attack(
@@ -1154,8 +1370,6 @@ def corrupt_online_transition(
             max(config.online_attack_step_size, config.attack_min_step_size),
             online=True,
         )[0]
-    if selected_target is None:
-        return state, stored_action, stored_reward, next_state, False
     if target == "observations":
         state = attacked.astype(np.float32)
     elif target == "actions":
@@ -1213,6 +1427,14 @@ def corrupt_pre_action_value(
     state_std: np.ndarray,
     action_std: np.ndarray,
 ) -> np.ndarray:
+    if config.run_purpose == "research_benchmark":
+        raise RuntimeError(
+            "pre-action sensor/actuator corruption is outside the benchmark "
+            f"contract ({CORRUPTION_APPLICATION_CONTRACT}); generate a clean "
+            "transition first and poison only the replay copy"
+        )
+    # Retain the old simulator-corruption path only for explicitly selected
+    # legacy diagnostics. It is never reachable from research_benchmark config.
     if target not in ("observations", "actions"):
         return original.copy()
     std = online_corruption_scale(
@@ -1221,7 +1443,11 @@ def corrupt_pre_action_value(
     if config.corruption == "random":
         return (
             original
-            + rng.uniform(-config.corruption_range, config.corruption_range, original.shape)
+            + rng.uniform(
+                -config.corruption_range,
+                config.corruption_range,
+                original.shape,
+            )
             * std
         ).astype(np.float32)
     if oracle is None:
@@ -1231,7 +1457,9 @@ def corrupt_pre_action_value(
             action = (
                 oracle.actor(
                     torch.as_tensor(
-                        raw_state[None, :], dtype=torch.float32, device=oracle.device
+                        raw_state[None, :],
+                        dtype=torch.float32,
+                        device=oracle.device,
                     ),
                     deterministic=True,
                 )[0]

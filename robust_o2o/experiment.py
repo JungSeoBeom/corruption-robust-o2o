@@ -74,6 +74,252 @@ class MetricAccumulator:
         return result
 
 
+_WSRL_UPDATE_COUNT_KEYS = (
+    "number_of_actor_updates",
+    "number_of_critic_updates",
+    "number_of_temperature_updates",
+)
+_WSRL_TOTAL_UPDATE_KEYS = (
+    "total_actor_updates",
+    "total_critic_updates",
+    "total_temperature_updates",
+)
+
+
+def _agent_update_count(agent: object, role: str) -> int:
+    """Read split optimizer counters with legacy/mock-agent compatibility."""
+
+    return int(
+        getattr(
+            agent,
+            f"{role}_updates",
+            getattr(agent, "total_updates", 0),
+        )
+    )
+
+
+def _runtime_update_metadata(
+    config: ExperimentConfig,
+    agent: object,
+    *,
+    online_initial_update_counts: Dict[str, int] | None = None,
+    online_environment_steps: int = 0,
+) -> Dict[str, Any]:
+    """Return measured optimizer counts without conflating compute and data budgets."""
+
+    totals = {
+        role: _agent_update_count(agent, role)
+        for role in ("actor", "critic", "temperature")
+    }
+    initial = online_initial_update_counts or totals
+    online = {
+        role: totals[role] - int(initial[role])
+        for role in totals
+    }
+    configured_utd = int(
+        config.wsrl_utd_ratio
+        if config.algorithm == "wsrl"
+        else config.updates_per_step
+    )
+    actual_utd = (
+        float(online["critic"] / online_environment_steps)
+        if online_environment_steps > 0
+        else 0.0
+    )
+    return {
+        "critic_gradient_updates": totals["critic"],
+        "actor_gradient_updates": totals["actor"],
+        "temperature_updates": totals["temperature"],
+        "online_critic_gradient_updates": online["critic"],
+        "online_actor_gradient_updates": online["actor"],
+        "online_temperature_updates": online["temperature"],
+        "configured_utd": configured_utd,
+        "actual_utd": actual_utd,
+    }
+
+
+def _split_wsrl_high_utd_batch(
+    batch: Dict[str, torch.Tensor], utd_ratio: int
+) -> list[Dict[str, torch.Tensor]]:
+    """Match upstream ``update_high_utd``'s reshape into contiguous minibatches."""
+
+    if utd_ratio <= 0:
+        raise ValueError("WSRL UTD ratio must be positive")
+    if not batch:
+        raise ValueError("WSRL high-UTD update requires a non-empty batch")
+    batch_sizes = {int(value.shape[0]) for value in batch.values()}
+    if len(batch_sizes) != 1:
+        raise ValueError("WSRL batch fields must have one shared leading dimension")
+    total_batch_size = batch_sizes.pop()
+    if total_batch_size % utd_ratio != 0:
+        raise ValueError(
+            "WSRL total batch size must be divisible by the critic UTD ratio"
+        )
+    per_critic_batch_size = total_batch_size // utd_ratio
+    return [
+        {
+            key: value[
+                index * per_critic_batch_size : (index + 1)
+                * per_critic_batch_size
+            ]
+            for key, value in batch.items()
+        }
+        for index in range(utd_ratio)
+    ]
+
+
+def _aggregate_wsrl_high_utd_metrics(
+    critic_metrics: list[Dict[str, float]],
+    actor_temperature_metrics: Dict[str, float],
+) -> Dict[str, float]:
+    """Mirror upstream: mean critic info, then one actor/temperature info."""
+
+    if not critic_metrics:
+        raise ValueError("WSRL high-UTD update requires critic metrics")
+    critic_keys = set.intersection(*(set(metrics) for metrics in critic_metrics))
+    result = {
+        key: float(np.mean([metrics[key] for metrics in critic_metrics]))
+        for key in critic_keys
+        if isinstance(critic_metrics[0][key], (int, float))
+    }
+    result.update(actor_temperature_metrics)
+    for key in _WSRL_UPDATE_COUNT_KEYS:
+        result[key] = float(
+            sum(float(metrics.get(key, 0.0)) for metrics in critic_metrics)
+            + float(actor_temperature_metrics.get(key, 0.0))
+        )
+    for key in _WSRL_TOTAL_UPDATE_KEYS:
+        if key in actor_temperature_metrics:
+            result[key] = float(actor_temperature_metrics[key])
+    return result
+
+
+def _wsrl_first_update_env_step(
+    *, warmup_steps: int, total_batch_size: int
+) -> int:
+    """Return the first local env-step that updates under pinned WSRL timing.
+
+    Pinned ``finetune.py`` performs the transition while the zero-based online
+    offset is less than or equal to ``max(warmup_steps, min_steps_to_update)``.
+    With this runner's one-based env-step counter that makes the first update
+    occur at threshold + 2.
+    """
+
+    return max(int(warmup_steps), int(total_batch_size)) + 2
+
+
+def _run_wsrl_high_utd_update(
+    agent: object,
+    offline: OfflineDataset,
+    replay: ReplayBuffer,
+    config: ExperimentConfig,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Execute one pinned WSRL online REDQ update cycle.
+
+    Upstream samples one ``batch_size=1024`` replay batch, reshapes it into four
+    contiguous 256-sample critic minibatches, then updates actor/temperature
+    once on the original 1024-sample batch. Sampling four independent batches
+    changes both replay membership and RNG consumption.
+    """
+
+    offline_ratio = float(config.effective_offline_ratio)
+    if not np.isclose(offline_ratio, 0.0):
+        raise ValueError(
+            "WSRL online fine-tuning retains no offline data; "
+            f"effective_offline_ratio must be 0.0, got {offline_ratio}"
+        )
+    total_batch_size = (
+        config.wsrl_utd_ratio * config.wsrl_per_critic_batch_size
+    )
+    full_batch = mixed_batch(
+        offline,
+        replay,
+        total_batch_size,
+        offline_ratio,
+        device,
+        online_replace=True,
+    )
+    critic_metrics = [
+        agent.update(
+            minibatch,
+            update_actor_temperature=False,
+            update_critic=True,
+        )
+        for minibatch in _split_wsrl_high_utd_batch(
+            full_batch, config.wsrl_utd_ratio
+        )
+    ]
+    actor_temperature_metrics = agent.update(
+        full_batch,
+        update_actor_temperature=True,
+        update_critic=False,
+    )
+    return _aggregate_wsrl_high_utd_metrics(
+        critic_metrics, actor_temperature_metrics
+    )
+
+
+def _wsrl_runtime_metadata(
+    config: ExperimentConfig,
+    agent: object,
+    *,
+    online_initial_update_counts: Dict[str, int] | None = None,
+) -> Dict[str, Any]:
+    """Describe the executed WSRL protocol and measured optimizer counts."""
+
+    if config.algorithm != "wsrl":
+        return {}
+    total_batch_size = (
+        config.wsrl_utd_ratio * config.wsrl_per_critic_batch_size
+    )
+    first_update_env_step = _wsrl_first_update_env_step(
+        warmup_steps=max(
+            config.initial_collection_steps, config.warmup_steps
+        ),
+        total_batch_size=total_batch_size,
+    )
+    current_counts = {
+        "actor": _agent_update_count(agent, "actor"),
+        "critic": _agent_update_count(agent, "critic"),
+        "temperature": _agent_update_count(agent, "temperature"),
+    }
+    metadata: Dict[str, Any] = {
+        "wsrl_online_replay_profile_executed": "online_only",
+        "wsrl_online_offline_ratio_executed": 0.0,
+        "wsrl_online_cql_enabled": False,
+        "wsrl_configured_warmup_steps": int(config.warmup_steps),
+        "wsrl_first_update_env_step": first_update_env_step,
+        "wsrl_total_sampled_batch_size": total_batch_size,
+        "wsrl_per_critic_batch_size": int(
+            config.wsrl_per_critic_batch_size
+        ),
+        "wsrl_critic_updates_per_update_step": int(config.wsrl_utd_ratio),
+        "wsrl_actor_updates_per_update_step": 1,
+        "wsrl_temperature_updates_per_update_step": 1,
+        "wsrl_batch_reuse_profile": (
+            "one_online_batch_contiguously_split_for_critic_then_reused_for_actor_temperature"
+        ),
+        "wsrl_total_actor_updates": current_counts["actor"],
+        "wsrl_total_critic_updates": current_counts["critic"],
+        "wsrl_total_temperature_updates": current_counts["temperature"],
+    }
+    if online_initial_update_counts is not None:
+        metadata.update(
+            {
+                "wsrl_online_actor_updates": current_counts["actor"]
+                - int(online_initial_update_counts["actor"]),
+                "wsrl_online_critic_updates": current_counts["critic"]
+                - int(online_initial_update_counts["critic"]),
+                "wsrl_online_temperature_updates": current_counts[
+                    "temperature"
+                ]
+                - int(online_initial_update_counts["temperature"]),
+            }
+        )
+    return metadata
+
+
 def bounded_executed_action(
     raw_policy_action: np.ndarray,
     action_low: np.ndarray,
@@ -95,6 +341,17 @@ def _replay_transition_coordinates(
     return (
         normalizer.transform(stored_state),
         normalizer.transform(stored_next_state),
+    )
+
+
+def _poison_replay_in_learner_coordinates(config: ExperimentConfig) -> bool:
+    """Use the normalized replay coordinates expected by pinned RPEX attacks."""
+
+    return (
+        config.implementation_profile
+        in ("official_code_reference", "research_benchmark")
+        and config.attack_timing
+        == "official_code_post_transition_replay_poisoning"
     )
 
 
@@ -797,6 +1054,11 @@ def run_experiment(
             _parameter_snapshot(agent) if config.diagnostic_mode else None
         )
         diagnostic_initial_updates = agent.total_updates
+        diagnostic_initial_update_counts = {
+            "actor": _agent_update_count(agent, "actor"),
+            "critic": _agent_update_count(agent, "critic"),
+            "temperature": _agent_update_count(agent, "temperature"),
+        }
         diagnostic_initial_return: float | None = None
 
         logger.write_config(
@@ -841,7 +1103,7 @@ def run_experiment(
             config.corruption_target,
             device,
         )
-        if config.algorithm == "pessimistic_q_ensemble":
+        if config.algorithm == "pqe_shared_actor_approx":
             logger.logger.warning(
                 "Pessimistic Q-Ensemble uses implementation_variant=%s: "
                 "one shared actor with critic ensembles, not the exact official "
@@ -920,6 +1182,7 @@ def run_experiment(
                     "requested_online_steps": config.online_steps,
                     "actual_online_steps": 0,
                     "episode_boundary_overshoot": 0,
+                    **_runtime_update_metadata(config, agent),
                 }
             )
         if diagnostic_snapshot is not None:
@@ -943,10 +1206,16 @@ def run_experiment(
                 "final_deterministic_return": final_return,
                 "return_delta": final_return - float(diagnostic_initial_return),
                 **parameter_deltas,
-                "completed_actor_updates": agent.total_updates
+                "completed_updates": agent.total_updates
                 - diagnostic_initial_updates,
-                "completed_critic_updates": agent.total_updates
-                - diagnostic_initial_updates,
+                "completed_actor_updates": _agent_update_count(agent, "actor")
+                - diagnostic_initial_update_counts["actor"],
+                "completed_critic_updates": _agent_update_count(agent, "critic")
+                - diagnostic_initial_update_counts["critic"],
+                "completed_temperature_updates": _agent_update_count(
+                    agent, "temperature"
+                )
+                - diagnostic_initial_update_counts["temperature"],
             }
             with (logger.run_dir / "diagnostic_evidence.json").open(
                 "w", encoding="utf-8"
@@ -1123,6 +1392,32 @@ def _run_online(
     action_std = raw_dataset["actions"].std(axis=0).astype(np.float32)
     online_resume = resume_state is not None and resume_state.get("phase") == "online"
     start_env_step = int(resume_state["phase_step"]) if online_resume else 0
+    online_initial_update_counts = {
+        "actor": int(
+            resume_state.get(
+                "online_initial_actor_updates",
+                _agent_update_count(agent, "actor"),
+            )
+            if online_resume
+            else _agent_update_count(agent, "actor")
+        ),
+        "critic": int(
+            resume_state.get(
+                "online_initial_critic_updates",
+                _agent_update_count(agent, "critic"),
+            )
+            if online_resume
+            else _agent_update_count(agent, "critic")
+        ),
+        "temperature": int(
+            resume_state.get(
+                "online_initial_temperature_updates",
+                _agent_update_count(agent, "temperature"),
+            )
+            if online_resume
+            else _agent_update_count(agent, "temperature")
+        ),
+    }
     rpex_episode_boundary_budget = (
         config.implementation_profile == "official_code_reference"
         and config.algorithm in ("rpex", "riql_naive", "riql_pex")
@@ -1155,6 +1450,21 @@ def _run_online(
                     ),
                     "resume_noop_already_complete": True,
                 }
+            )
+            online_corruption_metadata.update(
+                _wsrl_runtime_metadata(
+                    config,
+                    agent,
+                    online_initial_update_counts=online_initial_update_counts,
+                )
+            )
+            online_corruption_metadata.update(
+                _runtime_update_metadata(
+                    config,
+                    agent,
+                    online_initial_update_counts=online_initial_update_counts,
+                    online_environment_steps=start_env_step,
+                )
             )
             with (logger.run_dir / "online_corruption_manifest.json").open(
                 "w", encoding="utf-8"
@@ -1193,6 +1503,11 @@ def _run_online(
         }
     parameter_snapshot = _parameter_snapshot(agent)
     offline_ratio = config.effective_offline_ratio
+    if config.algorithm == "wsrl" and not np.isclose(offline_ratio, 0.0):
+        raise ValueError(
+            "WSRL online fine-tuning is online-replay-only; "
+            f"effective_offline_ratio must be 0.0, got {offline_ratio}"
+        )
     warmup = (
         max(config.initial_collection_steps, config.warmup_steps)
         if config.algorithm == "wsrl"
@@ -1210,7 +1525,7 @@ def _run_online(
         offline.size
         * desired_online_fraction
         / max(offline_ratio * max(warmup, 1), 1e-12)
-        if config.algorithm == "pessimistic_q_ensemble"
+        if config.algorithm == "pqe_shared_actor_approx"
         and config.pqe_replay_mode == "balanced_density"
         and offline_ratio > 0.0
         else 1.0
@@ -1238,6 +1553,15 @@ def _run_online(
             "replay_mismatch": replay_mismatch,
             "metric_accumulator": accumulator.values,
             "writer_append_position": _writer_positions(logger),
+            "online_initial_actor_updates": online_initial_update_counts[
+                "actor"
+            ],
+            "online_initial_critic_updates": online_initial_update_counts[
+                "critic"
+            ],
+            "online_initial_temperature_updates": online_initial_update_counts[
+                "temperature"
+            ],
         }
 
     pending_checkpoint = False
@@ -1257,25 +1581,52 @@ def _run_online(
     # membership and the Torch RNG state affect the update.  Other profiles
     # retain this repository's post-transition update schedule.
     official_pre_transition_updates = rpex_episode_boundary_budget
-    is_pqe = config.algorithm == "pessimistic_q_ensemble"
+    is_pqe = config.algorithm == "pqe_shared_actor_approx"
+    is_wsrl = config.algorithm == "wsrl"
     update_batch_size = (
         config.wsrl_per_critic_batch_size
-        if config.algorithm == "wsrl"
+        if is_wsrl
         else config.batch_size
+    )
+    wsrl_total_batch_size = (
+        config.wsrl_utd_ratio * config.wsrl_per_critic_batch_size
+        if is_wsrl
+        else 0
     )
     required_online_samples = (
         config.batch_size
         if is_pqe
+        else wsrl_total_batch_size
+        if is_wsrl
         else max(
             update_batch_size - int(round(update_batch_size * offline_ratio)),
             1,
         )
     )
+    wsrl_first_update_step = (
+        _wsrl_first_update_env_step(
+            warmup_steps=warmup,
+            total_batch_size=wsrl_total_batch_size,
+        )
+        if is_wsrl
+        else 0
+    )
+    last_count_log_env_step = start_env_step
+    last_logged_actor_updates = _agent_update_count(agent, "actor")
+    last_logged_critic_updates = _agent_update_count(agent, "critic")
+    last_logged_temperature_updates = _agent_update_count(
+        agent, "temperature"
+    )
 
     def perform_online_updates(env_step: int, *, before_transition: bool) -> None:
         nonlocal last_metrics, priority_metrics
 
-        if before_transition:
+        if is_wsrl:
+            can_update = (
+                env_step >= wsrl_first_update_step
+                and replay.size >= required_online_samples
+            )
+        elif before_transition:
             can_update = (
                 replay.size > warmup
                 and replay.size >= required_online_samples
@@ -1288,12 +1639,18 @@ def _run_online(
         if not can_update:
             return
 
-        update_repeats = (
-            config.wsrl_utd_ratio
-            if config.algorithm == "wsrl"
-            else config.updates_per_step
-        )
-        wsrl_batches: list[Dict[str, torch.Tensor]] = []
+        if is_wsrl:
+            last_metrics = _run_wsrl_high_utd_update(
+                agent,
+                offline,
+                replay,
+                config,
+                device,
+            )
+            accumulator.add(last_metrics)
+            return
+
+        update_repeats = config.updates_per_step
         for _ in range(update_repeats):
             prioritized = (
                 is_pqe and config.pqe_replay_mode == "balanced_density"
@@ -1325,15 +1682,7 @@ def _run_online(
                     offline_ratio,
                     device,
                 )
-                if config.algorithm == "wsrl":
-                    wsrl_batches.append(batch)
-                    last_metrics = agent.update(
-                        batch,
-                        update_actor_temperature=False,
-                        update_critic=True,
-                    )
-                else:
-                    last_metrics = agent.update(batch)
+                last_metrics = agent.update(batch)
             accumulator.add(last_metrics)
             if is_pqe:
                 priorities = agent.consume_priority_values()
@@ -1344,18 +1693,6 @@ def _run_online(
                 priority_metrics = update_sample_priorities(
                     offline, replay, batch, priorities
                 )
-        if config.algorithm == "wsrl":
-            actor_batch = {
-                key: torch.cat([batch[key] for batch in wsrl_batches], dim=0)
-                for key in wsrl_batches[0]
-            }
-            last_metrics = agent.update(
-                actor_batch,
-                update_actor_temperature=True,
-                update_critic=False,
-            )
-            accumulator.add(last_metrics)
-
     actual_online_steps = start_env_step
     for env_step in online_step_iterator:
         actual_online_steps = env_step
@@ -1431,10 +1768,8 @@ def _run_online(
             stored_next_state = raw_next_state.copy()
             was_corrupted = True
         else:
-            normalized_replay_poisoning = (
-                config.implementation_profile == "official_code_reference"
-                and config.attack_timing
-                == "official_code_post_transition_replay_poisoning"
+            normalized_replay_poisoning = _poison_replay_in_learner_coordinates(
+                config
             )
             corruption_state = (
                 normalizer.transform(raw_state)
@@ -1505,6 +1840,63 @@ def _run_online(
             parameter_deltas, parameter_snapshot = _parameter_deltas(
                 agent, parameter_snapshot
             )
+            wsrl_update_metrics: Dict[str, float] = {}
+            if is_wsrl:
+                count_window_env_steps = max(
+                    env_step - last_count_log_env_step, 1
+                )
+                critic_update_delta = (
+                    _agent_update_count(agent, "critic")
+                    - last_logged_critic_updates
+                )
+                actor_update_delta = (
+                    _agent_update_count(agent, "actor")
+                    - last_logged_actor_updates
+                )
+                temperature_update_delta = (
+                    _agent_update_count(agent, "temperature")
+                    - last_logged_temperature_updates
+                )
+                wsrl_update_metrics = {
+                    "wsrl_warmup_active": float(
+                        env_step < wsrl_first_update_step
+                    ),
+                    "wsrl_first_update_env_step": float(
+                        wsrl_first_update_step
+                    ),
+                    "wsrl_configured_critic_updates_per_update_step": float(
+                        config.wsrl_utd_ratio
+                    ),
+                    "wsrl_configured_actor_updates_per_update_step": 1.0,
+                    "wsrl_configured_temperature_updates_per_update_step": 1.0,
+                    "wsrl_critic_updates_since_last_log": float(
+                        critic_update_delta
+                    ),
+                    "wsrl_actor_updates_since_last_log": float(
+                        actor_update_delta
+                    ),
+                    "wsrl_temperature_updates_since_last_log": float(
+                        temperature_update_delta
+                    ),
+                    "wsrl_critic_updates_per_env_step": float(
+                        critic_update_delta / count_window_env_steps
+                    ),
+                    "wsrl_actor_updates_per_env_step": float(
+                        actor_update_delta / count_window_env_steps
+                    ),
+                    "wsrl_temperature_updates_per_env_step": float(
+                        temperature_update_delta / count_window_env_steps
+                    ),
+                    "wsrl_total_actor_updates": float(
+                        _agent_update_count(agent, "actor")
+                    ),
+                    "wsrl_total_critic_updates": float(
+                        _agent_update_count(agent, "critic")
+                    ),
+                    "wsrl_total_temperature_updates": float(
+                        _agent_update_count(agent, "temperature")
+                    ),
+                }
             logger.log_train(
                 "online",
                 env_step,
@@ -1523,12 +1915,7 @@ def _run_online(
                         config.algorithm == "wsrl"
                     ),
                     "offline_data_retained_online": float(offline_ratio > 0.0),
-                    "wsrl_critic_updates_per_env_step": float(
-                        config.wsrl_utd_ratio if config.algorithm == "wsrl" else 0
-                    ),
-                    "wsrl_actor_updates_per_env_step": float(
-                        1 if config.algorithm == "wsrl" else 0
-                    ),
+                    **wsrl_update_metrics,
                     "online_corruption_fraction": corrupted_online / env_step,
                     "raw_action_abs_max": raw_action_abs_max,
                     "executed_action_abs_max": executed_action_abs_max,
@@ -1537,6 +1924,17 @@ def _run_online(
                     **priority_metrics,
                 },
             )
+            if is_wsrl:
+                last_count_log_env_step = env_step
+                last_logged_actor_updates = _agent_update_count(
+                    agent, "actor"
+                )
+                last_logged_critic_updates = _agent_update_count(
+                    agent, "critic"
+                )
+                last_logged_temperature_updates = _agent_update_count(
+                    agent, "temperature"
+                )
         if env_step % config.eval_period == 0:
             _evaluate(
                 logger,
@@ -1627,6 +2025,21 @@ def _run_online(
                 actual_online_steps - config.online_steps, 0
             ),
         }
+    )
+    online_corruption_metadata.update(
+        _wsrl_runtime_metadata(
+            config,
+            agent,
+            online_initial_update_counts=online_initial_update_counts,
+        )
+    )
+    online_corruption_metadata.update(
+        _runtime_update_metadata(
+            config,
+            agent,
+            online_initial_update_counts=online_initial_update_counts,
+            online_environment_steps=actual_online_steps,
+        )
     )
     with (logger.run_dir / "online_corruption_manifest.json").open(
         "w", encoding="utf-8"

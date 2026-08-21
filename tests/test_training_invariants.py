@@ -197,7 +197,7 @@ class TrainingInvariantTest(unittest.TestCase):
 
     def test_uniform_pqe_replay_is_explicit_ablation(self):
         config = ExperimentConfig(
-            "pessimistic_q_ensemble",
+            "pqe_shared_actor_approx",
             "hopper-medium-replay-v2",
             pqe_replay_mode="uniform",
         )
@@ -207,7 +207,7 @@ class TrainingInvariantTest(unittest.TestCase):
         torch.manual_seed(4)
         device = torch.device("cpu")
         config = ExperimentConfig(
-            "pessimistic_q_ensemble",
+            "pqe_shared_actor_approx",
             "hopper-medium-replay-v2",
             hidden_dim=16,
             hidden_layers=2,
@@ -244,7 +244,7 @@ class TrainingInvariantTest(unittest.TestCase):
         dataset = synthetic_dataset(size=8)
         dataset["episode_id"] = np.array([0, 0, 0, 1, 1, 1, 1, 1], np.float32)
         config = ExperimentConfig(
-            "cal_ql",
+            "cal_ql_locomotion_adaptation",
             "hopper-medium-replay-v2",
             corruption="random",
             corruption_target="rewards",
@@ -266,7 +266,7 @@ class TrainingInvariantTest(unittest.TestCase):
         np.testing.assert_array_equal(result["mc_calibration_valid"], 1.0)
 
         config = ExperimentConfig(
-            "cal_ql",
+            "cal_ql_locomotion_adaptation",
             "hopper-medium-replay-v2",
             corruption="random",
             corruption_target="actions",
@@ -292,7 +292,7 @@ class TrainingInvariantTest(unittest.TestCase):
         original = np.arange(8, dtype=np.float32)
         dataset["mc_returns"] = original.copy()
         config = ExperimentConfig(
-            "cal_ql",
+            "cal_ql_locomotion_adaptation",
             "hopper-medium-replay-v2",
             corruption="random",
             corruption_target="rewards",
@@ -329,7 +329,7 @@ class TrainingInvariantTest(unittest.TestCase):
         ):
             torch.manual_seed(3)
             config = ExperimentConfig(
-                "cal_ql",
+                "cal_ql_locomotion_adaptation",
                 "hopper-medium-replay-v2",
                 hidden_dim=16,
                 hidden_layers=2,

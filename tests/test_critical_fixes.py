@@ -362,7 +362,7 @@ class CalQLReturnRegressionTest(unittest.TestCase):
             with self.subTest(target=target):
                 result = {key: value.copy() for key, value in clean.items()}
                 config = ExperimentConfig(
-                    "cal_ql",
+                    "cal_ql_locomotion_adaptation",
                     "hopper-medium-replay-v2",
                     corruption="random",
                     corruption_target=target,
@@ -429,7 +429,7 @@ class PQEBatchRoutingRegressionTest(unittest.TestCase):
     def test_density_updates_and_priorities_write_to_aligned_indices(self):
         seed_everything(9)
         config = ExperimentConfig(
-            "pessimistic_q_ensemble",
+            "pqe_shared_actor_approx",
             "hopper-medium-replay-v2",
             hidden_dim=16,
             hidden_layers=2,
@@ -469,10 +469,14 @@ class PQEBatchRoutingRegressionTest(unittest.TestCase):
 
     def test_resolved_configuration_labels_shared_actor_approximation(self):
         config = ExperimentConfig(
-            "pqe_shared_actor", "hopper-medium-replay-v2"
+            "pqe_shared_actor_approx", "hopper-medium-replay-v2"
         )
-        self.assertEqual(config.algorithm, "pessimistic_q_ensemble")
+        self.assertEqual(config.algorithm, "pqe_shared_actor_approx")
         self.assertEqual(config.to_dict()["implementation_variant"], "pqe_shared_actor_approx")
+        with self.assertRaisesRegex(ValueError, "never silently aliased"):
+            ExperimentConfig(
+                "pessimistic_q_ensemble", "hopper-medium-replay-v2"
+            )
 
 
 if __name__ == "__main__":

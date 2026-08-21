@@ -8,6 +8,7 @@ import random
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,6 +26,7 @@ from robust_o2o.corruption import (
     sample_online_corruption_target,
 )
 from robust_o2o.fidelity import (
+    BASELINE_REPRODUCTION_REGISTRY,
     FinalBenchmarkValidationError,
     RPEX_GOLDEN_FIXTURE_CERTIFICATES,
     STRICT_FINAL_SEEDS,
@@ -40,6 +42,8 @@ from robust_o2o.experiment import (
 from robust_o2o.replay import OfflineDataset, ReplayBuffer
 from robust_o2o.replay import RPEX_OFFICIAL_REPLAY_SAMPLING
 from scripts.audit_reproducibility import (
+    CERTIFICATE_SPECS,
+    EXPECTED_BASELINES,
     Check,
     adversarial_checkpoint_check,
     audit,
@@ -68,6 +72,20 @@ HOPPER_CHECKPOINT = (
     / "EDAC_baseline_seed0-hopper-medium-replay-v2"
     / "2999.pt"
 )
+
+
+def _verified_rpex_registry():
+    """Install a test-only verified record to exercise downstream strict gates."""
+
+    verified = replace(
+        BASELINE_REPRODUCTION_REGISTRY["rpex"],
+        implementation_type="pinned upstream subprocess adapter",
+        reproduction_status="official_adapter_verified",
+        parity_status="official_adapter_verified",
+        strict_final_eligible=True,
+        remaining_deviation="none in synthetic strict-gate fixture",
+    )
+    return patch.dict(BASELINE_REPRODUCTION_REGISTRY, {"rpex": verified})
 
 
 def synthetic_dataset() -> dict[str, np.ndarray]:
@@ -640,7 +658,11 @@ class RPEXGoldenFixtureTest(unittest.TestCase):
             )
 
     def test_final_registry_rejects_unverified_and_task_port_baselines(self):
-        for algorithm in ("wsrl", "cal_ql", "pessimistic_q_ensemble"):
+        for algorithm in (
+            "wsrl",
+            "cal_ql_locomotion_adaptation",
+            "pqe_shared_actor_approx",
+        ):
             with self.subTest(algorithm=algorithm):
                 with self.assertRaises((FinalBenchmarkValidationError, ValueError)):
                     ExperimentConfig(
@@ -662,9 +684,12 @@ class RPEXGoldenFixtureTest(unittest.TestCase):
             )
 
     def test_final_benchmark_rejects_uncertified_corruption_fixture(self):
-        with patch(
-            "robust_o2o.config.validate_reproduction_fixture",
-            side_effect=ValueError("fixture content SHA256 mismatch"),
+        with (
+            _verified_rpex_registry(),
+            patch(
+                "robust_o2o.config.validate_reproduction_fixture",
+                side_effect=ValueError("fixture content SHA256 mismatch"),
+            ),
         ):
             with self.assertRaisesRegex(
                 FinalBenchmarkValidationError,
@@ -692,22 +717,29 @@ class RPEXGoldenFixtureTest(unittest.TestCase):
         self.assertFalse(diagnostic["publication_eligible"])
         self.assertTrue(diagnostic["not_paper_reproduction"])
 
-        final_config = ExperimentConfig(
-            "rpex",
-            "hopper-medium-replay-v2",
-            corruption="random",
-            corruption_target="observations",
-            suite_profile="primary_research_benchmark",
-            run_purpose="final_benchmark",
-            benchmark_seed_set=STRICT_FINAL_SEEDS,
-        )
-        final = final_config.to_dict()
+        with _verified_rpex_registry():
+            final_config = ExperimentConfig(
+                "rpex",
+                "hopper-medium-replay-v2",
+                corruption="random",
+                corruption_target="observations",
+                suite_profile="primary_research_benchmark",
+                run_purpose="final_benchmark",
+                benchmark_seed_set=STRICT_FINAL_SEEDS,
+            )
+            final = final_config.to_dict()
+            self.assertFalse(final["publication_eligible"])
+            self.assertFalse(final["controller_seed_cohort_attested"])
+            final_config._controller_seed_cohort_attested = True
+            final = final_config.to_dict()
+
+        # Cohort membership alone is not executable evidence. Runtime,
+        # certificate, dataset, worktree, and receipt facts remain fail-closed
+        # until the controller/manifester verifies them.
         self.assertFalse(final["publication_eligible"])
-        self.assertFalse(final["controller_seed_cohort_attested"])
-        final_config._controller_seed_cohort_attested = True
-        final = final_config.to_dict()
-        self.assertTrue(final["publication_eligible"])
         self.assertTrue(final["corruption_fixture_verified"])
+        self.assertFalse(final["condition_certificate_verified"])
+        self.assertFalse(final["audit_receipt_verified"])
 
     def test_final_benchmark_locks_core_upstream_contract(self):
         base = {
@@ -755,17 +787,18 @@ class RPEXGoldenFixtureTest(unittest.TestCase):
                     ExperimentConfig(**{**base, field: value})
 
     def test_final_requires_full_seed_cohort_even_for_single_run_entrypoint(self):
-        with self.assertRaisesRegex(
-            FinalBenchmarkValidationError, "benchmark_seed_set"
-        ):
-            ExperimentConfig(
-                "rpex",
-                "hopper-medium-replay-v2",
-                corruption="random",
-                corruption_target="observations",
-                suite_profile="primary_research_benchmark",
-                run_purpose="final_benchmark",
-            )
+        with _verified_rpex_registry():
+            with self.assertRaisesRegex(
+                FinalBenchmarkValidationError, "benchmark_seed_set"
+            ):
+                ExperimentConfig(
+                    "rpex",
+                    "hopper-medium-replay-v2",
+                    corruption="random",
+                    corruption_target="observations",
+                    suite_profile="primary_research_benchmark",
+                    run_purpose="final_benchmark",
+                )
 
     def test_adversarial_fixture_scope_is_observation_only(self):
         base = {
@@ -777,12 +810,22 @@ class RPEXGoldenFixtureTest(unittest.TestCase):
             "benchmark_seed_set": STRICT_FINAL_SEEDS,
         }
         observations = ExperimentConfig(
-            **base, corruption_target="observations"
+            "rpex",
+            "hopper-medium-replay-v2",
+            corruption="adversarial",
+            corruption_target="observations",
+            run_purpose="diagnostic",
+            implementation_profile="official_code_reference",
         )
         self.assertEqual(
             observations.corruption_fixture_id, "rpex_adversarial_core_v1"
         )
         self.assertTrue(observations.to_dict()["corruption_fixture_verified"])
+        with _verified_rpex_registry():
+            with self.assertRaisesRegex(
+                FinalBenchmarkValidationError, "condition_status"
+            ):
+                ExperimentConfig(**base, corruption_target="observations")
 
         for target in ("actions", "rewards", "dynamics"):
             with self.subTest(target=target):
@@ -797,10 +840,11 @@ class RPEXGoldenFixtureTest(unittest.TestCase):
                 self.assertIsNone(diagnostic["corruption_fixture_id"])
                 self.assertFalse(diagnostic["corruption_fixture_verified"])
                 self.assertFalse(diagnostic["publication_eligible"])
-                with self.assertRaisesRegex(
-                    FinalBenchmarkValidationError, "corruption_fixture_scope"
-                ):
-                    ExperimentConfig(**base, corruption_target=target)
+                with _verified_rpex_registry():
+                    with self.assertRaisesRegex(
+                        FinalBenchmarkValidationError, "corruption_fixture_scope"
+                    ):
+                        ExperimentConfig(**base, corruption_target=target)
 
     def test_hopper_adversarial_fixture_cannot_certify_other_tasks(self):
         for env_name in (
@@ -825,32 +869,34 @@ class RPEXGoldenFixtureTest(unittest.TestCase):
                 )
                 self.assertFalse(resolved["publication_eligible"])
 
-                with self.assertRaisesRegex(
-                    FinalBenchmarkValidationError, "corruption_fixture_scope"
-                ):
-                    ExperimentConfig(
-                        "rpex",
-                        env_name,
-                        corruption="adversarial",
-                        corruption_target="observations",
-                        suite_profile="primary_research_benchmark",
-                        run_purpose="final_benchmark",
-                        benchmark_seed_set=STRICT_FINAL_SEEDS,
-                    )
+                with _verified_rpex_registry():
+                    with self.assertRaisesRegex(
+                        FinalBenchmarkValidationError, "corruption_fixture_scope"
+                    ):
+                        ExperimentConfig(
+                            "rpex",
+                            env_name,
+                            corruption="adversarial",
+                            corruption_target="observations",
+                            suite_profile="primary_research_benchmark",
+                            run_purpose="final_benchmark",
+                            benchmark_seed_set=STRICT_FINAL_SEEDS,
+                        )
 
     def test_checkpoint_restored_fields_are_revalidated_for_final(self):
-        config = ExperimentConfig(
-            "rpex",
-            "hopper-medium-replay-v2",
-            corruption="random",
-            corruption_target="observations",
-            suite_profile="primary_research_benchmark",
-            run_purpose="final_benchmark",
-            benchmark_seed_set=STRICT_FINAL_SEEDS,
-        )
-        _restore_agent_config(config, {"config": {"hidden_dim": 64}})
-        with self.assertRaisesRegex(FinalBenchmarkValidationError, "hidden_dim"):
-            config._validate_final_benchmark()
+        with _verified_rpex_registry():
+            config = ExperimentConfig(
+                "rpex",
+                "hopper-medium-replay-v2",
+                corruption="random",
+                corruption_target="observations",
+                suite_profile="primary_research_benchmark",
+                run_purpose="final_benchmark",
+                benchmark_seed_set=STRICT_FINAL_SEEDS,
+            )
+            _restore_agent_config(config, {"config": {"hidden_dim": 64}})
+            with self.assertRaisesRegex(FinalBenchmarkValidationError, "hidden_dim"):
+                config._validate_final_benchmark()
 
     def test_paper_reproduction_is_reserved_until_contract_is_certified(self):
         with self.assertRaisesRegex(
@@ -1050,61 +1096,93 @@ class RPEXGoldenFixtureTest(unittest.TestCase):
 class ReproducibilityAuditStatusTest(unittest.TestCase):
     @staticmethod
     def _eligible_ready_five_not_ready_checks() -> list[Check]:
-        return [
-            Check("eligible_subset_gate", True, "passed"),
-            Check(
-                "wsrl_fixed_batch_parity",
-                False,
-                "fixed_batch_numerical_parity_missing",
-                blocking=False,
-            ),
-            Check(
-                "five_baseline_final_coverage",
-                False,
-                "strict_final_algorithms=('rpex', 'riql_naive')",
-                blocking=False,
-            ),
-            Check(
-                "save_resume_full_benchmark_coverage",
-                True,
-                "all eligible baseline/condition paths established",
-                blocking=True,
-            ),
+        checks = [
+            Check(name, True, "passed")
+            for name in (
+                "baseline_registry",
+                "no_unverified_exact_labels",
+                "source_commits",
+                "reporting_registry",
+                "final_seed_contract",
+                "strict_task_contract",
+                "strict_config_contract",
+                "manifest_provenance",
+                "repository_clean",
+                "rpex_riql_registry_eligibility",
+                "strict_d4rl_preflight",
+            )
         ]
+        checks.extend(
+            Check(
+                f"certificate:{certificate_id}",
+                True,
+                "valid synthetic status input",
+                evidence={
+                    "certificate_id": certificate_id,
+                    "status": "valid",
+                    "valid": True,
+                    "detail": "synthetic status input",
+                },
+            )
+            for certificate_id in CERTIFICATE_SPECS
+        )
+        checks.extend(
+            (
+                Check(
+                    "wsrl_fixed_batch_parity",
+                    False,
+                    "fixed_batch_numerical_parity_missing",
+                    blocking=False,
+                ),
+                Check(
+                    "five_baseline_final_coverage",
+                    False,
+                    "strict_final_algorithms=('rpex', 'riql_naive')",
+                    blocking=False,
+                ),
+            )
+        )
+        return checks
 
-    def test_nonblocking_five_baseline_gaps_do_not_make_subset_unreachable(self):
+    def test_partial_subset_ready_does_not_promote_final_benchmark(self):
         summary = summarize_audit(
             self._eligible_ready_five_not_ready_checks()
         )
-        self.assertEqual(summary["reproducibility_audit"], "PASS")
-        self.assertEqual(summary["final_benchmark_status"], "READY")
+        self.assertEqual(summary["reproducibility_audit"], "FAIL")
+        self.assertEqual(summary["final_benchmark_status"], "NOT READY")
         self.assertEqual(
-            summary["eligible_subset_benchmark_status"], "READY"
+            summary["rpex_riql_eligible_subset_status"], "READY"
         )
         self.assertEqual(
-            summary["five_baseline_benchmark_status"], "NOT READY"
+            summary["five_baseline_status"], "NOT READY"
         )
         self.assertEqual(
-            summary["final_benchmark_scope"], ["rpex", "riql_naive"]
+            set(summary["final_benchmark_scope"]), EXPECTED_BASELINES
         )
 
-    def test_audit_marks_known_matrix_gaps_as_nonblocking_warnings(self):
+    def test_audit_uses_receipts_instead_of_hardcoded_rng_booleans(self):
         checks = {check.name: check for check in audit(static_only=True)}
         for name in ("wsrl_fixed_batch_parity", "five_baseline_final_coverage"):
             with self.subTest(name=name):
                 self.assertFalse(checks[name].passed)
                 self.assertFalse(checks[name].blocking)
-        self.assertFalse(checks["save_resume_full_benchmark_coverage"].passed)
-        self.assertTrue(checks["save_resume_full_benchmark_coverage"].blocking)
-        self.assertFalse(checks["rpex_online_phase_rng_parity"].passed)
-        self.assertTrue(checks["rpex_online_phase_rng_parity"].blocking)
-        self.assertFalse(checks["rpex_evaluation_rng_parity"].passed)
-        self.assertTrue(checks["rpex_evaluation_rng_parity"].blocking)
-        self.assertIn("RIQL-naive", checks["save_resume_full_benchmark_coverage"].detail)
-        self.assertIn(
-            "random observation",
-            checks["save_resume_full_benchmark_coverage"].detail,
-        )
+        self.assertNotIn("rpex_online_phase_rng_parity", checks)
+        self.assertNotIn("rpex_evaluation_rng_parity", checks)
+        for certificate_id in (
+            "rpex_online_rng_parity",
+            "rpex_evaluation_schedule_parity",
+            "save_resume_coverage",
+        ):
+            check = checks[f"certificate:{certificate_id}"]
+            self.assertFalse(check.passed)
+            self.assertTrue(check.blocking)
+            self.assertIn(
+                check.evidence["status"], {"missing", "invalid", "stale"}
+            )
+        summary = summarize_audit(list(checks.values()))
+        self.assertEqual(summary["save_resume_status"], "NOT READY")
+        self.assertEqual(summary["adversarial_corruption_status"], "EXCLUDED")
+        self.assertEqual(summary["verified_certificate_ids"], [])
 
     def test_fixture_runtime_mismatch_is_a_blocking_audit_failure(self):
         check = fixture_runtime_alignment_check()
@@ -1113,18 +1191,26 @@ class ReproducibilityAuditStatusTest(unittest.TestCase):
         self.assertIn("required=1.23.5", check.detail)
         self.assertIn("required=2.5.1", check.detail)
 
-    def test_missing_full_save_resume_coverage_blocks_subset(self):
+    def test_missing_save_resume_receipt_blocks_final_status(self):
         checks = self._eligible_ready_five_not_ready_checks()
-        checks[-1] = Check(
-            "save_resume_full_benchmark_coverage",
-            False,
-            "diagnostic path only",
-            blocking=True,
-        )
+        for index, check in enumerate(checks):
+            if check.name == "certificate:save_resume_coverage":
+                checks[index] = Check(
+                    check.name,
+                    False,
+                    "missing executable receipt",
+                    evidence={
+                        "certificate_id": "save_resume_coverage",
+                        "status": "missing",
+                        "valid": False,
+                        "detail": "missing executable receipt",
+                    },
+                )
+                break
         summary = summarize_audit(checks)
         self.assertEqual(summary["reproducibility_audit"], "FAIL")
-        self.assertEqual(summary["eligible_subset_benchmark_status"], "NOT READY")
-        self.assertEqual(summary["five_baseline_benchmark_status"], "NOT READY")
+        self.assertEqual(summary["save_resume_status"], "NOT READY")
+        self.assertEqual(summary["final_benchmark_status"], "NOT READY")
 
     def test_preflight_save_resume_result_names_its_narrow_scope(self):
         completed = SimpleNamespace(returncode=0, stdout="{}", stderr="")
@@ -1141,7 +1227,7 @@ class ReproducibilityAuditStatusTest(unittest.TestCase):
         self.assertIn("offline checkpoint", resume_check.detail)
         self.assertIn("full resume-state equality", resume_check.detail)
 
-    def test_text_and_json_outputs_separate_subset_from_five_baselines(self):
+    def test_text_and_json_outputs_all_independent_statuses(self):
         checks = self._eligible_ready_five_not_ready_checks()
         with patch(
             "scripts.audit_reproducibility.audit", return_value=checks
@@ -1150,10 +1236,15 @@ class ReproducibilityAuditStatusTest(unittest.TestCase):
             with redirect_stdout(stream):
                 returncode = audit_main()
         output = stream.getvalue()
-        self.assertEqual(returncode, 0)
+        self.assertEqual(returncode, 1)
         self.assertIn("[WARN] wsrl_fixed_batch_parity", output)
-        self.assertIn("ELIGIBLE-SUBSET BENCHMARK STATUS: READY", output)
-        self.assertIn("FIVE-BASELINE BENCHMARK STATUS: NOT READY", output)
+        self.assertIn("RPEX/RIQL ELIGIBLE SUBSET STATUS: READY", output)
+        self.assertIn("FIVE-BASELINE STATUS: NOT READY", output)
+        self.assertIn("RANDOM CORRUPTION STATUS: READY", output)
+        self.assertIn("ADVERSARIAL CORRUPTION STATUS: EXCLUDED", output)
+        self.assertIn("SAVE/RESUME STATUS: READY", output)
+        self.assertIn("STRICT ENVIRONMENT STATUS: READY", output)
+        self.assertIn("FINAL BENCHMARK STATUS: NOT READY", output)
 
         with patch(
             "scripts.audit_reproducibility.audit", return_value=checks
@@ -1162,13 +1253,14 @@ class ReproducibilityAuditStatusTest(unittest.TestCase):
             with redirect_stdout(stream):
                 returncode = audit_main()
         payload = json.loads(stream.getvalue())
-        self.assertEqual(returncode, 0)
+        self.assertEqual(returncode, 1)
         self.assertEqual(
-            payload["eligible_subset_benchmark_status"], "READY"
+            payload["rpex_riql_eligible_subset_status"], "READY"
         )
         self.assertEqual(
-            payload["five_baseline_benchmark_status"], "NOT READY"
+            payload["five_baseline_status"], "NOT READY"
         )
+        self.assertEqual(payload["final_benchmark_status"], "NOT READY")
 
 
 if __name__ == "__main__":

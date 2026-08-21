@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -12,6 +13,7 @@ import torch
 
 from robust_o2o.config import ExperimentConfig, STRICT_FINAL_SEEDS
 from robust_o2o.experiment import resolve_resume_checkpoint
+from robust_o2o.fidelity import BASELINE_REPRODUCTION_REGISTRY
 from robust_o2o.final_gate import AUDIT_RECEIPT_SHA256_ENV, RECEIPT_SCHEMA
 from robust_o2o.logging_utils import METRIC_FIELDS, RunLogger
 from robust_o2o.manifest import (
@@ -35,6 +37,20 @@ def _resolved_config(config: ExperimentConfig) -> dict:
         normalizer_sha256="normalizer",
     )
     return resolved
+
+
+def _verified_rpex_registry():
+    """Install a test-only verified record to reach resume-specific gates."""
+
+    verified = replace(
+        BASELINE_REPRODUCTION_REGISTRY["rpex"],
+        implementation_type="pinned upstream subprocess adapter",
+        reproduction_status="official_adapter_verified",
+        parity_status="official_adapter_verified",
+        strict_final_eligible=True,
+        remaining_deviation="none in synthetic strict-resume fixture",
+    )
+    return patch.dict(BASELINE_REPRODUCTION_REGISTRY, {"rpex": verified})
 
 
 def _receipt(context_token: str, context: dict, origin_pid: int = 123) -> dict:
@@ -251,7 +267,6 @@ class ResumeIdentityTest(unittest.TestCase):
             with (
                 patch.object(cli, "build_parser", return_value=parser),
                 patch.object(cli, "config_from_args", return_value=resumed),
-                patch.object(cli, "require_final_benchmark_audit", return_value=None),
                 patch.object(
                     cli,
                     "run_experiment",
@@ -264,36 +279,38 @@ class ResumeIdentityTest(unittest.TestCase):
 
     def test_new_direct_final_run_is_rejected_before_output_creation(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = ExperimentConfig(
-                "rpex",
-                "hopper-medium-replay-v2",
-                corruption="random",
-                corruption_target="observations",
-                suite_profile="primary_research_benchmark",
-                run_purpose="final_benchmark",
-                benchmark_seed_set=STRICT_FINAL_SEEDS,
-                output_dir=directory,
-                comparison_name="must_not_exist",
-            )
-            context = {"git_head": "abc", "python_executable": "/python"}
-            receipt = _receipt("stable-context", context, origin_pid=os.getpid())
-            receipt_digest = _receipt_content_sha256(receipt)
-            cli = importlib.import_module("run_experiment")
-            parser = Mock()
-            parser.parse_args.return_value = Mock()
-            with (
-                patch.object(cli, "build_parser", return_value=parser),
-                patch.object(cli, "config_from_args", return_value=config),
-                patch.object(
-                    cli, "require_final_benchmark_audit", return_value=receipt
-                ),
-                patch.dict(
-                    os.environ,
-                    {AUDIT_RECEIPT_SHA256_ENV: receipt_digest},
-                    clear=False,
-                ),
-            ):
-                self.assertEqual(cli.main(), 1)
+            with _verified_rpex_registry():
+                config = ExperimentConfig(
+                    "rpex",
+                    "hopper-medium-replay-v2",
+                    corruption="random",
+                    corruption_target="observations",
+                    suite_profile="primary_research_benchmark",
+                    run_purpose="final_benchmark",
+                    benchmark_seed_set=STRICT_FINAL_SEEDS,
+                    output_dir=directory,
+                    comparison_name="must_not_exist",
+                )
+                context = {"git_head": "abc", "python_executable": "/python"}
+                receipt = _receipt("stable-context", context, origin_pid=os.getpid())
+                receipt_digest = _receipt_content_sha256(receipt)
+                cli = importlib.import_module("run_experiment")
+                parser = Mock()
+                parser.parse_args.return_value = Mock()
+                with (
+                    patch.object(cli, "build_parser", return_value=parser),
+                    patch.object(cli, "config_from_args", return_value=config),
+                    patch(
+                        "robust_o2o.final_gate.require_final_benchmark_audit",
+                        return_value=receipt,
+                    ),
+                    patch.dict(
+                        os.environ,
+                        {AUDIT_RECEIPT_SHA256_ENV: receipt_digest},
+                        clear=False,
+                    ),
+                ):
+                    self.assertEqual(cli.main(), 1)
 
             self.assertEqual(list(Path(directory).iterdir()), [])
 
@@ -307,19 +324,33 @@ class ResumeIdentityTest(unittest.TestCase):
         )
         launch_receipt = _receipt(context_token, context)
         receipt_digest = _receipt_content_sha256(launch_receipt)
-        config = ExperimentConfig(
-            "rpex",
-            "hopper-medium-replay-v2",
-            corruption="random",
-            corruption_target="observations",
-            suite_profile="primary_research_benchmark",
-            run_purpose="final_benchmark",
-            benchmark_seed_set=STRICT_FINAL_SEEDS,
-        )
-        config._controller_seed_cohort_attested = True
-        config._final_audit_context_token = context_token
-        config._final_audit_receipt_sha256 = receipt_digest
-        manifest = build_experiment_manifest(_resolved_config(config))
+        with _verified_rpex_registry():
+            config = ExperimentConfig(
+                "rpex",
+                "hopper-medium-replay-v2",
+                corruption="random",
+                corruption_target="observations",
+                suite_profile="primary_research_benchmark",
+                run_purpose="final_benchmark",
+                benchmark_seed_set=STRICT_FINAL_SEEDS,
+            )
+            config._controller_seed_cohort_attested = True
+            config._final_audit_context_token = context_token
+            config._final_audit_receipt_sha256 = receipt_digest
+            resolved = _resolved_config(config)
+            resolved.update(
+                condition_certificate_verified=True,
+                strict_runtime_fixture_verified=True,
+                strict_environment_preflight_verified=True,
+                save_resume_certificate_verified=True,
+                audit_receipt_verified=True,
+                repository_worktree_clean=True,
+                dataset_hash_recorded=True,
+                required_checkpoint_hashes_verified=True,
+                paper_reproduction_eligible=True,
+                publication_eligible=True,
+            )
+            manifest = build_experiment_manifest(resolved)
         (run_dir / "experiment_manifest.json").write_text(
             json.dumps(manifest), encoding="utf-8"
         )
@@ -339,16 +370,17 @@ class ResumeIdentityTest(unittest.TestCase):
             run_dir, _ = self._write_attested_final_run(
                 Path(directory), context_token="stable-context", context=context
             )
-            resumed = ExperimentConfig(
-                "rpex",
-                "hopper-medium-replay-v2",
-                corruption="random",
-                corruption_target="observations",
-                suite_profile="primary_research_benchmark",
-                run_purpose="final_benchmark",
-                benchmark_seed_set=STRICT_FINAL_SEEDS,
-                resume_run=str(run_dir),
-            )
+            with _verified_rpex_registry():
+                resumed = ExperimentConfig(
+                    "rpex",
+                    "hopper-medium-replay-v2",
+                    corruption="random",
+                    corruption_target="observations",
+                    suite_profile="primary_research_benchmark",
+                    run_purpose="final_benchmark",
+                    benchmark_seed_set=STRICT_FINAL_SEEDS,
+                    resume_run=str(run_dir),
+                )
             resumed._controller_seed_cohort_attested = False
             resumed._final_audit_context_token = "stable-context"
             fresh = _receipt("stable-context", context, origin_pid=999)
@@ -371,16 +403,17 @@ class ResumeIdentityTest(unittest.TestCase):
             run_dir, _ = self._write_attested_final_run(
                 Path(directory), context_token="stable-context", context=context
             )
-            resumed = ExperimentConfig(
-                "rpex",
-                "hopper-medium-replay-v2",
-                corruption="random",
-                corruption_target="observations",
-                suite_profile="primary_research_benchmark",
-                run_purpose="final_benchmark",
-                benchmark_seed_set=STRICT_FINAL_SEEDS,
-                resume_run=str(run_dir),
-            )
+            with _verified_rpex_registry():
+                resumed = ExperimentConfig(
+                    "rpex",
+                    "hopper-medium-replay-v2",
+                    corruption="random",
+                    corruption_target="observations",
+                    suite_profile="primary_research_benchmark",
+                    run_purpose="final_benchmark",
+                    benchmark_seed_set=STRICT_FINAL_SEEDS,
+                    resume_run=str(run_dir),
+                )
             before = _tree_bytes(run_dir)
             changed_receipt = _receipt(
                 "different-context",

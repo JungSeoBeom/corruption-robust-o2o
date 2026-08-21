@@ -6,6 +6,7 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 
+from .dataset import assert_no_corruption_labels, learner_dataset_view
 from .environment import Dataset
 
 
@@ -28,7 +29,11 @@ class OfflineDataset:
         seed: int,
         sampling_profile: str = NUMPY_REPLAY_SAMPLING,
     ):
-        self.dataset = dataset
+        # Preprocessing keeps corruption diagnostics next to the artifact, but
+        # the learner receives only ordinary transition fields.  In
+        # particular, Cal-QL cannot use ``mc_calibration_valid`` as an oracle
+        # corruption mask in a benchmark run.
+        self.dataset = learner_dataset_view(dataset)
         self.size = len(dataset["rewards"])
         self.sampling_profile = sampling_profile
         if sampling_profile not in (
@@ -72,6 +77,7 @@ class OfflineDataset:
         result = _tensor_batch(self.dataset, indices, device)
         result["_indices"] = torch.as_tensor(indices, dtype=torch.long, device=device)
         result["_source"] = torch.zeros(batch_size, dtype=torch.long, device=device)
+        assert_no_corruption_labels(result)
         return result
 
     def update_priorities(self, indices: torch.Tensor, priorities: torch.Tensor) -> None:
@@ -157,11 +163,17 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.capacity)
 
     def sample(
-        self, batch_size: int, device: torch.device, prioritized: bool = False
+        self,
+        batch_size: int,
+        device: torch.device,
+        prioritized: bool = False,
+        replace: bool = False,
     ) -> TensorBatch:
         if batch_size <= 0:
             return {}
-        if self.size < batch_size:
+        if self.size <= 0:
+            raise ValueError("Replay contains no samples")
+        if not replace and self.size < batch_size:
             raise ValueError(f"Replay contains {self.size} samples, need {batch_size}")
         probabilities = None
         if prioritized:
@@ -171,13 +183,17 @@ class ReplayBuffer:
                 raise ValueError(
                     "official RPEX online replay sampling does not support priorities"
                 )
+            if replace:
+                raise ValueError(
+                    "official RPEX replay sampling is without replacement"
+                )
             # ReplayMemory.sample uses random.sample(self.buffer, batch_size).
             indices = np.asarray(
                 random.sample(range(self.size), batch_size), dtype=np.int64
             )
         else:
             indices = self.rng.choice(
-                self.size, size=batch_size, replace=False, p=probabilities
+                self.size, size=batch_size, replace=replace, p=probabilities
             )
         batch = {
             "observations": self.states[indices],
@@ -190,6 +206,7 @@ class ReplayBuffer:
         result = _tensor_batch(batch, np.arange(batch_size), device)
         result["_indices"] = torch.as_tensor(indices, dtype=torch.long, device=device)
         result["_source"] = torch.ones(batch_size, dtype=torch.long, device=device)
+        assert_no_corruption_labels(result)
         return result
 
     def update_priorities(self, indices: torch.Tensor, priorities: torch.Tensor) -> None:
@@ -301,17 +318,25 @@ def mixed_batch(
     device: torch.device,
     prioritized_online: bool = False,
     prioritized_offline: bool = False,
+    online_replace: bool = False,
 ) -> TensorBatch:
     offline_count = int(round(batch_size * offline_ratio))
     online_count = batch_size - offline_count
-    if online.size < online_count:
+    if online_count > 0 and online.size <= 0:
+        raise ValueError("Online replay contains no transitions")
+    if not online_replace and online.size < online_count:
         raise ValueError(
             f"Online replay has {online.size} transitions; {online_count} are required"
         )
     offline_batch = offline.sample(
         offline_count, device, prioritized=prioritized_offline
     )
-    online_batch = online.sample(online_count, device, prioritized=prioritized_online)
+    online_batch = online.sample(
+        online_count,
+        device,
+        prioritized=prioritized_online,
+        replace=online_replace,
+    )
     return concatenate_batches(offline_batch, online_batch)
 
 

@@ -136,6 +136,7 @@ class RunLogger:
         )
         self.run_dir = (
             runs_dir
+            / config.run_purpose
             / config.algorithm
             / config.suite_profile
             / config.implementation_profile

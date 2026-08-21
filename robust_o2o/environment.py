@@ -82,6 +82,54 @@ def runtime_package_versions() -> Dict[str, str]:
     return versions
 
 
+def repository_state_metadata() -> Dict[str, Any]:
+    """Return lightweight run provenance without invoking strict audit code.
+
+    Research runs only need the current commit, whether the tree is dirty, and
+    a stable digest that distinguishes two dirty trees.  The publication-only
+    certificate/audit machinery deliberately stays out of this execution path.
+    """
+
+    repository_root = Path(__file__).resolve().parents[1]
+
+    def git(*arguments: str) -> bytes:
+        completed = subprocess.run(
+            ("git", *arguments),
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+        )
+        return completed.stdout
+
+    commit = git("rev-parse", "HEAD").decode("ascii").strip()
+    status = git(
+        "status", "--porcelain=v1", "--untracked-files=all", "-z"
+    )
+    diff = git("diff", "--binary", "HEAD", "--", ".")
+    digest = hashlib.sha256()
+    digest.update(status)
+    digest.update(diff)
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z")
+    for raw_name in untracked.split(b"\0"):
+        if not raw_name:
+            continue
+        relative = raw_name.decode("utf-8", errors="surrogateescape")
+        path = repository_root / relative
+        digest.update(raw_name)
+        if path.is_symlink():
+            digest.update(path.readlink().as_posix().encode("utf-8"))
+        elif path.is_file():
+            digest.update(path.read_bytes())
+        else:
+            digest.update(b"missing-or-special")
+    return {
+        "git_commit": commit,
+        "repository_commit": commit,
+        "repository_dirty": bool(status),
+        "repository_worktree_sha256": digest.hexdigest(),
+    }
+
+
 def installed_d4rl_commit() -> str | None:
     """Read the immutable VCS commit recorded by pip's direct_url metadata."""
     try:
@@ -683,48 +731,15 @@ def environment_metadata(
             "mujoco_runtime_error": None,
         }
     )
-    repository_worktree_sha256 = None
     try:
-        repository_root = Path(__file__).resolve().parents[1]
-        git_commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repository_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        git_dirty = bool(
-            subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=repository_root,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-        )
-        from .final_gate import audit_context
-
-        repository_context = audit_context()
-        worktree_payload = {
-            key: repository_context[key]
-            for key in (
-                "git_head",
-                "git_status_sha256",
-                "git_worktree_diff_sha256",
-                "git_untracked_content_sha256",
-            )
-        }
-        repository_worktree_sha256 = hashlib.sha256(
-            json.dumps(
-                worktree_payload,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        repository_metadata = repository_state_metadata()
     except (OSError, RuntimeError, subprocess.SubprocessError):
-        git_commit = "unknown"
-        git_dirty = None
-        repository_worktree_sha256 = None
+        repository_metadata = {
+            "git_commit": "unknown",
+            "repository_commit": "unknown",
+            "repository_dirty": None,
+            "repository_worktree_sha256": None,
+        }
     action_space = env.action_space
     action_low = np.asarray(
         getattr(action_space, "low", np.full(action_space.shape, np.nan)),
@@ -757,10 +772,7 @@ def environment_metadata(
         ),
         **mujoco_identity,
         "d4rl_version_or_commit": installed_commit or versions["d4rl"],
-        "git_commit": git_commit,
-        "repository_commit": git_commit,
-        "repository_dirty": git_dirty,
-        "repository_worktree_sha256": repository_worktree_sha256,
+        **repository_metadata,
         "benchmark_comparable": protocol == LEGACY_PROTOCOL,
         "diagnostic_reason": (
             None

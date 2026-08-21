@@ -170,6 +170,10 @@ def _load_runs(root: Path):
                 )
             immutable_fields = (
                 "algorithm",
+                "implementation_type",
+                "benchmark_role",
+                "main_table_eligible",
+                "uses_corruption_labels",
                 "dataset_id",
                 "environment_protocol",
                 "corruption",
@@ -188,6 +192,9 @@ def _load_runs(root: Path):
                 "suite_profile",
                 "run_purpose",
                 "condition_status",
+                "corruption_application_contract",
+                "environment_interaction_corrupted",
+                "evaluation_corruption",
                 "reporting_rule",
                 "reporting_rule_verified",
                 "publication_eligible",
@@ -202,6 +209,7 @@ def _load_runs(root: Path):
                 "final_audit_context_token",
                 "corruption_rate",
                 "corruption_range",
+                "final_window_size",
             )
             changed_launch_fields = {
                 key: {
@@ -294,7 +302,20 @@ def _load_runs(root: Path):
             # A training process may be appending a row while plots refresh.
             continue
         if frame.empty:
-            continue
+            # Failed runs can legitimately have only the CSV header.  Preserve
+            # a status-only row so reporting records the failed/partial seed
+            # instead of silently deleting it from the experiment cohort.
+            frame = pd.DataFrame(
+                [
+                    {
+                        "phase": "status_only",
+                        "step": 0,
+                        "env_steps": 0,
+                        "normalized_return_mean": float("nan"),
+                        "normalized_return_std": float("nan"),
+                    }
+                ]
+            )
         frame["algorithm"] = manifest.get("algorithm", config.get("algorithm"))
         frame["env_name"] = manifest.get("dataset_id", config.get("env_name"))
         frame["corruption"] = manifest.get(
@@ -315,11 +336,33 @@ def _load_runs(root: Path):
         frame["implementation_fidelity"] = manifest.get(
             "implementation_fidelity", "legacy_unknown"
         )
+        frame["implementation_type"] = manifest.get(
+            "implementation_type",
+            manifest.get("implementation_fidelity", "legacy_unknown"),
+        )
+        frame["benchmark_role"] = manifest.get(
+            "benchmark_role", "diagnostic"
+        )
+        frame["main_table_eligible"] = bool(
+            manifest.get("main_table_eligible", False)
+        )
+        frame["uses_corruption_labels"] = bool(
+            manifest.get("uses_corruption_labels", False)
+        )
         frame["upstream_commit"] = manifest.get(
             "upstream_commit", "unknown"
         )
         frame["reporting_rule"] = manifest.get(
             "reporting_rule", "unknown"
+        )
+        frame["learner_parity_verified"] = bool(
+            manifest.get("learner_parity_verified", False)
+        )
+        frame["reporting_rule_verified"] = bool(
+            manifest.get("reporting_rule_verified", False)
+        )
+        frame["condition_certificate_verified"] = bool(
+            manifest.get("condition_certificate_verified", False)
         )
         frame["publication_eligible"] = bool(
             manifest.get("publication_eligible", False)
@@ -333,6 +376,15 @@ def _load_runs(root: Path):
         frame["suite_profile"] = manifest.get("suite_profile", "legacy_current")
         frame["run_purpose"] = manifest.get("run_purpose", "legacy_unknown")
         frame["attack_timing"] = manifest.get("attack_timing", "legacy_unknown")
+        frame["corruption_application_contract"] = manifest.get(
+            "corruption_application_contract", "legacy_unknown"
+        )
+        frame["environment_interaction_corrupted"] = bool(
+            manifest.get("environment_interaction_corrupted", False)
+        )
+        frame["evaluation_corruption"] = manifest.get(
+            "evaluation_corruption", "legacy_unknown"
+        )
         frame["adversarial_attack_profile"] = manifest.get(
             "adversarial_attack_profile",
             manifest.get("attack_implementation", "legacy_unknown"),
@@ -370,6 +422,11 @@ def _load_runs(root: Path):
                 "online", config.get("online_corruption_rate", -1.0)
             )
         )
+        frame["corruption_range"] = float(
+            manifest.get(
+                "corruption_range", config.get("corruption_range", -1.0)
+            )
+        )
         frame["learner_seed"] = int(
             manifest.get(
                 "learner_seed", config.get("learner_seed", config["seed"])
@@ -382,6 +439,7 @@ def _load_runs(root: Path):
         )
         frame["run_dir"] = str(metrics_path.parent)
         frame["run_status"] = summary.get("status", "unknown")
+        frame["error_message"] = str(summary.get("error") or "")
         elapsed = summary.get("elapsed_seconds")
         frame["run_elapsed_seconds"] = (
             float(elapsed) if elapsed is not None else float("nan")
@@ -432,6 +490,37 @@ def _load_runs(root: Path):
         )
         frame["eval_period"] = int(
             manifest.get("evaluation_interval", config.get("eval_period", 0))
+        )
+        frame["final_window_size"] = int(
+            manifest.get(
+                "final_window_size", config.get("final_window_size", 3)
+            )
+        )
+        frame["critic_gradient_updates"] = completion_manifest.get(
+            "critic_gradient_updates",
+            completion_manifest.get("wsrl_online_critic_updates"),
+        ) if completion_manifest is not None else manifest.get(
+            "critic_gradient_updates"
+        )
+        frame["actor_gradient_updates"] = completion_manifest.get(
+            "actor_gradient_updates",
+            completion_manifest.get("wsrl_online_actor_updates"),
+        ) if completion_manifest is not None else manifest.get(
+            "actor_gradient_updates"
+        )
+        frame["temperature_updates"] = completion_manifest.get(
+            "temperature_updates",
+            completion_manifest.get("wsrl_online_temperature_updates"),
+        ) if completion_manifest is not None else manifest.get(
+            "temperature_updates"
+        )
+        frame["configured_utd"] = manifest.get(
+            "configured_utd", manifest.get("utd_ratio")
+        )
+        frame["actual_utd"] = (
+            completion_manifest.get("actual_utd")
+            if completion_manifest is not None
+            else manifest.get("actual_utd")
         )
         frame["online_budget_semantics"] = (
             completion_manifest.get("online_budget_semantics")
@@ -502,10 +591,10 @@ def write_final_score_summary(
         frame = frame[frame["corruption"] == corruption]
     if target:
         frame = frame[frame["corruption_target"] == target]
-    frame = frame[frame["run_status"] == "completed"]
     if frame.empty:
-        raise RuntimeError("No completed runs match the requested summary filters")
-    _validate_aggregation_signatures(frame, "final-score groups")
+        raise RuntimeError("No runs match the requested summary filters")
+    completed = frame[frame["run_status"] == "completed"]
+    _validate_aggregation_signatures(completed, "final-score groups")
 
     common_rule = common_reporting_rule(phase)
     rules = {

@@ -13,7 +13,6 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import subprocess
 import sys
 import types
 from pathlib import Path
@@ -21,12 +20,22 @@ from pathlib import Path
 import numpy as np
 import torch
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from rpex_fixture_provenance import (  # noqa: E402
+    numpy_rng_state_hash,
+    platform_metadata,
+    require_pinned_clean_upstream,
+    require_strict_runtime,
+    sha256_file,
+    torch_rng_state_hash,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-PINNED_COMMIT = "35da71ee5151b6179d21b9a2b4ce1b6408aedd04"
-
 
 def sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
@@ -143,9 +152,12 @@ def traced_online(attack, original, std, observation, action):
     original_tensor = torch.from_numpy(original).view(1, -1)
     std_tensor = torch.from_numpy(std).view(1, -1)
     action_tensor = torch.from_numpy(action).view(1, -1)
+    online_generator = torch.Generator()
+    rng_before = torch_rng_state_hash(online_generator)
     para = 2.0 * std_tensor * (
-        torch.rand(original_tensor.shape, generator=torch.Generator()) - 0.5
+        torch.rand(original_tensor.shape, generator=online_generator) - 0.5
     )
+    rng_after = torch_rng_state_hash(online_generator)
     initial = para.detach().cpu().numpy()
     initial_effective = (para * std_tensor).detach().cpu().numpy()
     first_post = None
@@ -176,6 +188,8 @@ def traced_online(attack, original, std, observation, action):
         "last_objective": last_post,
         "final_noise": final_noise.cpu().numpy(),
         "attacked": attacked.cpu().numpy(),
+        "torch_generator_state_before_sha256": rng_before,
+        "torch_generator_state_after_sha256": rng_after,
     }
 
 
@@ -183,32 +197,45 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--upstream-dir", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--diagnostic-allow-runtime-mismatch",
+        action="store_true",
+        help=(
+            "allow unsupported host versions for diagnostic output only; "
+            "this generator never emits an end-to-end certificate"
+        ),
+    )
     args = parser.parse_args()
     upstream = args.upstream_dir.expanduser().resolve()
     checkpoint = args.checkpoint.expanduser().resolve()
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=upstream,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if commit != PINNED_COMMIT:
-        raise RuntimeError(f"upstream commit {commit} != pinned {PINNED_COMMIT}")
+    runtime = require_strict_runtime(
+        allow_diagnostic_mismatch=args.diagnostic_allow_runtime_mismatch
+    )
+    upstream_provenance = require_pinned_clean_upstream(upstream)
+    commit = str(upstream_provenance["commit"])
+    if not checkpoint.is_file():
+        raise RuntimeError(f"checkpoint does not exist: {checkpoint}")
     module, source, oracle_module, oracle_source = load_upstream(upstream)
     torch.set_num_threads(1)
+    process_torch_rng_before = torch_rng_state_hash()
     seed = 7
     all_observations, all_actions = synthetic_inputs()
     rng = np.random.RandomState(seed)
+    selection_rng_before = numpy_rng_state_hash(rng.get_state())
     indices = np.flatnonzero(rng.random(len(all_observations)) < 0.3)
+    selection_rng_after = numpy_rng_state_hash(rng.get_state())
     observations = torch.from_numpy(all_observations[indices].copy())
     actions = torch.from_numpy(all_actions[indices].copy())
     std = torch.from_numpy(all_observations.std(axis=0)).view(1, -1)
 
     official_attack = make_attack(module, oracle_module, checkpoint, seed)
+    official_rng_before = torch_rng_state_hash(official_attack._th_rng)
     official = official_attack.split_gradient_attack(observations, actions, std)
+    official_rng_after = torch_rng_state_hash(official_attack._th_rng)
     traced_attack = make_attack(module, oracle_module, checkpoint, seed)
+    traced_rng_before = torch_rng_state_hash(traced_attack._th_rng)
     trace = traced_split(traced_attack, observations, actions, std)
+    traced_rng_after = torch_rng_state_hash(traced_attack._th_rng)
     if not np.array_equal(official.astype(np.float32), trace["attacked"].astype(np.float32)):
         raise RuntimeError("instrumented trajectory differs from upstream final output")
 
@@ -240,17 +267,32 @@ def main() -> int:
     ):
         raise RuntimeError("instrumented online trajectory differs from upstream output")
 
+    generator_path = Path(__file__).resolve()
+    helper_path = generator_path.with_name("rpex_fixture_provenance.py")
     payload = {
-        "fixture_schema_version": 1,
-        "fixture_id": "rpex_adversarial_core_v1",
-        "scope": "public attack optimizer core; not the broken end-to-end wrapper",
+        "fixture_schema_version": 2,
+        "fixture_id": "rpex_adversarial_optimizer_core_diagnostic_v2",
+        "scope": (
+            "diagnostic public optimizer core only; not the broken end-to-end "
+            "wrapper and never an end-to-end adversarial certificate"
+        ),
+        "strict_or_publication_eligible": False,
+        "end_to_end_verified": False,
+        "strict_runtime_preflight_passed": bool(runtime["passed"]),
+        "runtime_preflight": runtime,
+        "generator_sha256": sha256_file(generator_path),
+        "provenance_helper_sha256": sha256_file(helper_path),
         "upstream_repository": "https://github.com/felix-thu/RPEX",
         "upstream_commit": commit,
+        "upstream_checkout_clean": upstream_provenance["clean"],
+        "upstream_status_sha256": upstream_provenance["status_sha256"],
         "upstream_source_sha256": sha(source.read_bytes()),
         "oracle_source_sha256": sha(oracle_source.read_bytes()),
-        "python_version": sys.version.split()[0],
-        "numpy_version": np.__version__,
-        "pytorch_version": torch.__version__,
+        "upstream_source_hashes": {
+            "attack.py": sha256_file(source),
+            "EDAC.py": sha256_file(oracle_source),
+        },
+        "platform": platform_metadata(execution_device="cpu"),
         "device": "cpu",
         "dtype": "float32",
         "synthetic_input_hash_scheme": (
@@ -260,7 +302,16 @@ def main() -> int:
             np.ascontiguousarray(all_observations).tobytes()
             + np.ascontiguousarray(all_actions).tobytes()
         ),
+        "input_hashes": {
+            "synthetic_observations_and_actions": sha(
+                np.ascontiguousarray(all_observations).tobytes()
+                + np.ascontiguousarray(all_actions).tobytes()
+            )
+        },
         "checkpoint_sha256": sha(checkpoint.read_bytes()),
+        "checkpoint_hashes": {
+            "edac_oracle_checkpoint": sha(checkpoint.read_bytes())
+        },
         "seed": seed,
         "corruption_rate": 0.3,
         "epsilon": 1.0,
@@ -268,6 +319,12 @@ def main() -> int:
             "target": "observations",
             "selected_indices": indices.tolist(),
             "selected_indices_hash": sha(indices.astype(np.int64).tobytes()),
+            "selection_numpy_rng_state_before_sha256": selection_rng_before,
+            "selection_numpy_rng_state_after_sha256": selection_rng_after,
+            "official_torch_generator_state_before_sha256": official_rng_before,
+            "official_torch_generator_state_after_sha256": official_rng_after,
+            "traced_torch_generator_state_before_sha256": traced_rng_before,
+            "traced_torch_generator_state_after_sha256": traced_rng_after,
             "split_sizes": [len(indices) // 10] * 9
             + [len(indices) - 9 * (len(indices) // 10)],
             "initial_parameter_hash": sha(
@@ -306,6 +363,16 @@ def main() -> int:
             ),
             "attacked_input": online.reshape(-1).tolist(),
             "attacked_input_hash": sha(np.ascontiguousarray(online).tobytes()),
+            "traced_torch_generator_state_before_sha256": online_trace[
+                "torch_generator_state_before_sha256"
+            ],
+            "traced_torch_generator_state_after_sha256": online_trace[
+                "torch_generator_state_after_sha256"
+            ],
+        },
+        "process_rng_state_hashes": {
+            "torch_cpu_before_sha256": process_torch_rng_before,
+            "torch_cpu_after_sha256": torch_rng_state_hash(),
         },
         "known_upstream_wrapper_blockers": [
             "offline adversarial branches return undefined std",
@@ -313,6 +380,11 @@ def main() -> int:
             "offline dynamics passes Actor tuple directly to critic",
         ],
     }
+    if not runtime["passed"]:
+        payload["diagnostic_only_reason"] = (
+            "unsupported runtime override was used; optimizer-core output "
+            "cannot satisfy strict or publication eligibility"
+        )
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 

@@ -8,27 +8,33 @@ and `BASELINE_REPRODUCTION_REGISTRY`. No long reinforcement-learning run was
 performed. The machine used for the checks was macOS, so strict D4RL-v2 runtime
 success is intentionally not claimed.
 
-Current conservative decision: the complete five-baseline final benchmark is
-**NOT READY**. The only strict-eligible candidate subset is RPEX and
-RIQL-naive, both handwritten `source_aligned_port`s. That subset is also
-currently **NOT READY** because save/resume equivalence has not been exercised
-for every eligible baseline × certified condition, the complete fresh-process
-online-constructor RNG trajectory is not reproduced, and the upstream
-evaluation environment/RNG schedule is not matched. The fixtures were also
-generated under NumPy/PyTorch versions different from the pinned strict
-runtime. After those blockers are resolved, the exact `0,1,2,3,4` seed set,
-official `2,000,001` offline /
-`1,000,001` requested online budget, supported Linux x86_64 runtime, and
-successful executable audit gate are still required. The current Mac must be
-used for diagnostics only, not a final launch.
+Current conservative decision: **FINAL BENCHMARK NOT READY; strict-final
+algorithm set empty**. RPEX and RIQL-naive remain handwritten
+`source_aligned_port`s with `fixed_batch_partial` evidence, not verified
+upstream adapters or end-to-end learner ports. WSRL is an unverified framework
+port and its reporting rule is `verified=false`; Cal-QL locomotion is a task
+port; PQE is an approximation. The random and adversarial v1 fixtures are
+diagnostic/runtime-mismatched, and the latter covers only the Hopper
+observation optimizer core. Required learner, online-constructor/evaluation
+RNG, strict condition, full save/resume, reporting, and Linux receipts are
+missing. The current Mac is diagnostic-only. No final-run command is authorized.
+
+Condition scope is also fail-closed: diagnostic random is clean plus four
+random targets, while strict random contains only the four actual corruption
+targets. Clean is a benchmark transfer, never automatically certified. Strict
+adversarial contains no condition because an optimizer-core fixture cannot
+certify an end-to-end wrapper. A future eligibility decision must validate
+external receipts bound to the exact clean repository state, upstream commits,
+fixture/dataset/checkpoint hashes, runtime/platform, command, return code, and
+timestamp; a boolean or successful local test is insufficient.
 
 ## A. Baseline fidelity matrix
 
 | Baseline | Upstream commit | Current conservative status | Parity status | Strict locomotion status |
 |---|---|---|---|---|
-| RPEX / RIQL-naive | `felix-thu/RPEX@35da71ee5151b6179d21b9a2b4ce1b6408aedd04` | `source_aligned_port` | Partial formula, random fixtures, and adversarial observation-target optimizer-core fixture only; no complete learner optimizer parity | Conditional candidate; full save/resume coverage, Linux audit, and all runtime, fixture, official-budget, exact-seed, and reporting gates must pass |
+| RPEX / RIQL-naive | `felix-thu/RPEX@35da71ee5151b6179d21b9a2b4ce1b6408aedd04` | `source_aligned_port` | `fixed_batch_partial`; no upstream-executed complete learner/optimizer parity | Excluded; `strict_final_eligible=false` |
 | RPEX paper interpretation | Same source plus paper semantics | `paper_code_conflict` sensitivity profile | No complete learner optimizer parity | Not the default final profile |
-| WSRL locomotion | `zhouzypaul/wsrl@ad4dc1248a138bc15d6e053f2d1dba1b8cfbaca2` | `framework_port_unverified` | Fixed-batch JAX/PyTorch parity missing | Excluded |
+| WSRL locomotion | `zhouzypaul/wsrl@ad4dc1248a138bc15d6e053f2d1dba1b8cfbaca2` | `framework_port_unverified` | Fixed-batch JAX/PyTorch and source-backed reporting parity missing | Excluded |
 | Cal-QL locomotion | `nakamotoo/Cal-QL@ac6eafec22e8d60836573e1f488c7f626ce8a77e` | `task_port` | Official public recipes are AntMaze/Adroit, not D4RL locomotion | Excluded; diagnostic only |
 | Pessimistic Q-Ensemble | `shlee94/Off2OnRL@6f298fa9ef040d725067d0f2775022bd2900d635` | `approximation` | Five independent checkpoint-loaded actors/twin critics are not implemented | Excluded; diagnostic only |
 
@@ -105,10 +111,10 @@ until a citable source supplies the missing definition.
 - Adversarial initialization uses the source-matched CPU Torch generator. The
   Adam optimizer core follows the pinned step schedules—offline `100 × 0.01`
   and online `2 × 0.1`—plus the public-code scaling and objective. The pinned
-  wrapper contains execution defects, so the fixture establishes optimizer-core
-  coverage for the **Hopper observation target only**, not HalfCheetah,
-  Walker2d, actions, rewards, dynamics, the whole wrapper, or learner
-  equivalence. All uncertified task/target cells are diagnostic-only.
+  wrapper contains execution defects, so the v1 fixture checks only the
+  **Hopper observation-target optimizer core**, not HalfCheetah, Walker2d,
+  actions, rewards, dynamics, the whole wrapper, or learner equivalence. Its
+  runtime also differs from the strict pins; it certifies no strict condition.
   Experimental sign-PGD has a different manifest and cache identity.
 - Cache identity includes source commit, dataset/normalizer/attacker hashes,
   attack implementation/objective/optimizer/device/timing, both attack
@@ -163,10 +169,10 @@ until a citable source supplies the missing definition.
 The serialization and deterministic-update tests above do not establish full
 benchmark coverage. The end-to-end preflight has exercised only RIQL-naive plus
 random observation corruption under the diagnostic smoke configuration. It has
-not demonstrated interrupted/resumed equivalence for both eligible learners
-across every clean, random, and certified adversarial condition. Full
-per-baseline/per-condition save/resume coverage remains a blocking strict gate,
-so the candidate eligible subset is currently `NOT READY`.
+not produced a source-bound receipt for complete online-checkpoint state or a
+full baseline × certified-condition matrix. The strict algorithm set is empty,
+and no adversarial condition is certified. Serialization tests and this smoke
+must not be promoted into a save/resume certificate.
 
 ## G. Historical bounded test snapshot
 
@@ -195,11 +201,9 @@ not be quoted as the current suite result.
 ## H. Superseded command examples
 
 These examples document the earlier interface. They are not authorization for
-a final run. On the current Mac, do not launch `final_benchmark`. On the target
-Linux x86_64 host, use the current README and run
-`python scripts/audit_reproducibility.py` first. A nonzero result blocks the
-strict eligible subset; the audit's separate five-baseline status remains
-`NOT READY` until WSRL, Cal-QL locomotion, and PQE blockers are resolved.
+a final run. Every command below is diagnostic/historical. The current strict
+algorithm set is empty on every platform; neither a Linux environment smoke nor
+an audit invocation turns these examples into final-run authorization.
 
 RPEX source-aligned public-code profile, five seeds, random observations:
 
@@ -231,13 +235,13 @@ python run_experiment.py --algorithm wsrl \
   --implementation-profile official_code_reference --seed 0
 ```
 
-Cal-QL locomotion port:
+Optional Cal-QL locomotion adaptation:
 
 ```bash
-python run_experiment.py --algorithm cal_ql \
+python run_experiment.py --algorithm cal_ql_locomotion_adaptation \
   --env-name hopper-medium-replay-v2 --corruption clean --stage both \
-  --suite-profile common_budget_robustness \
-  --implementation-profile locomotion_port --seed 0
+  --run-purpose research_benchmark --suite-profile research_benchmark \
+  --implementation-profile research_benchmark --seed 0
 ```
 
 An upstream-equivalent Off2OnRL/PQE implementation is unavailable. This command
@@ -251,12 +255,13 @@ python run_experiment.py --algorithm pessimistic_q_ensemble \
   --implementation-profile official_code_reference
 ```
 
-Common-budget 5×5:
+Custom-budget main 3×5 (clean plus four random targets):
 
 ```bash
 python run_55_experiment.py \
   --env-name hopper-medium-replay-v2 \
-  --suite-profile common_budget_robustness --seeds 0
+  --run-purpose research_benchmark --suite-profile research_benchmark \
+  --algorithms rpex,riql_naive,wsrl --seeds 0
 ```
 
 Paired adversarial RNG run (repeat for each intended learner seed):
@@ -307,14 +312,12 @@ python run_experiment.py --algorithm riql_naive \
   rules, selection hash, and value hash are persisted and aggregation-strict.
 - `experimental_sign_pgd` requires both its profile flag and
   `--allow-experimental-adversarial-attack`.
-- `primary_research_benchmark` now consumes the strict registry. It
-  conditionally allowlists only RPEX and RIQL-naive; WSRL is excluded as
-  `framework_port_unverified`, Cal-QL locomotion as `task_port`, and PQE as
-  `approximation`. `common_budget_diagnostic` may retain all five with their
-  non-publication labels. `final_benchmark` requires exactly seeds
-  `0,1,2,3,4`, official budgets `2,000,001/1,000,001`, the executable audit
-  gate, and all other strict gates. `paper_reproduction` remains reserved and
-  rejected because no complete per-paper execution/reporting contract exists.
+- At the time of this superseded snapshot, `primary_research_benchmark`
+  conditionally allowlisted RPEX and RIQL-naive. That conclusion is withdrawn:
+  both are `fixed_batch_partial` source-aligned ports and the current strict
+  registry yields an empty algorithm set. `common_budget_diagnostic` may retain
+  all five with non-publication labels. `paper_reproduction` remains reserved
+  and rejected.
 
 ### Verification classification
 
@@ -338,13 +341,12 @@ The five-algorithm common-budget diagnostic suite may be used for code-path
 checks, but it is not publication-eligible. The complete five-baseline strict
 suite is blocked by missing WSRL fixed-batch parity, unsupported Cal-QL
 locomotion recipes, the shared-actor PQE approximation, and the unexecuted
-strict Linux runtime audit. Full per-baseline/per-condition save/resume coverage
-is also absent. RPEX and RIQL-naive are only conditionally allowlisted
-source-aligned candidates; neither is an exact learner-port claim. Their
-narrower strict suite is currently `NOT READY` because its full save/resume
-matrix is unverified and its online-constructor/evaluation RNG trajectories are
-not source-identical. Its fixture generation runtime also differs from the
-strict pins. It may start only after those gaps are implemented and the audit
-returns `ELIGIBLE-SUBSET BENCHMARK STATUS: READY` on the target Linux host.
+strict Linux runtime receipt. WSRL reporting is also unverified. Full
+per-baseline/per-condition save/resume receipts are absent. RPEX and RIQL-naive
+are source-aligned but not strict-eligible; their end-to-end learner,
+online-constructor/evaluation RNG, and condition receipts are missing, and the
+v1 fixture runtime differs from the strict pins. The strict-final algorithm set
+is empty, so there is no narrower suite to launch and no final command to
+publish.
 `paper_reproduction_summary.csv` accepts only verified rows with
 `paper_reproduction_eligible=true`; current source-aligned rows are excluded.

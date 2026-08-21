@@ -5,6 +5,7 @@ from typing import Mapping
 
 
 IMPLEMENTATION_PROFILES = (
+    "research_benchmark",
     "official_code_reference",
     "paper_reference",
     "common_budget_robustness",
@@ -19,20 +20,62 @@ IMPLEMENTATION_FIDELITIES = (
     "source_aligned_port",
     "framework_port_unverified",
     "framework_port_verified",
+    "end_to_end_verified",
+    "official_adapter_verified",
     "paper_code_conflict",
     "task_port",
     "diagnostic_extension",
     "approximation",
     "legacy_unknown",
 )
+PARITY_STATUSES = (
+    "unverified",
+    "formula_only",
+    "corruption_only",
+    "fixed_batch_partial",
+    "end_to_end_verified",
+    "official_adapter_verified",
+)
+STRICT_ELIGIBLE_PARITY_STATUSES = frozenset(
+    {"end_to_end_verified", "official_adapter_verified"}
+)
+STRICT_ELIGIBLE_REPRODUCTION_STATUSES = frozenset(
+    {
+        "exact_upstream_port",
+        "framework_port_verified",
+        "end_to_end_verified",
+        "official_adapter_verified",
+    }
+)
 SUITE_PROFILES = (
+    "research_benchmark",
     "primary_research_benchmark",
     "common_budget_diagnostic",
     # Backward-compatible names retained for existing commands/results.
     "method_fidelity",
     "common_budget_robustness",
 )
-RUN_PURPOSES = ("smoke", "diagnostic", "paper_reproduction", "final_benchmark")
+RUN_PURPOSES = (
+    "smoke",
+    "diagnostic",
+    "research_benchmark",
+    "paper_reproduction",
+    "final_benchmark",
+)
+
+# The practical custom-budget benchmark deliberately separates methods that
+# can be compared in its main table from task adaptations and approximations.
+# These declarations are the single source of truth used by launchers,
+# manifests, reporting, and the lightweight readiness checker.
+MAIN_BASELINES = ("rpex", "riql_naive", "wsrl")
+OPTIONAL_ADAPTED_BASELINES = ("cal_ql_locomotion_adaptation",)
+OPTIONAL_APPROXIMATION_BASELINES = ("pqe_shared_actor_approx",)
+OPTIONAL_BASELINES = (
+    *OPTIONAL_ADAPTED_BASELINES,
+    *OPTIONAL_APPROXIMATION_BASELINES,
+)
+RESEARCH_BASELINES = (*MAIN_BASELINES, *OPTIONAL_BASELINES)
+BENCHMARK_ROLES = ("main", "optional_adapted", "optional_diagnostic", "diagnostic")
 
 ONLINE_REPLAY_PROFILES = (
     "official_code_online_only",
@@ -89,7 +132,9 @@ UPSTREAM_COMMITS: Mapping[str, str] = {
     "riql_pex": "35da71ee5151b6179d21b9a2b4ce1b6408aedd04",
     "wsrl": "ad4dc1248a138bc15d6e053f2d1dba1b8cfbaca2",
     "cal_ql": "ac6eafec22e8d60836573e1f488c7f626ce8a77e",
+    "cal_ql_locomotion_adaptation": "ac6eafec22e8d60836573e1f488c7f626ce8a77e",
     "pessimistic_q_ensemble": "6f298fa9ef040d725067d0f2775022bd2900d635",
+    "pqe_shared_actor_approx": "6f298fa9ef040d725067d0f2775022bd2900d635",
 }
 
 
@@ -104,6 +149,51 @@ class BaselineReproductionRecord:
     parity_status: str
     strict_final_eligible: bool
     remaining_deviation: str
+    benchmark_role: str = "diagnostic"
+    main_table_eligible: bool = False
+
+    def __post_init__(self) -> None:
+        if self.benchmark_role not in BENCHMARK_ROLES:
+            raise ValueError(
+                f"unknown benchmark_role {self.benchmark_role!r}; "
+                f"choose from {BENCHMARK_ROLES}"
+            )
+        if self.main_table_eligible != (self.benchmark_role == "main"):
+            raise ValueError(
+                "main_table_eligible must be true exactly for benchmark_role='main'"
+            )
+        if self.parity_status not in PARITY_STATUSES:
+            raise ValueError(
+                f"unknown parity_status {self.parity_status!r}; "
+                f"choose from {PARITY_STATUSES}"
+            )
+        if self.strict_final_eligible and not baseline_record_is_strict_eligible(
+            self, require_declaration=False
+        ):
+            raise ValueError(
+                "strict_final_eligible requires end_to_end_verified or "
+                "official_adapter_verified parity and a non-diagnostic, "
+                "non-port reproduction status"
+            )
+
+
+def baseline_record_is_strict_eligible(
+    record: BaselineReproductionRecord,
+    *,
+    require_declaration: bool = True,
+) -> bool:
+    """Return strict eligibility only for an explicitly verified baseline.
+
+    The registry declaration is necessary but never sufficient: handwritten
+    source alignment, framework/task ports, and approximations remain excluded
+    even if their boolean is accidentally changed.
+    """
+
+    return bool(
+        (record.strict_final_eligible or not require_declaration)
+        and record.parity_status in STRICT_ELIGIBLE_PARITY_STATUSES
+        and record.reproduction_status in STRICT_ELIGIBLE_REPRODUCTION_STATUSES
+    )
 
 
 # This registry is deliberately conservative.  A source-aligned handwritten
@@ -119,61 +209,71 @@ BASELINE_REPRODUCTION_REGISTRY: Mapping[str, BaselineReproductionRecord] = {
         upstream_repository="https://github.com/felix-thu/RPEX",
         upstream_commit=UPSTREAM_COMMITS["rpex"],
         official_task_support="D4RL MuJoCo locomotion v2",
-        implementation_type="handwritten PyTorch source-aligned port",
+        implementation_type="source_aligned_port",
         reproduction_status="source_aligned_port",
-        parity_status="partial_formula_and_corruption_fixture_only",
-        strict_final_eligible=True,
+        parity_status="fixed_batch_partial",
+        strict_final_eligible=False,
         remaining_deviation=(
             "no end-to-end fixed-batch optimizer parity certificate for the "
             "complete learner"
         ),
+        benchmark_role="main",
+        main_table_eligible=True,
     ),
     "riql_naive": BaselineReproductionRecord(
         paper_title="Towards Robust Offline Reinforcement Learning under Diverse Data Corruption",
         upstream_repository="https://github.com/felix-thu/RPEX",
         upstream_commit=UPSTREAM_COMMITS["riql_naive"],
         official_task_support="D4RL MuJoCo locomotion v2",
-        implementation_type="handwritten PyTorch source-aligned port",
+        implementation_type="source_aligned_port",
         reproduction_status="source_aligned_port",
-        parity_status="partial_formula_and_corruption_fixture_only",
-        strict_final_eligible=True,
+        parity_status="fixed_batch_partial",
+        strict_final_eligible=False,
         remaining_deviation=(
             "no end-to-end fixed-batch optimizer parity certificate for the "
             "complete learner"
         ),
+        benchmark_role="main",
+        main_table_eligible=True,
     ),
     "wsrl": BaselineReproductionRecord(
         paper_title="Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data",
         upstream_repository="https://github.com/zhouzypaul/wsrl",
         upstream_commit=UPSTREAM_COMMITS["wsrl"],
         official_task_support="D4RL MuJoCo locomotion, AntMaze, Adroit, Kitchen",
-        implementation_type="JAX/Flax-to-PyTorch framework port",
+        implementation_type="framework_port",
         reproduction_status="framework_port_unverified",
-        parity_status="fixed_batch_numerical_parity_missing",
+        parity_status="unverified",
         strict_final_eligible=False,
         remaining_deviation="optimizer-step parity against pinned JAX/Flax output is unverified",
+        benchmark_role="main",
+        main_table_eligible=True,
     ),
-    "cal_ql": BaselineReproductionRecord(
+    "cal_ql_locomotion_adaptation": BaselineReproductionRecord(
         paper_title="Cal-QL: Calibrated Offline RL Pre-Training for Efficient Online Fine-Tuning",
         upstream_repository="https://github.com/nakamotoo/Cal-QL",
-        upstream_commit=UPSTREAM_COMMITS["cal_ql"],
+        upstream_commit=UPSTREAM_COMMITS["cal_ql_locomotion_adaptation"],
         official_task_support="official release recipes: AntMaze and Adroit",
-        implementation_type="D4RL locomotion task port",
+        implementation_type="task_adaptation",
         reproduction_status="task_port",
-        parity_status="unsupported_official_task",
+        parity_status="unverified",
         strict_final_eligible=False,
         remaining_deviation="Hopper/HalfCheetah/Walker2d recipes are absent upstream",
+        benchmark_role="optional_adapted",
+        main_table_eligible=False,
     ),
-    "pessimistic_q_ensemble": BaselineReproductionRecord(
+    "pqe_shared_actor_approx": BaselineReproductionRecord(
         paper_title="Offline-to-Online Reinforcement Learning via Balanced Replay and Pessimistic Q-Ensemble",
         upstream_repository="https://github.com/shlee94/Off2OnRL",
-        upstream_commit=UPSTREAM_COMMITS["pessimistic_q_ensemble"],
+        upstream_commit=UPSTREAM_COMMITS["pqe_shared_actor_approx"],
         official_task_support="D4RL MuJoCo v0 recipes in the public release",
-        implementation_type="shared-actor approximation",
+        implementation_type="approximation",
         reproduction_status="approximation",
-        parity_status="official_independent_policy_ensemble_missing",
+        parity_status="unverified",
         strict_final_eligible=False,
         remaining_deviation="no N=5 independently pretrained actor/twin-critic ensemble",
+        benchmark_role="optional_diagnostic",
+        main_table_eligible=False,
     ),
 }
 
@@ -214,9 +314,9 @@ REPORTING_RULES: Mapping[str, ReportingRule] = {
         1,
         20,
         "zhouzypaul/wsrl finetune.py terminal evaluation",
-        True,
+        False,
     ),
-    "cal_ql": ReportingRule(
+    "cal_ql_locomotion_adaptation": ReportingRule(
         "upstream_reporting_unverified",
         "online",
         1,
@@ -224,7 +324,7 @@ REPORTING_RULES: Mapping[str, ReportingRule] = {
         "nakamotoo/Cal-QL (locomotion unsupported)",
         False,
     ),
-    "pessimistic_q_ensemble": ReportingRule(
+    "pqe_shared_actor_approx": ReportingRule(
         "upstream_reporting_unverified",
         "online",
         1,
@@ -259,7 +359,7 @@ def strict_final_algorithms() -> tuple[str, ...]:
     return tuple(
         name
         for name, record in BASELINE_REPRODUCTION_REGISTRY.items()
-        if record.strict_final_eligible
+        if baseline_record_is_strict_eligible(record)
     )
 
 

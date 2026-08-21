@@ -19,9 +19,11 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
+from .certificates import fixture_hashes, repository_binding, runtime_binding
 from .fidelity import strict_final_algorithms
+from .fidelity import UPSTREAM_COMMITS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +33,21 @@ AUDIT_RECEIPT_ENV = "ROBUST_O2O_FINAL_AUDIT_RECEIPT"
 AUDIT_RECEIPT_SHA256_ENV = "ROBUST_O2O_FINAL_AUDIT_RECEIPT_SHA256"
 RECEIPT_SCHEMA = "robust_o2o.final_audit_receipt.v1"
 _RECEIPT_DIRECTORY_PREFIX = "robust_o2o_final_audit_"
+_AUDIT_READY_FIELDS = (
+    "rpex_riql_eligible_subset_status",
+    "five_baseline_status",
+    "random_corruption_status",
+    "save_resume_status",
+    "strict_environment_status",
+    "final_benchmark_status",
+)
+_REQUIRED_AUDIT_CAPABILITIES = (
+    "rpex_riql_learner",
+    "five_baseline_learners",
+    "random_corruption",
+    "save_resume",
+    "strict_environment",
+)
 
 
 class FinalAuditGateError(RuntimeError):
@@ -90,14 +107,17 @@ def audit_context() -> dict[str, Any]:
 
     if not AUDIT_SCRIPT.is_file():
         raise FinalAuditGateError(f"strict audit script is missing: {AUDIT_SCRIPT}")
-    head = _run_git("rev-parse", "HEAD").decode("ascii", errors="strict").strip()
+    repository = repository_binding(ROOT)
     diff = _run_git("diff", "--binary", "HEAD", "--", ".")
     status = _run_git(
         "status", "--porcelain=v1", "--untracked-files=all"
     )
     return {
         "repository_root": str(ROOT.resolve()),
-        "git_head": head,
+        "git_head": repository["commit"],
+        "repository_clean": repository["clean"],
+        "git_tree_sha256": repository["tree_sha256"],
+        "source_tree_sha256": repository["source_tree_sha256"],
         "git_status_sha256": _sha256_bytes(status),
         "git_worktree_diff_sha256": _sha256_bytes(diff),
         "git_untracked_content_sha256": _untracked_content_digest(),
@@ -108,6 +128,15 @@ def audit_context() -> dict[str, Any]:
         "platform_system": platform.system(),
         "platform_release": platform.release(),
         "platform_machine": platform.machine(),
+        "runtime": runtime_binding(),
+        "upstream_commits": dict(sorted(UPSTREAM_COMMITS.items())),
+        "fixture_sha256": fixture_hashes(
+            ROOT,
+            tuple(
+                str(path.relative_to(ROOT))
+                for path in sorted((ROOT / "tests" / "fixtures").glob("*.json"))
+            ),
+        ),
     }
 
 
@@ -135,6 +164,113 @@ def _origin_is_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _audit_result_is_ready(result: object) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("reproducibility_audit") != "PASS":
+        return False
+    if any(result.get(field) != "READY" for field in _AUDIT_READY_FIELDS):
+        return False
+    # Adversarial corruption may be explicitly excluded from the strict suite;
+    # an uncertified condition may never be represented as READY.
+    if result.get("adversarial_corruption_status") not in {"READY", "EXCLUDED"}:
+        return False
+    verified_ids = result.get("verified_certificate_ids")
+    statuses = result.get("certificate_statuses")
+    capabilities = result.get("certificate_capabilities")
+    if (
+        not isinstance(verified_ids, list)
+        or any(not isinstance(value, str) for value in verified_ids)
+        or len(verified_ids) != len(set(verified_ids))
+        or not isinstance(statuses, dict)
+        or not isinstance(capabilities, dict)
+    ):
+        return False
+    verified_set = set(verified_ids)
+    status_verified_set = {
+        certificate_id
+        for certificate_id, status in statuses.items()
+        if isinstance(certificate_id, str)
+        and isinstance(status, dict)
+        and status.get("valid") is True
+        and status.get("status") == "valid"
+    }
+    if verified_set != status_verified_set:
+        return False
+    for capability_id in _REQUIRED_AUDIT_CAPABILITIES:
+        capability = capabilities.get(capability_id)
+        if not isinstance(capability, dict) or capability.get("verified") is not True:
+            return False
+        required_ids = capability.get("required_certificate_ids")
+        if (
+            not isinstance(required_ids, list)
+            or not required_ids
+            or any(not isinstance(value, str) for value in required_ids)
+            or not set(required_ids).issubset(verified_set)
+        ):
+            return False
+    adversarial_capability = capabilities.get("adversarial_corruption")
+    if result.get("adversarial_corruption_status") == "READY" and (
+        not isinstance(adversarial_capability, dict)
+        or adversarial_capability.get("verified") is not True
+    ):
+        return False
+    return True
+
+
+def extract_verified_audit_attestation(
+    receipt: Mapping[str, Any],
+    *,
+    current_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Expose only evidence cross-checked by the final audit gate.
+
+    Launch code may copy these fields into runtime config/manifest metadata.
+    It must not derive eligibility from unchecked receipt strings.
+    """
+
+    if receipt.get("schema") != RECEIPT_SCHEMA:
+        raise FinalAuditGateError("cannot attest an unsupported audit receipt")
+    if receipt.get("audit_returncode") != 0:
+        raise FinalAuditGateError("cannot attest a failed audit receipt")
+    context = receipt.get("context")
+    if not isinstance(context, dict) or context.get("repository_clean") is not True:
+        raise FinalAuditGateError("cannot attest an audit from a dirty repository")
+    expected_context = (
+        audit_context() if current_context is None else dict(current_context)
+    )
+    expected_token = audit_context_token(expected_context)
+    if context != expected_context or receipt.get("context_token") != expected_token:
+        raise FinalAuditGateError(
+            "cannot attest a stale audit from a different repository/runtime context"
+        )
+    result = receipt.get("audit_result")
+    if not _audit_result_is_ready(result):
+        raise FinalAuditGateError(
+            "cannot attest an audit without all required READY statuses"
+        )
+    assert isinstance(result, dict)
+    return {
+        "audit_receipt_verified": True,
+        "audit_context_token": receipt.get("context_token"),
+        "repository_clean_verified": True,
+        "verified_certificate_ids": list(result["verified_certificate_ids"]),
+        "certificate_capabilities": dict(result["certificate_capabilities"]),
+        "certificate_statuses": dict(result["certificate_statuses"]),
+        "rpex_riql_eligible_subset_status": result[
+            "rpex_riql_eligible_subset_status"
+        ],
+        "five_baseline_status": result["five_baseline_status"],
+        "random_corruption_status": result["random_corruption_status"],
+        "adversarial_corruption_status": result[
+            "adversarial_corruption_status"
+        ],
+        "save_resume_status": result["save_resume_status"],
+        "strict_environment_status": result["strict_environment_status"],
+        "final_benchmark_status": result["final_benchmark_status"],
+    }
 
 
 def _validated_inherited_receipt(
@@ -185,11 +321,8 @@ def _validated_inherited_receipt(
     if receipt.get("audit_returncode") != 0:
         return None, "audit receipt records a failed audit"
     result = receipt.get("audit_result")
-    if not isinstance(result, dict) or (
-        result.get("reproducibility_audit") != "PASS"
-        or result.get("final_benchmark_status") != "READY"
-    ):
-        return None, "audit receipt does not record PASS/READY"
+    if not _audit_result_is_ready(result):
+        return None, "audit receipt does not record all required READY statuses"
     try:
         origin_pid = int(receipt["origin_pid"])
     except (KeyError, TypeError, ValueError):
@@ -243,6 +376,11 @@ def require_final_benchmark_audit(
         return None
 
     context = audit_context()
+    if context.get("repository_clean") is not True:
+        raise FinalAuditGateError(
+            "final benchmark requires a clean repository working tree; "
+            "commit or remove all tracked and untracked changes before audit"
+        )
     token = audit_context_token(context)
     inherited, rejection = _validated_inherited_receipt(context, token)
     if inherited is not None:
@@ -282,12 +420,7 @@ def require_final_benchmark_audit(
         parse_error = str(exc)
     else:
         parse_error = None
-    passed = (
-        completed.returncode == 0
-        and isinstance(audit_result, dict)
-        and audit_result.get("reproducibility_audit") == "PASS"
-        and audit_result.get("final_benchmark_status") == "READY"
-    )
+    passed = completed.returncode == 0 and _audit_result_is_ready(audit_result)
     if not passed:
         details = [
             f"returncode={completed.returncode}",
