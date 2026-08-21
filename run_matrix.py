@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from robust_o2o.config import (
+    ALGORITHM_ALIASES,
     ALGORITHMS,
     BENCHMARK_ENVS,
     CORRUPTION_MODES,
@@ -23,6 +24,7 @@ from robust_o2o.config import (
 )
 from robust_o2o.fidelity import (
     IMPLEMENTATION_PROFILES,
+    MAIN_BASELINES,
     ONLINE_CORRUPTION_SCALE_PROFILES,
     RUN_PURPOSES,
     STRICT_FINAL_SEEDS,
@@ -61,11 +63,26 @@ def _csv(value: str):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _canonical_algorithms(values: list[str]) -> list[str]:
+    requested = [
+        item.strip().lower()
+        for value in values
+        for item in value.split(",")
+        if item.strip()
+    ]
+    return [ALGORITHM_ALIASES.get(value, value) for value in requested]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run or print an RPEX-benchmark algorithm/corruption matrix"
     )
-    parser.add_argument("--algorithms", type=_csv, default=list(ALGORITHMS))
+    parser.add_argument(
+        "--algorithms",
+        nargs="+",
+        default=list(MAIN_BASELINES),
+        help="algorithm names separated by commas, spaces, or both",
+    )
     parser.add_argument(
         "--envs",
         type=_csv,
@@ -172,11 +189,17 @@ def _validate_args(
     if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
         args.protocol = LOCAL_PROTOCOL
 
+    args.algorithms = _canonical_algorithms(args.algorithms)
+
     unknown_algorithms = sorted(set(args.algorithms) - set(ALGORITHMS))
     if unknown_algorithms:
         parser.error(f"unknown algorithms: {', '.join(unknown_algorithms)}")
     if not args.algorithms:
         parser.error("--algorithms cannot be empty")
+    if len(args.algorithms) != len(set(args.algorithms)):
+        parser.error(
+            "algorithm selections cannot contain duplicates after alias normalization"
+        )
     args.envs = [normalize_env_name(env_name) for env_name in args.envs]
     unknown_envs = sorted(set(args.envs) - set(BENCHMARK_ENVS))
     if unknown_envs:

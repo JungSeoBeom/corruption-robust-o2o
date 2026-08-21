@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from robust_o2o.config import ExperimentConfig
@@ -13,6 +17,8 @@ from robust_o2o.fidelity import (
 from robust_o2o.experiment import _runtime_update_metadata
 from robust_o2o.paths import comparison_directory
 from scripts.check_research_readiness import (
+    _discover_runtime_evidence,
+    _latest_completed,
     build_parser as build_readiness_parser,
     run_checks,
 )
@@ -31,15 +37,18 @@ class ResearchBenchmarkConfigTest(unittest.TestCase):
         return ExperimentConfig(**values)
 
     def test_main_and_optional_baseline_registry_is_explicit(self):
-        self.assertEqual(MAIN_BASELINES, ("rpex", "riql_naive", "wsrl"))
         self.assertEqual(
-            OPTIONAL_ADAPTED_BASELINES,
-            ("cal_ql_locomotion_adaptation",),
+            MAIN_BASELINES,
+            (
+                "rpex",
+                "riql_naive",
+                "wsrl",
+                "cal_ql",
+                "pessimistic_q_ensemble",
+            ),
         )
-        self.assertEqual(
-            OPTIONAL_APPROXIMATION_BASELINES,
-            ("pqe_shared_actor_approx",),
-        )
+        self.assertEqual(OPTIONAL_ADAPTED_BASELINES, ())
+        self.assertEqual(OPTIONAL_APPROXIMATION_BASELINES, ())
         for algorithm in MAIN_BASELINES:
             record = BASELINE_REPRODUCTION_REGISTRY[algorithm]
             self.assertEqual(record.benchmark_role, "main")
@@ -69,33 +78,61 @@ class ResearchBenchmarkConfigTest(unittest.TestCase):
             self.assertEqual(config.eval_period, 19)
             self.assertEqual(config.eval_episodes, 7)
             self.assertEqual(config.final_window_size, 2)
-            self.assertEqual(config.evaluation_mode, "deterministic_diagnostic")
-            self.assertEqual(
-                config.evaluation_policy_profile, "deterministic_diagnostic"
-            )
+            if algorithm == "rpex":
+                self.assertEqual(config.evaluation_mode, "both")
+                self.assertEqual(
+                    config.evaluation_policy_profile,
+                    "official_code_epsilon_switching",
+                )
+            else:
+                self.assertEqual(
+                    config.evaluation_mode, "deterministic_diagnostic"
+                )
+                self.assertEqual(
+                    config.evaluation_policy_profile, "deterministic_diagnostic"
+                )
 
-    def test_retired_algorithm_names_are_never_silently_aliased(self):
-        with self.assertRaisesRegex(ValueError, "Exact Pessimistic Q-Ensemble"):
+    def test_canonical_and_alias_names_select_the_main_implementations(self):
+        self.assertEqual(
+            ExperimentConfig("calql", "hopper-medium-replay-v2").algorithm,
+            "cal_ql",
+        )
+        self.assertEqual(
+            ExperimentConfig("pqe", "hopper-medium-replay-v2").algorithm,
+            "pessimistic_q_ensemble",
+        )
+        with self.assertRaisesRegex(ValueError, "historical result name"):
             ExperimentConfig(
-                "pessimistic_q_ensemble", "hopper-medium-replay-v2"
+                "cal_ql_locomotion_adaptation", "hopper-medium-replay-v2"
             )
-        with self.assertRaisesRegex(ValueError, "task adaptation"):
-            ExperimentConfig("cal_ql", "hopper-medium-replay-v2")
+        with self.assertRaisesRegex(ValueError, "retired for new runs"):
+            ExperimentConfig(
+                "pqe_shared_actor_approx", "hopper-medium-replay-v2"
+            )
 
-    def test_optional_results_have_non_main_metadata(self):
-        adapted = self.make_config("cal_ql_locomotion_adaptation").to_dict()
-        approximate = self.make_config("pqe_shared_actor_approx").to_dict()
-        self.assertEqual(adapted["implementation_type"], "task_adaptation")
-        self.assertEqual(adapted["benchmark_role"], "optional_adapted")
-        self.assertFalse(adapted["main_table_eligible"])
-        self.assertEqual(approximate["implementation_type"], "approximation")
-        self.assertEqual(approximate["benchmark_role"], "optional_diagnostic")
-        self.assertFalse(approximate["main_table_eligible"])
+    def test_calql_and_pqe_have_honest_main_metadata(self):
+        adapted = self.make_config("cal_ql").to_dict()
+        port = self.make_config("pessimistic_q_ensemble").to_dict()
+        self.assertEqual(
+            adapted["implementation_type"],
+            "source_aligned_locomotion_adaptation",
+        )
+        self.assertEqual(adapted["benchmark_role"], "main")
+        self.assertTrue(adapted["main_table_eligible"])
+        self.assertEqual(
+            port["implementation_type"], "source_aligned_d4rl_v2_port"
+        )
+        self.assertEqual(port["benchmark_role"], "main")
+        self.assertTrue(port["main_table_eligible"])
+        self.assertEqual(port["upstream_task_version"], "v0")
+        self.assertEqual(port["benchmark_task_version"], "v2")
+        self.assertEqual(port["offline_compute_multiplier"], 5)
+        self.assertFalse(port["shared_actor"])
 
     def test_calql_oracle_corruption_labels_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "corruption masks/labels"):
             self.make_config(
-                "cal_ql_locomotion_adaptation",
+                "cal_ql",
                 calibration_mask_mode="oracle_exclude_corrupted",
             )
 
@@ -178,7 +215,50 @@ class ResearchBenchmarkConfigTest(unittest.TestCase):
 
 
 class ResearchReadinessTest(unittest.TestCase):
-    def test_runtime_loader_can_satisfy_practical_readiness(self):
+    def test_latest_completed_uses_completion_manifest_mtime(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            completion_paths = {}
+            for name in ("z_lexically_later_old", "a_lexically_earlier_new"):
+                run_dir = root / name
+                run_dir.mkdir()
+                (run_dir / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "algorithm": "cal_ql",
+                            "env_name": "hopper-medium-replay-v2",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (run_dir / "summary.json").write_text(
+                    json.dumps({"status": "completed"}), encoding="utf-8"
+                )
+                completion = run_dir / "completed_experiment_manifest.json"
+                completion.write_text(
+                    json.dumps({"actual_online_steps": 1}), encoding="utf-8"
+                )
+                completion_paths[name] = completion
+
+            old_ns = 1_700_000_000_000_000_000
+            new_ns = old_ns + 1_000_000_000
+            os.utime(
+                completion_paths["z_lexically_later_old"],
+                ns=(old_ns, old_ns),
+            )
+            os.utime(
+                completion_paths["a_lexically_earlier_new"],
+                ns=(new_ns, new_ns),
+            )
+
+            records = _discover_runtime_evidence([directory])
+            selected = _latest_completed(
+                records, "cal_ql", "hopper-medium-replay-v2"
+            )
+            self.assertIsNotNone(selected)
+            self.assertEqual(selected.run_dir.name, "a_lexically_earlier_new")
+
+    def test_runtime_loader_leaves_post_training_evidence_pending(self):
         args = build_readiness_parser().parse_args(
             [
                 "--env-name",
@@ -193,8 +273,149 @@ class ResearchReadinessTest(unittest.TestCase):
                 "dataset": "loaded"
             },
         )
-        failures = [check for check in checks if not check.ok]
+        failures = [check for check in checks if check.ok is False]
         self.assertEqual(failures, [])
+        pending = {check.label for check in checks if check.ok is None}
+        self.assertEqual(
+            pending,
+            {
+                "CAL-QL ONLINE MC EVIDENCE",
+                "PQE MEMBER CHECKPOINT EVIDENCE",
+            },
+        )
+
+    def test_static_only_never_claims_runtime_evidence(self):
+        args = build_readiness_parser().parse_args(
+            [
+                "--env-name",
+                "hopper-medium-replay-v2",
+                "--corruption-suite",
+                "clean",
+                "--static-only",
+            ]
+        )
+        checks = run_checks(args)
+        environment = next(
+            check for check in checks if check.label == "D4RL ENVIRONMENT"
+        )
+        self.assertIsNone(environment.ok)
+        self.assertIn("PENDING", environment.detail)
+
+    def test_completed_run_directories_validate_runtime_evidence(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            calql = root / "calql"
+            calql.mkdir()
+            (calql / "config.json").write_text(
+                json.dumps(
+                    {
+                        "algorithm": "cal_ql",
+                        "env_name": "hopper-medium-replay-v2",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (calql / "summary.json").write_text(
+                json.dumps({"status": "completed"}), encoding="utf-8"
+            )
+            (calql / "completed_experiment_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "completed_online_trajectories": 2,
+                        "completed_online_transitions": 7,
+                        "online_mc_return_valid_fraction": 1.0,
+                        "online_critic_gradient_updates": 7,
+                        "calql_online_cql_enabled": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            pqe = root / "pqe"
+            members = pqe / "checkpoints" / "offline" / "members"
+            members.mkdir(parents=True)
+            member_hashes = []
+            for index in range(5):
+                payload = f"independent-{index}".encode()
+                (members / f"member_{index}.pt").write_bytes(payload)
+                member_hashes.append(hashlib.sha256(payload).hexdigest())
+            (pqe / "config.json").write_text(
+                json.dumps(
+                    {
+                        "algorithm": "pessimistic_q_ensemble",
+                        "env_name": "hopper-medium-replay-v2",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (pqe / "summary.json").write_text(
+                json.dumps({"status": "completed"}), encoding="utf-8"
+            )
+            (pqe / "completed_experiment_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "pqe_member_checkpoint_hashes": member_hashes,
+                        "shared_actor": False,
+                        "actor_independence": True,
+                        "critic_independence": True,
+                        "pqe_replay_mode": "balanced_density",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            args = build_readiness_parser().parse_args(
+                [
+                    "--env-name",
+                    "hopper-medium-replay-v2",
+                    "--corruption-suite",
+                    "clean",
+                    "--run-dir",
+                    directory,
+                ]
+            )
+            checks = run_checks(
+                args,
+                environment_loader=lambda *unused_args, **unused_kwargs: {},
+            )
+            for label in (
+                "CAL-QL ONLINE MC EVIDENCE",
+                "PQE MEMBER CHECKPOINT EVIDENCE",
+            ):
+                check = next(item for item in checks if item.label == label)
+                self.assertTrue(check.ok, check.detail)
+
+    def test_supplied_incomplete_runtime_directory_fails_closed(self):
+        with TemporaryDirectory() as directory:
+            args = build_readiness_parser().parse_args(
+                [
+                    "--env-name",
+                    "hopper-medium-replay-v2",
+                    "--corruption-suite",
+                    "clean",
+                    "--run-dir",
+                    directory,
+                ]
+            )
+            checks = run_checks(
+                args,
+                environment_loader=lambda *unused_args, **unused_kwargs: {},
+            )
+            runtime = {
+                check.label: check
+                for check in checks
+                if check.label
+                in {
+                    "CAL-QL ONLINE MC EVIDENCE",
+                    "PQE MEMBER CHECKPOINT EVIDENCE",
+                }
+            }
+            self.assertEqual(set(runtime), {
+                "CAL-QL ONLINE MC EVIDENCE",
+                "PQE MEMBER CHECKPOINT EVIDENCE",
+            })
+            self.assertTrue(all(check.ok is False for check in runtime.values()))
 
     def test_existing_explicit_comparison_path_is_a_collision(self):
         with TemporaryDirectory() as directory:

@@ -7,7 +7,10 @@ from typing import Iterable, Mapping
 import numpy as np
 
 from .fidelity import (
+    BASELINE_REPRODUCTION_REGISTRY,
     COMMON_BENCHMARK_REPORTING_RULE,
+    HISTORICAL_RESULT_ALGORITHM_ALIASES,
+    MAIN_BASELINES as CANONICAL_MAIN_BASELINES,
     REPORTING_RULES,
     ReportingRule,
 )
@@ -112,11 +115,44 @@ SEED_STATUS_COLUMNS = (
     "run_dir",
 )
 
-MAIN_BASELINES = frozenset(("rpex", "riql_naive", "wsrl"))
-ADAPTED_BASELINES = frozenset(("cal_ql", "cal_ql_locomotion_adaptation"))
-APPROXIMATION_BASELINES = frozenset(
-    ("pessimistic_q_ensemble", "pqe_shared_actor_approx")
+RESEARCH_SUMMARY_COLUMNS = (
+    "algorithm",
+    "display_name",
+    "implementation_type",
+    "task_scope",
+    "environment",
+    "corruption",
+    "corruption_target",
+    "seed",
+    "offline_steps",
+    "online_environment_steps",
+    "offline_gradient_updates",
+    "online_critic_updates",
+    "online_actor_updates",
+    "UTD",
+    "ensemble_size",
+    "offline_compute_multiplier",
+    "evaluation_policy",
+    "final_window",
+    "seed_score",
+    "mean",
+    "std",
+    "status",
 )
+
+MAIN_BASELINES = frozenset(CANONICAL_MAIN_BASELINES)
+ADAPTED_BASELINES: frozenset[str] = frozenset()
+APPROXIMATION_BASELINES: frozenset[str] = frozenset()
+
+
+def _canonical_algorithm(algorithm: object) -> str:
+    name = str(algorithm)
+    return HISTORICAL_RESULT_ALGORITHM_ALIASES.get(name, name)
+
+
+def _registry_value(algorithm: str, field: str, fallback):
+    record = BASELINE_REPRODUCTION_REGISTRY.get(algorithm)
+    return getattr(record, field) if record is not None else fallback
 
 
 def _empty_score_frames(pd):
@@ -142,10 +178,7 @@ def _single_value(frame, column: str, run_dir: str):
 
 
 def _infer_benchmark_role(algorithm: str, run_purpose: str) -> str:
-    if algorithm in ADAPTED_BASELINES:
-        return "optional_adapted"
-    if algorithm in APPROXIMATION_BASELINES:
-        return "optional_diagnostic"
+    algorithm = _canonical_algorithm(algorithm)
     if algorithm in MAIN_BASELINES and run_purpose == "research_benchmark":
         return "main"
     return "diagnostic"
@@ -164,6 +197,10 @@ def _ensure_classification_columns(frame):
             if column not in result:
                 result[column] = []
         return result
+    if "algorithm" in result:
+        # Historical names are accepted only at result-read time.  Every CSV
+        # emitted by this module uses the canonical five-baseline registry.
+        result["algorithm"] = result["algorithm"].map(_canonical_algorithm)
     if "run_purpose" not in result:
         result["run_purpose"] = "legacy_unknown"
     if "benchmark_role" not in result:
@@ -181,6 +218,34 @@ def _ensure_classification_columns(frame):
         result["uses_corruption_labels"] = False
     if "error_message" not in result:
         result["error_message"] = ""
+    if "display_name" not in result:
+        result["display_name"] = [
+            _registry_value(str(algorithm), "display_name", str(algorithm))
+            for algorithm in result["algorithm"]
+        ]
+    if "task_scope" not in result:
+        result["task_scope"] = [
+            _registry_value(str(algorithm), "task_scope", "unspecified")
+            for algorithm in result["algorithm"]
+        ]
+    if "offline_compute_multiplier" not in result:
+        result["offline_compute_multiplier"] = [
+            float(
+                _registry_value(
+                    str(algorithm), "offline_compute_multiplier", 1.0
+                )
+            )
+            for algorithm in result["algorithm"]
+        ]
+    if "ensemble_size" not in result:
+        result["ensemble_size"] = [
+            5 if str(algorithm) == "pessimistic_q_ensemble" else 1
+            for algorithm in result["algorithm"]
+        ]
+    if "evaluation_policy" not in result:
+        result["evaluation_policy"] = result.get(
+            "evaluation_policy_profile", "legacy_unknown"
+        )
     optional_defaults = {
         "critic_gradient_updates": np.nan,
         "actor_gradient_updates": np.nan,
@@ -193,6 +258,9 @@ def _ensure_classification_columns(frame):
         "corruption_application_contract": "legacy_unknown",
         "evaluation_corruption": "legacy_unknown",
         "final_window_size": 3,
+        "offline_gradient_updates": np.nan,
+        "online_critic_updates": np.nan,
+        "online_actor_updates": np.nan,
     }
     for column, value in optional_defaults.items():
         if column not in result:
@@ -896,6 +964,214 @@ def aggregate_seed_scores(
     return per_seed, summary
 
 
+def _finite_or_nan(value) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return number if np.isfinite(number) else float("nan")
+
+
+def _research_summary_table(
+    research_frame,
+    per_seed,
+    aggregate,
+    *,
+    expected_seeds: Iterable[int] | None,
+):
+    """Build the canonical seed-explicit five-baseline main table.
+
+    Aggregate mean/std are published only for a complete cohort.  A failed,
+    missing, running, partial-window, or otherwise incomplete seed therefore
+    remains visible without making the successful subset look like a valid
+    benchmark result.
+    """
+
+    import pandas as pd
+
+    if research_frame.empty:
+        return pd.DataFrame(columns=RESEARCH_SUMMARY_COLUMNS)
+
+    expected = (
+        None
+        if expected_seeds is None
+        else sorted(set(int(seed) for seed in expected_seeds))
+    )
+    rows: list[dict] = []
+    group_columns = (
+        "algorithm",
+        "env_name",
+        "corruption",
+        "corruption_target",
+        "implementation_type",
+        "task_scope",
+        "run_purpose",
+    )
+    for group_keys, group in research_frame.groupby(list(group_columns), sort=True):
+        (
+            algorithm,
+            environment,
+            corruption,
+            corruption_target,
+            implementation_type,
+            task_scope,
+            _run_purpose,
+        ) = group_keys
+        condition = _condition(group)
+        group_aggregate = aggregate[
+            (aggregate["algorithm"] == algorithm)
+            & (aggregate["environment"] == environment)
+            & (aggregate["condition"] == condition)
+            & (aggregate["implementation_type"] == implementation_type)
+            & (aggregate["benchmark_role"] == "main")
+        ]
+        if len(group_aggregate) != 1:
+            raise ReportingValidationError(
+                "research main-table group has no unique aggregate row: "
+                f"{algorithm}/{environment}/{condition}"
+            )
+        summary = group_aggregate.iloc[0]
+        cohort_complete = bool(summary["result_eligible"])
+        cohort_mean = (
+            _finite_or_nan(summary["mean"])
+            if cohort_complete
+            else float("nan")
+        )
+        cohort_std = (
+            _finite_or_nan(summary["std"])
+            if cohort_complete
+            else float("nan")
+        )
+        run_groups = list(group.groupby("run_dir", sort=True))
+        observed_seeds: set[int] = set()
+
+        def base_row(run, run_label: str) -> dict:
+            offline_steps = int(
+                _single_value(run, "planned_offline_steps", run_label)
+            )
+            compute_multiplier = _finite_or_nan(
+                _single_value(
+                    run, "offline_compute_multiplier", run_label
+                )
+            )
+            offline_updates = _finite_or_nan(
+                _single_value(run, "offline_gradient_updates", run_label)
+            )
+            if not np.isfinite(offline_updates):
+                offline_updates = float(offline_steps) * compute_multiplier
+            actual_utd = _finite_or_nan(
+                _single_value(run, "actual_utd", run_label)
+            )
+            configured_utd = _finite_or_nan(
+                _single_value(run, "configured_utd", run_label)
+            )
+            return {
+                "algorithm": str(algorithm),
+                "display_name": str(
+                    _single_value(run, "display_name", run_label)
+                ),
+                "implementation_type": str(implementation_type),
+                "task_scope": str(task_scope),
+                "environment": str(environment),
+                "corruption": str(corruption),
+                "corruption_target": str(corruption_target),
+                "offline_steps": offline_steps,
+                "online_environment_steps": int(
+                    _single_value(
+                        run, "planned_online_steps", run_label
+                    )
+                ),
+                "offline_gradient_updates": offline_updates,
+                "online_critic_updates": _finite_or_nan(
+                    _single_value(
+                        run, "online_critic_updates", run_label
+                    )
+                ),
+                "online_actor_updates": _finite_or_nan(
+                    _single_value(
+                        run, "online_actor_updates", run_label
+                    )
+                ),
+                "UTD": (
+                    actual_utd if np.isfinite(actual_utd) else configured_utd
+                ),
+                "ensemble_size": int(
+                    _single_value(run, "ensemble_size", run_label)
+                ),
+                "offline_compute_multiplier": compute_multiplier,
+                "evaluation_policy": str(
+                    _single_value(run, "evaluation_policy", run_label)
+                ),
+                "final_window": int(
+                    _single_value(run, "final_window_size", run_label)
+                ),
+                "mean": cohort_mean,
+                "std": cohort_std,
+            }
+
+        template_run = run_groups[0][1]
+        for run_dir, run in run_groups:
+            seed = int(_single_value(run, "seed", str(run_dir)))
+            observed_seeds.add(seed)
+            raw_status = str(
+                _single_value(run, "run_status", str(run_dir))
+            ).lower()
+            score = per_seed[per_seed["run_dir"] == str(run_dir)]
+            if len(score) > 1:
+                raise ReportingValidationError(
+                    f"run {run_dir} has multiple research seed scores"
+                )
+            seed_score = (
+                _finite_or_nan(score.iloc[0]["seed_score"])
+                if len(score) == 1
+                else float("nan")
+            )
+            partial_window = bool(
+                len(score) == 1
+                and "__partial_" in str(score.iloc[0]["aggregation_rule"])
+            )
+            if raw_status == "completed" and partial_window:
+                status = "partial"
+                seed_score = float("nan")
+            elif raw_status == "completed" and not cohort_complete:
+                status = "cohort_incomplete"
+            elif raw_status == "completed":
+                status = "completed"
+            elif raw_status == "failed":
+                status = "failed"
+            elif raw_status in ("running", "partial"):
+                status = raw_status
+            else:
+                status = "partial"
+            rows.append(
+                {
+                    **base_row(run, str(run_dir)),
+                    "seed": seed,
+                    "seed_score": seed_score,
+                    "status": status,
+                }
+            )
+
+        expected_for_group = expected if expected is not None else sorted(observed_seeds)
+        for seed in sorted(set(expected_for_group) - observed_seeds):
+            rows.append(
+                {
+                    **base_row(template_run, str(run_groups[0][0])),
+                    "seed": int(seed),
+                    "seed_score": float("nan"),
+                    "mean": float("nan"),
+                    "std": float("nan"),
+                    "status": "missing",
+                }
+            )
+
+    result = pd.DataFrame(rows, columns=RESEARCH_SUMMARY_COLUMNS)
+    return result.sort_values(
+        ["algorithm", "environment", "corruption", "corruption_target", "seed"],
+        ignore_index=True,
+    )
+
+
 def write_reporting_outputs(
     frame,
     output_dir: Path,
@@ -935,6 +1211,21 @@ def write_reporting_outputs(
                 "research runs mix evaluation episode counts: " f"{episodes}"
             )
         evaluation_episodes = episodes[0] if episodes else None
+        periods = sorted(
+            set(int(value) for value in research_rows["eval_period"].dropna())
+        )
+        if len(periods) > 1:
+            raise ReportingValidationError(
+                "research runs mix evaluation intervals: " f"{periods}"
+            )
+        evaluation_contracts = set(
+            research_rows["evaluation_corruption"].astype(str)
+        )
+        if evaluation_contracts != {"clean"}:
+            raise ReportingValidationError(
+                "research seed scores require clean evaluation; observed "
+                f"{sorted(evaluation_contracts)}"
+            )
     common_rule = common_reporting_rule(
         phase,
         final_evaluations=final_window,
@@ -1037,11 +1328,14 @@ def write_reporting_outputs(
     )
 
     no_labels = ~frame["uses_corruption_labels"].astype(bool)
-    research_mask = (
-        (frame["benchmark_role"] == "main")
-        & (frame["run_purpose"] == "research_benchmark")
-        & no_labels
-    )
+    research_mask = no_labels & False
+    if not frame.empty:
+        research_mask = (
+            frame["algorithm"].isin(MAIN_BASELINES)
+            & (frame["benchmark_role"] == "main")
+            & (frame["run_purpose"] == "research_benchmark")
+            & no_labels
+        )
     adapted_mask = (
         (frame["benchmark_role"] == "optional_adapted") & no_labels
     )
@@ -1050,10 +1344,16 @@ def write_reporting_outputs(
     research_frame = frame[research_mask]
     adapted_frame = frame[adapted_mask]
     diagnostic_frame = frame[diagnostic_mask]
-    research_seed, research_summary = aggregate_seed_scores(
+    research_seed, research_aggregate = aggregate_seed_scores(
         research_frame,
         rule_by_algorithm=common_rules,
         strict=strict and not research_frame.empty,
+        expected_seeds=expected_seeds,
+    )
+    research_summary = _research_summary_table(
+        research_frame,
+        research_seed,
+        research_aggregate,
         expected_seeds=expected_seeds,
     )
     adapted_seed, adapted_summary = aggregate_seed_scores(

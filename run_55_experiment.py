@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable
 
 from robust_o2o.config import (
+    ALGORITHM_ALIASES,
     BENCHMARK_ENVS,
     DEFAULT_PROTOCOL,
     LEGACY_LOCAL_PROTOCOL_ALIAS,
@@ -25,7 +26,6 @@ from robust_o2o.fidelity import (
     IMPLEMENTATION_PROFILES,
     MAIN_BASELINES,
     ONLINE_CORRUPTION_SCALE_PROFILES,
-    OPTIONAL_BASELINES,
     RUN_PURPOSES,
     STRICT_FINAL_SEEDS,
     STRICT_FINAL_TASKS,
@@ -33,8 +33,8 @@ from robust_o2o.fidelity import (
     strict_final_algorithms,
 )
 ENV_NAME = "hopper-medium-replay-v2"
-# Backward-compatible import name. The default suite is now intentionally
-# three main baselines; adaptations/approximations require an explicit option.
+# Backward-compatible import name used by existing launcher callers.  New runs
+# always use the five canonical main-baseline names from fidelity.py.
 ALGORITHMS = MAIN_BASELINES
 CORRUPTION_SUITES = ("clean", "random", "adversarial", "all")
 CLEAN_SETTINGS = (("clean", "none"),)
@@ -90,11 +90,27 @@ RESERVED_PASSTHROUGH_OPTIONS = {
     "--evaluation-episodes",
     "--eval-episodes",
     "--final-window-size",
+    "--offline-steps",
+    "--online-steps",
 }
 
 
-def _csv(value: str) -> list[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
+def _flatten_cli_values(values: Iterable[str]) -> list[str]:
+    """Accept both comma-separated and shell-space-separated CLI lists."""
+
+    return [
+        item.strip()
+        for value in values
+        for item in value.split(",")
+        if item.strip()
+    ]
+
+
+def _canonical_algorithms(values: Iterable[str]) -> list[str]:
+    return [
+        ALGORITHM_ALIASES.get(value.strip().lower(), value.strip().lower())
+        for value in _flatten_cli_values(values)
+    ]
 
 
 def _default_experiment_name(env_name: str) -> str:
@@ -110,14 +126,14 @@ def _selected_algorithms(args: argparse.Namespace) -> tuple[str, ...]:
             for algorithm in args.algorithms
             if algorithm in strict_final_algorithms()
         )
-    return (*tuple(args.algorithms), *tuple(args.optional_baselines))
+    return tuple(args.algorithms)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the RPEX, RIQL-naive, and WSRL main benchmark. Cal-QL "
-            "locomotion and shared-actor PQE are explicit optional results."
+            "Run the five-main-baseline RPEX, RIQL-naive, WSRL, Cal-QL, and "
+            "Pessimistic Q-Ensemble corruption benchmark."
         )
     )
     parser.add_argument("--env-name", choices=BENCHMARK_ENVS, default=ENV_NAME)
@@ -132,20 +148,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--algorithms",
-        type=_csv,
+        nargs="+",
         default=list(MAIN_BASELINES),
-        help="comma-separated subset of main baselines",
+        help=(
+            "main baselines as comma-separated and/or space-separated names; "
+            "Cal-QL/PQE aliases are normalized to canonical names"
+        ),
     )
     parser.add_argument(
         "--optional-baselines",
-        type=_csv,
+        nargs="+",
         default=[],
-        help=(
-            "explicit opt-in list: cal_ql_locomotion_adaptation and/or "
-            "pqe_shared_actor_approx"
-        ),
+        help=argparse.SUPPRESS,
     )
-    parser.add_argument("--seeds", type=_csv, default=["0"])
+    parser.add_argument("--seeds", nargs="+", default=["0"])
     parser.add_argument("--offline-steps", type=int, default=500_000)
     parser.add_argument("--online-steps", type=int, default=500_000)
     parser.add_argument(
@@ -201,6 +217,14 @@ def _validate_args(
 ) -> None:
     if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
         args.protocol = LOCAL_PROTOCOL
+    args.algorithms = _canonical_algorithms(args.algorithms)
+    args.seeds = _flatten_cli_values(args.seeds)
+    if args.optional_baselines:
+        parser.error(
+            "--optional-baselines is retired: Cal-QL and Pessimistic "
+            "Q-Ensemble are main baselines; select their canonical names with "
+            "--algorithms"
+        )
     if not args.seeds:
         parser.error("--seeds cannot be empty")
     for seed in args.seeds:
@@ -208,36 +232,12 @@ def _validate_args(
             int(seed)
         except ValueError:
             parser.error(f"invalid seed: {seed!r}")
-    retired = {
-        "pessimistic_q_ensemble",
-        "pessimistic-q-ensemble",
-        "pqe",
-    }
-    requested = (*tuple(args.algorithms), *tuple(args.optional_baselines))
-    retired_requested = sorted(set(requested) & retired)
-    if retired_requested:
-        parser.error(
-            "exact Pessimistic Q-Ensemble is not implemented; the shared-actor "
-            "approximation must be explicitly selected as "
-            "--optional-baselines pqe_shared_actor_approx"
-        )
-    retired_calql = sorted(set(requested) & {"cal_ql", "cal-ql", "calql"})
-    if retired_calql:
-        parser.error(
-            "Cal-QL locomotion is a task adaptation; select it explicitly as "
-            "--optional-baselines cal_ql_locomotion_adaptation"
-        )
+    requested = tuple(args.algorithms)
     unknown_main = sorted(set(args.algorithms) - set(MAIN_BASELINES))
     if unknown_main:
         parser.error(
             "--algorithms accepts only main baselines "
             f"{','.join(MAIN_BASELINES)}; invalid: {','.join(unknown_main)}"
-        )
-    unknown_optional = sorted(set(args.optional_baselines) - set(OPTIONAL_BASELINES))
-    if unknown_optional:
-        parser.error(
-            "--optional-baselines accepts only "
-            f"{','.join(OPTIONAL_BASELINES)}; invalid: {','.join(unknown_optional)}"
         )
     if not args.algorithms:
         parser.error("--algorithms cannot be empty for a research benchmark")
@@ -288,8 +288,8 @@ def _validate_args(
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.suite_profile == "method_fidelity":
         parser.error(
-            "method_fidelity 5x5 is unavailable: Cal-QL locomotion is a task "
-            "port and the local PQE is pqe_shared_actor_approx. Use "
+            "method_fidelity 5x5 is unavailable: canonical Cal-QL is a frozen "
+            "locomotion adaptation and canonical PQE is a D4RL-v2 port. Use "
             "--suite-profile common_budget_diagnostic; no run will be mislabeled "
             "as paper reproduction."
         )
@@ -493,11 +493,6 @@ def main() -> int:
     print(f"ENVIRONMENT: {args.env_name}", flush=True)
     print(f"ALGORITHMS: {', '.join(selected_algorithms)}", flush=True)
     print(f"MAIN_BASELINES: {', '.join(args.algorithms)}", flush=True)
-    print(
-        "OPTIONAL_BASELINES: "
-        + (", ".join(args.optional_baselines) if args.optional_baselines else "none"),
-        flush=True,
-    )
     print(f"CORRUPTION_SUITE: {args.corruption_suite}", flush=True)
     print(
         "SETTINGS: "

@@ -6,9 +6,14 @@ from pathlib import Path
 
 import pandas as pd
 
-from robust_o2o.fidelity import REPORTING_RULES
+from robust_o2o.fidelity import (
+    BASELINE_REPRODUCTION_REGISTRY,
+    MAIN_BASELINES,
+    REPORTING_RULES,
+)
 from robust_o2o.reporting import (
     PER_SEED_COLUMNS,
+    RESEARCH_SUMMARY_COLUMNS,
     SUMMARY_COLUMNS,
     ReportingValidationError,
     aggregate_seed_scores,
@@ -441,13 +446,14 @@ class ReportingRuleTest(unittest.TestCase):
         self.assertEqual(int(failed["seed"]), 1)
         self.assertEqual(failed["error_message"], "optimizer diverged")
 
-    def test_research_adapted_and_diagnostic_summaries_are_separate(self):
+    def test_historical_names_are_read_normalized_without_role_promotion(self):
         main = evaluation_frame(seeds=(0,))
         main["run_purpose"] = "research_benchmark"
         main["benchmark_role"] = "main"
         main["implementation_type"] = "source_aligned_port"
         main["uses_corruption_labels"] = False
         main["final_window_size"] = 3
+        main["evaluation_corruption"] = "clean"
 
         adapted = main.copy()
         adapted["algorithm"] = "cal_ql_locomotion_adaptation"
@@ -477,12 +483,122 @@ class ReportingRuleTest(unittest.TestCase):
         self.assertEqual(research["algorithm"].tolist(), ["rpex"])
         self.assertEqual(
             adapted_result["algorithm"].tolist(),
-            ["cal_ql_locomotion_adaptation"],
+            ["cal_ql"],
         )
         self.assertEqual(
             diagnostic_result["algorithm"].tolist(),
-            ["pqe_shared_actor_approx"],
+            ["pessimistic_q_ensemble"],
         )
+
+    def test_research_summary_is_seed_explicit_five_baseline_main_table(self):
+        frames = []
+        for index, algorithm in enumerate(MAIN_BASELINES):
+            item = evaluation_frame(seeds=(0,))
+            item["algorithm"] = algorithm
+            item["run_dir"] = f"/tmp/{algorithm}_seed_0"
+            item["run_purpose"] = "research_benchmark"
+            item["benchmark_role"] = "main"
+            item["implementation_type"] = BASELINE_REPRODUCTION_REGISTRY[
+                algorithm
+            ].implementation_type
+            item["uses_corruption_labels"] = False
+            item["final_window_size"] = 3
+            item["evaluation_corruption"] = "clean"
+            online = item["phase"] == "online"
+            item.loc[online, "normalized_return_mean"] += float(index)
+            frames.append(item)
+
+        with tempfile.TemporaryDirectory() as directory:
+            outputs = write_reporting_outputs(
+                pd.concat(frames, ignore_index=True),
+                Path(directory),
+                strict=False,
+                expected_seeds=[0],
+            )
+            research = pd.read_csv(outputs["research_summary"])
+
+        self.assertEqual(tuple(research.columns), RESEARCH_SUMMARY_COLUMNS)
+        self.assertEqual(set(research["algorithm"]), set(MAIN_BASELINES))
+        self.assertEqual(len(research), 5)
+        self.assertEqual(set(research["status"]), {"completed"})
+        self.assertEqual(
+            int(
+                research.loc[
+                    research["algorithm"] == "pessimistic_q_ensemble",
+                    "ensemble_size",
+                ].iloc[0]
+            ),
+            5,
+        )
+        self.assertEqual(
+            float(
+                research.loc[
+                    research["algorithm"] == "pessimistic_q_ensemble",
+                    "offline_compute_multiplier",
+                ].iloc[0]
+            ),
+            5.0,
+        )
+
+    def test_incomplete_research_cohort_cannot_publish_subset_mean(self):
+        frame = evaluation_frame()
+        frame["run_purpose"] = "research_benchmark"
+        frame["benchmark_role"] = "main"
+        frame["implementation_type"] = "source_aligned_port"
+        frame["uses_corruption_labels"] = False
+        frame["final_window_size"] = 3
+        frame["evaluation_corruption"] = "clean"
+        frame.loc[frame["seed"] == 1, "run_status"] = "failed"
+        with tempfile.TemporaryDirectory() as directory:
+            outputs = write_reporting_outputs(
+                frame,
+                Path(directory),
+                strict=False,
+                expected_seeds=[0, 1],
+            )
+            research = pd.read_csv(outputs["research_summary"])
+
+        self.assertEqual(set(research["seed"]), {0, 1})
+        self.assertEqual(
+            set(research["status"]), {"cohort_incomplete", "failed"}
+        )
+        self.assertTrue(research["mean"].isna().all())
+        self.assertTrue(research["std"].isna().all())
+        self.assertTrue(
+            research.loc[research["seed"] == 1, "seed_score"].isna().all()
+        )
+
+    def test_research_summary_requires_common_interval_and_clean_evaluation(self):
+        frame = evaluation_frame(seeds=(0,))
+        frame["run_purpose"] = "research_benchmark"
+        frame["benchmark_role"] = "main"
+        frame["evaluation_corruption"] = "clean"
+        mixed = frame.copy()
+        mixed["algorithm"] = "riql_naive"
+        mixed["run_dir"] = "/tmp/riql_naive_seed_0"
+        mixed["eval_period"] = 5_000
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                ReportingValidationError, "evaluation intervals"
+            ):
+                write_reporting_outputs(
+                    pd.concat([frame, mixed], ignore_index=True),
+                    Path(directory),
+                    strict=False,
+                    expected_seeds=[0],
+                )
+
+        frame["evaluation_corruption"] = "random"
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                ReportingValidationError, "require clean evaluation"
+            ):
+                write_reporting_outputs(
+                    frame,
+                    Path(directory),
+                    strict=False,
+                    expected_seeds=[0],
+                )
 
 
 if __name__ == "__main__":

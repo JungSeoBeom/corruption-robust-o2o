@@ -1,342 +1,253 @@
-schema_version: 3
+schema_version: 4
 audit_date: "2026-08-21"
 status_note: >-
-  This manifest records source provenance and conservative implementation
-  status. The custom research_benchmark path does not claim exact upstream
-  reproduction and does not require parity or certificate evidence. Strict
-  final_benchmark eligibility remains controlled by executable evidence and
-  BASELINE_REPRODUCTION_REGISTRY, not by an implementation-profile name or a
-  hand-edited boolean. Documentation never grants eligibility.
+  This manifest describes the executable custom research benchmark. It records
+  source and task scope honestly, but does not claim bitwise parity or official
+  paper-budget reproduction. Documentation does not override executable config,
+  manifests, or completed-run evidence.
+
 research_benchmark_contract:
   run_purpose: research_benchmark
-  main_baselines: [rpex, riql_naive, wsrl]
-  optional_adapted_baselines: [cal_ql_locomotion_adaptation]
-  optional_approximation_baselines: [pqe_shared_actor_approx]
+  suite_profile: research_benchmark
+  main_baselines:
+    - rpex
+    - riql_naive
+    - wsrl
+    - cal_ql
+    - pessimistic_q_ensemble
+  main_baseline_count: 5
+  canonical_new_run_names_only: true
+  historical_result_aliases:
+    cal_ql_locomotion_adaptation: cal_ql
+    pqe_shared_actor_approx: pessimistic_q_ensemble
   corruption_application_contract: replay_transition_poisoning
   default_offline_corruption_rate: 0.3
   default_online_corruption_rate: 0.5
-  default_epsilon: 1.0
-  clean_deterministic_evaluation: true
-  default_final_evaluation_window: 3
-  parity_certificate_required: false
-  official_paper_reproduction: false
-benchmark_status:
-  complete_five_baseline_final: NOT_READY
-  rpex_riql_eligible_subset: []
-  rpex_riql_eligible_subset_status: NOT_READY
-  five_baseline_status: NOT_READY
-  random_corruption_status: NOT_READY
-  adversarial_corruption_status: EXCLUDED
-  save_resume_status: NOT_READY
-  strict_environment_status: NOT_READY
-  final_benchmark_status: NOT_READY
-  strict_final_algorithms: []
-  launch_condition: >-
-    No final launch is authorized. Eligibility requires validated external
-    executable receipts for learner, condition, RNG/evaluation, save/resume,
-    reporting, and strict Linux environment parity, all bound to the exact
-    clean repository state and pinned upstream/runtime artifacts.
-strict_execution_contract:
-  run_purpose: final_benchmark
-  exact_seed_set: [0, 1, 2, 3, 4]
-  offline_updates: 2000001
-  requested_online_steps: 1000001
-  environment_protocol: rpex_d4rl_v2_legacy
-  audit_gate_required: true
-  clean_repository_required: true
-  allow_extension: false
-  strict_random_conditions:
-    - random_observations
-    - random_actions
-    - random_rewards
-    - random_dynamics
-  strict_adversarial_conditions: []
-diagnostic_contract:
-  run_purpose: diagnostic
-  default_offline_updates: 500000
-  default_online_steps: 500000
-  publication_eligible: false
-  random_suite_conditions:
-    - clean
-    - random_observations
-    - random_actions
-    - random_rewards
-    - random_dynamics
-  clean_status: benchmark_transfer_not_auto_certified
-paper_reproduction_contract:
-  run_purpose_status: reserved_and_rejected
-  reason: >-
-    No baseline currently has a certified paper-specific task, seed, budget,
-    environment, learner, corruption, and reporting contract.
-  summary_filename_semantics: >-
-    paper_reproduction_summary.csv contains only verified rows with
-    paper_reproduction_eligible=true. Current source_aligned_port rows are
-    excluded and an empty file is intentional.
-save_resume_verification:
-  established_scope: >-
-    RIQL-naive with random observation corruption in the bounded
-    common_budget_diagnostic preflight smoke only, resumed from an offline
-    checkpoint. Online-checkpoint restore and full saved replay/RNG-state
-    equality are not exercised.
-  online_checkpoint_resume_exercised: false
-  full_resume_state_compared: false
-  full_baseline_condition_coverage: false
-  executable_certificate_present: false
-  status: diagnostic_smoke_only_blocking_strict_gate
-required_external_receipts:
-  validation_contract: >-
-    Each receipt must bind the repository commit and clean worktree, pinned
-    upstream commit, fixture/dataset/checkpoint hashes, runtime and platform,
-    exact command, return code, and timestamp. Missing, malformed, stale, dirty,
-    source-mismatched, or runtime-mismatched receipts fail closed.
-  rpex_end_to_end_learner_parity: missing
-  riql_naive_end_to_end_learner_parity: missing
-  rpex_online_constructor_rng_parity: missing
-  rpex_evaluation_environment_rng_parity: missing
-  random_corruption_strict_runtime_v2: missing
-  adversarial_end_to_end_wrapper: missing
-  complete_save_resume_matrix: missing
-  strict_linux_environment: missing
-  wsrl_fixed_batch_and_reporting: missing
-  missing_upstream_fixture_artifacts:
-    - tests/fixtures/rpex_riql_offline_update_v1.json
-    - tests/fixtures/rpex_online_transition_v1.json
-    - tests/fixtures/rpex_online_rng_trajectory_v1.json
-    - tests/fixtures/rpex_evaluation_schedule_v1.json
-    - tests/fixtures/rpex_reporting_v1.json
-    - tests/fixtures/rpex_riql_save_resume_v1.json
-fixture_inventory:
-  rpex_random_corruption_v1:
-    status: diagnostic_runtime_mismatch
-    strict_authority: false
-    generated_with: "NumPy 2.2.6 / PyTorch 2.13.0"
-    strict_runtime: "NumPy 1.23.5 / PyTorch 2.5.1"
-  rpex_adversarial_core_v1:
-    status: diagnostic_optimizer_core_only_runtime_mismatch
-    strict_authority: false
-    scope: hopper_observations_optimizer_core_only
-  required_random_v2:
-    path: tests/fixtures/rpex_random_corruption_v2.json
-    status: missing
-  required_adversarial_offline_v2:
-    path: tests/fixtures/rpex_adversarial_observation_offline_v2.json
-    status: missing
-  required_adversarial_online_v2:
-    path: tests/fixtures/rpex_adversarial_observation_online_v2.json
-    status: missing
-baselines:
-  rpex_riql:
-    paper_title: "RPEX: Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption"
-    algorithm_name: [RPEX, RIQL-naive]
-    upstream_repository: "https://github.com/felix-thu/RPEX"
-    upstream_commit: "35da71ee5151b6179d21b9a2b4ce1b6408aedd04"
-    upstream_files:
-      - pex/networks/policy.py
-      - pex/algorithms/riql.py
-      - pex/algorithms/rpex.py
-      - pex/algorithms/aligniql.py
-      - RIQL_TRAIN_CONFIG.py
-      - attack.py
-      - attack_offline.py
-      - attack_online.py
-    upstream_functions:
-      - GaussianPolicy.forward
-      - RIQL.update
-      - RIQL.policy_update
-      - RPEX.select_action
-      - epsilon_greedy_sample
-      - sample_batch
-      - ReplayMemory.sample
-      - ALIGNIQL.policy_update
-      - get_config
-      - Attack.optimize_para
-      - Attack.corrupt_rew
-      - corrupt_trans
-    supported_environments: "D4RL MuJoCo locomotion v2 datasets listed by upstream"
-    local_files:
-      - robust_o2o/agents/iql_family.py
-      - robust_o2o/networks.py
-      - robust_o2o/corruption.py
-      - robust_o2o/experiment.py
-    implementation_type: "handwritten PyTorch source-aligned port"
-    reproduction_status: source_aligned_port
-    parity_status: fixed_batch_partial
-    strict_final_eligible: false
-    reporting_rule_verified: true
-    reporting_note: >-
-      The source-backed RPEX final-three rule is verified as a rule, but does
-      not compensate for missing learner and condition parity.
-    strict_eligibility_scope: >-
-      Excluded until an official adapter or upstream-executed end-to-end learner
-      certificate establishes parity. Source alignment and partial fixtures are
-      insufficient.
-    implementation_status: >-
-      Source-aligned policy/loss/config-table implementation with explicit
-      paper/code conflict profiles. The official profile uses AWR for every
-      target, source-matched offline/online replay samplers, fresh online Adam
-      optimizers without the offline actor scheduler, and literal epsilon-greedy
-      action sampling. It is not a thin wrapper and is not certified by a
-      complete fixed-batch optimizer parity test.
-    condition_status:
-      random_single_target: upstream_protocol_row_uncertified
-      adversarial_observations:
-        hopper-medium-replay-v2: optimizer_core_v1_diagnostic_only
-        halfcheetah-medium-replay-v2: paper_condition_fixture_unverified_diagnostic_only
-        walker2d-medium-replay-v2: paper_condition_fixture_unverified_diagnostic_only
-      adversarial_actions: paper_condition_fixture_unverified_diagnostic_only
-      adversarial_rewards: paper_condition_fixture_unverified_diagnostic_only
-      adversarial_dynamics: paper_condition_fixture_unverified_diagnostic_only
-      clean: benchmark_transfer
-      mixed: unsupported_or_diagnostic
-    known_paper_code_conflicts:
-      - "official code fine-tunes from online replay only; paper describes offline/online replay mixing"
-      - "official code evaluates epsilon-greedy policy switching; paper describes greedy highest-weight selection"
-      - "official code corrupts the stored transition after env.step; sensor/actuator semantics require pre-action corruption"
-    local_divergences:
-      - "500k/500k is labelled common-budget diagnostic, never paper reproduction"
-      - "clean and mixed have no RIQL_TRAIN_CONFIG.py row and are explicit extensions or unsupported"
-      - "The pinned public code has no mixed-corruption implementation/config; rpex_paper_mixed therefore fails instead of guessing"
-      - "The adversarial v1 fixture checks only the observation-target optimizer core and certifies no strict condition"
-    remaining_differences:
-      - "Handwritten unified learner/controller rather than a thin wrapper around the pinned source"
-      - "No end-to-end fixed-batch optimizer parity certificate for the complete learner"
-      - "Online optimizer state is reset, but the complete fresh-process constructor RNG consumption order is not reproduced"
-      - "Action-level epsilon-greedy sampling is matched, but the separate local evaluation environment and per-episode reset seed schedule differ from upstream"
-      - "The adversarial observation fixture is tied to the Hopper EDAC checkpoint and cannot certify HalfCheetah or Walker2d"
-      - "v1 fixtures were generated with NumPy/PyTorch versions different from the pinned strict runtime; required strict-runtime v2 receipts are missing"
-      - "Clean/mixed RIQL rows are explicit task extensions, not upstream rows"
-      - "Save/resume equivalence is not yet covered for every strict baseline/condition"
-    attacker_checkpoints:
-      halfcheetah-medium-replay-v2: "sha256:7334ff2b658e95423ca520e258a15ebb6d32ac044cbb3bde27b352bb41e59beb"
-      hopper-medium-replay-v2: "sha256:f5c558003cfd3814c4ea6cff4ce5319b61a8e3dc9013cf208c29e37e368680bd"
-      walker2d-medium-replay-v2: "sha256:8028210fde88f2950115613b37df991358f6cb322f6ba06911662c99cd6d5852"
+  default_corruption_range: 1.0
+  clean_evaluation_environment: true
+  common_final_evaluation_window: 3
+  common_interaction_budget: true
+  compute_matched: false
+  note: >-
+    Cal-QL is a frozen locomotion adaptation and PQE is a v0-to-v2 port, but
+    both remain main comparison algorithms. PQE's approximately fivefold
+    offline gradient compute is recorded rather than used to exclude it.
 
-  wsrl:
-    paper_title: "Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data"
-    algorithm_name: WSRL
-    upstream_repository: "https://github.com/zhouzypaul/wsrl"
-    upstream_commit: "ad4dc1248a138bc15d6e053f2d1dba1b8cfbaca2"
-    upstream_files:
-      - experiments/configs/train_config.py
-      - experiments/configs/wsrl_config.py
-      - experiments/scripts/locomotion/launch_cql_finetune.sh
-      - experiments/scripts/locomotion/launch_wsrl_finetune.sh
-      - wsrl/agents/sac.py
-      - wsrl/agents/cql.py
-      - wsrl/networks/mlp.py
-    upstream_functions:
-      - SACAgent.update_high_utd
-      - SACAgent.critic_loss_fn
-      - SACAgent.policy_loss_fn
-      - SACAgent.temperature_loss_fn
-      - SACAgent.create
-      - CQLAgent._get_cql_q_diff
-      - LagrangeMultiplier.__call__
-      - MLP.__call__
-    supported_environments: "AntMaze, Adroit, Kitchen, and D4RL MuJoCo locomotion"
-    local_files:
-      - robust_o2o/agents/sac_family.py
-      - robust_o2o/networks.py
-      - robust_o2o/cql.py
-      - robust_o2o/experiment.py
-    implementation_type: framework_port
+research_readiness_contract:
+  config_ready_checks:
+    - exactly_five_canonical_main_baselines
+    - calql_online_calibration_enabled
+    - calql_two_by_256_network
+    - calql_bc_warmup_zero
+    - calql_online_cql_weight_five
+    - pqe_five_independent_actors
+    - pqe_five_independent_twin_critic_pairs
+    - pqe_no_shared_parameter_storage
+    - pqe_balanced_priority_replay
+    - pqe_five_checkpoint_generation_or_loading_plan
+    - wsrl_protocol_invariants
+    - riql_positive_online_actor_learning_rate
+    - selected_adversarial_target_and_checkpoint_valid
+    - clean_evaluation
+    - collision_free_output_path
+  completed_run_evidence:
+    - calql_completed_online_trajectory_count_positive
+    - calql_online_mc_return_valid_fraction_one
+    - calql_online_gradient_updates_positive
+    - five_content_distinct_pqe_member_checkpoint_files_and_hashes
+  missing_runtime_evidence_status: PENDING
+  pending_is_not_pass: true
+  excluded_gates:
+    - upstream_rng_trajectory
+    - same_seed_same_corruption_mask
+    - bitwise_parameter_equality
+    - cross_framework_numerical_parity
+    - fixed_batch_parity_certificate
+    - golden_fixture_certificate
+    - upstream_receipt_or_audit_certificate
+    - official_paper_step_budget
+    - fixed_seed_cohort
+
+reporting_contract:
+  phase: online
+  evaluation_environment: clean
+  per_seed_statistic: mean_last_k_evaluations
+  default_k: 3
+  cross_seed_statistic: population_mean_and_std
+  prohibited_selection:
+    - best_checkpoint
+    - best_evaluation
+    - best_ensemble_member
+    - silent_failed_seed_exclusion
+    - silent_nonfinite_seed_exclusion
+    - partial_run_as_completed
+  calql_and_pqe_in_main_summary: true
+
+baselines:
+  rpex:
+    display_name: RPEX
     benchmark_role: main
     main_table_eligible: true
-    reproduction_status: framework_port_unverified
-    parity_status: fixed_batch_numerical_parity_missing
-    strict_final_eligible: false
-    reporting_rule_verified: false
-    strict_eligibility_scope: >-
-      Excluded until an upstream-exported fixed-batch test verifies TD target,
-      CQL penalty, actor loss, temperature loss, target update, and optimizer
-      parameter deltas.
-    implementation_status: >-
-      Source-aligned locomotion structure (2x256 LayerNorm, final-hidden scale
-      1e-2, REDQ-10/2, CQL subset, and high UTD) without cross-framework
-      numerical parity certification.
-    condition_status:
-      clean: official_clean_condition
-      rpex_corruption: benchmark_transfer
-    known_paper_code_conflicts: []
-    local_divergences:
-      - "PyTorch port; canonical metadata records upstream JAX/Flax commit"
-      - "common-budget 500k pretraining is separated from upstream 250k recipe"
-      - "method profile preserves actor/critic/temperature LR 1e-4/3e-4/1e-4, resolved target entropy -action_dim, softplus Geq temperature multiplier, and backup_entropy=False"
-    remaining_differences:
-      - "PyTorch port rather than upstream JAX/Flax"
-      - "No upstream-exported fixed-batch or optimizer-step parity fixture"
-
-  cal_ql_locomotion_adaptation:
-    paper_title: "Cal-QL: Calibrated Offline RL Pre-Training for Efficient Online Fine-Tuning"
-    algorithm_name: Cal-QL locomotion adaptation
-    upstream_repository: "https://github.com/nakamotoo/Cal-QL"
-    upstream_commit: "ac6eafec22e8d60836573e1f488c7f626ce8a77e"
-    upstream_files:
-      - JaxCQL/conservative_sac.py
-      - JaxCQL/conservative_sac_main.py
-      - scripts/run_antmaze.sh
-      - scripts/run_adroit.sh
-    upstream_functions:
-      - ConservativeSAC.train
-      - ConservativeSAC._get_policy_actions
-      - ConservativeSAC._get_tensor_values
-    supported_environments: "Official release recipes: AntMaze and Adroit"
+    implementation_type: source_aligned_port
+    task_scope: d4rl_locomotion_v2
+    upstream_repository: "https://github.com/felix-thu/RPEX"
+    upstream_commit: "35da71ee5151b6179d21b9a2b4ce1b6408aedd04"
     local_files:
-      - robust_o2o/agents/calql.py
-      - robust_o2o/cql.py
-      - robust_o2o/config.py
-    implementation_type: task_adaptation
-    benchmark_role: optional_adapted
-    main_table_eligible: false
-    reproduction_status: task_port
-    parity_status: unsupported_official_task
-    strict_final_eligible: false
-    strict_eligibility_scope: "Excluded from strict locomotion runs; diagnostic only"
-    reporting_rule_verified: false
-    implementation_status: "D4RL locomotion task port; non-publication diagnostic"
-    condition_status:
-      locomotion: non_publication_diagnostic
-    known_paper_code_conflicts: []
-    local_divergences:
-      - "Hopper/HalfCheetah/Walker2d are always labelled d4rl_locomotion_port/task_port"
-      - "research_benchmark rejects oracle_exclude_corrupted and never passes corruption labels to the learner"
-    remaining_differences:
-      - "D4RL locomotion is outside the official task recipes"
+      - robust_o2o/agents/iql_family.py
+      - robust_o2o/experiment.py
+    online_update_order: before_env_step_and_replay_insert
+    action_execution: official_unsquashed_unclipped
+    primary_evaluation: method_faithful_epsilon_q_switching
+    secondary_evaluation: deterministic_diagnostic
 
-  pqe_shared_actor_approx:
-    paper_title: "Offline-to-Online Reinforcement Learning via Balanced Replay and Pessimistic Q-Ensemble"
-    algorithm_name: PQE shared-actor approximation
-    upstream_repository: "https://github.com/shlee94/Off2OnRL"
-    upstream_commit: "6f298fa9ef040d725067d0f2775022bd2900d635"
-    upstream_files:
-      - rlkit/examples/ours.py
-      - rlkit/rlkit/torch/sac/ours.py
-      - rlkit/rlkit/core/batch_rl_algorithm.py
-      - rlkit/rlkit/data_management/prioritized_replay_buffer.py
-    upstream_functions:
-      - experiment
-      - OursTrainer.compute_loss
-      - TorchOurRLAlgorithm._train
-      - PriorityReplayBuffer.random_batch
-    supported_environments: "D4RL MuJoCo v0 recipes in the public release"
+  riql_naive:
+    display_name: RIQL-naive
+    benchmark_role: main
+    main_table_eligible: true
+    implementation_type: source_aligned_port
+    task_scope: d4rl_locomotion_v2
+    upstream_repository: "https://github.com/felix-thu/RPEX"
+    upstream_commit: "35da71ee5151b6179d21b9a2b4ce1b6408aedd04"
+    local_files:
+      - robust_o2o/agents/iql_family.py
+      - robust_o2o/experiment.py
+    online_update_order: before_env_step_and_replay_insert
+    action_execution: official_unsquashed_unclipped
+    online_optimizer_transition:
+      actor: fresh_adam_positive_lr
+      critic: fresh_adam_positive_lr
+      value: fresh_adam_positive_lr
+      actor_scheduler: disabled_online
+
+  wsrl:
+    display_name: WSRL
+    benchmark_role: main
+    main_table_eligible: true
+    implementation_type: framework_port
+    task_scope: d4rl_locomotion_v2
+    upstream_repository: "https://github.com/zhouzypaul/wsrl"
+    upstream_commit: "ad4dc1248a138bc15d6e053f2d1dba1b8cfbaca2"
     local_files:
       - robust_o2o/agents/sac_family.py
+      - robust_o2o/cql.py
+      - robust_o2o/experiment.py
+    protocol:
+      offline_pretrainer: cql_redq
+      critic_count: 10
+      target_critic_subset: 2
+      critic_utd: 4
+      frozen_warmup_steps: 5000
+      online_replay: online_only
+      offline_data_retained_online: false
+      actor_lr: 0.0001
+      critic_lr: 0.0003
+      temperature_lr: 0.0001
+      backup_entropy: false
+
+  cal_ql:
+    display_name: Cal-QL (D4RL locomotion adaptation)
+    benchmark_role: main
+    main_table_eligible: true
+    implementation_type: source_aligned_locomotion_adaptation
+    task_scope: d4rl_locomotion_adaptation
+    official_locomotion_recipe: false
+    upstream_repository: "https://github.com/nakamotoo/Cal-QL"
+    upstream_commit: "ac6eafec22e8d60836573e1f488c7f626ce8a77e"
+    upstream_official_recipes: [antmaze, adroit]
+    benchmark_tasks:
+      - hopper-medium-replay-v2
+      - halfcheetah-medium-replay-v2
+      - walker2d-medium-replay-v2
+    local_files:
+      - robust_o2o/agents/calql.py
+      - robust_o2o/calql_online.py
+      - robust_o2o/experiment.py
+    frozen_protocol:
+      hidden_layers: 2
+      hidden_width: 256
+      orthogonal_initialization: true
+      actor_lr: 0.0001
+      critic_lr: 0.0003
+      temperature_lr: 0.0001
+      target_update_rate: 0.005
+      batch_size: 256
+      target_entropy: negative_action_dim
+      actor_loss: sac_from_first_update
+      bc_warmup_steps: 0
+      calibration_offline: true
+      calibration_online: true
+      calibration_proposals: [current_policy_actions, next_policy_actions]
+      cql_sampled_actions: 10
+      cql_temperature: 1.0
+      cql_importance_sampling: true
+      cql_max_target_backup: true
+      cql_backup_entropy: false
+      cql_alpha_offline: 5.0
+      cql_alpha_online: 5.0
+      offline_mc_return_source: post_corruption
+      online_mc_return_source: completed_post_corruption_trajectory
+      pending_episode_fake_return_forbidden: true
+      replay_mixture: offline_size_over_offline_plus_completed_online_size
+      update_schedule: completed_trajectory_length_times_utd
+
+  pessimistic_q_ensemble:
+    display_name: Pessimistic Q-Ensemble (D4RL-v2 port)
+    benchmark_role: main
+    main_table_eligible: true
+    implementation_type: source_aligned_d4rl_v2_port
+    task_scope: d4rl_v2_port
+    upstream_repository: "https://github.com/shlee94/Off2OnRL"
+    upstream_commit: "6f298fa9ef040d725067d0f2775022bd2900d635"
+    upstream_task_version: v0
+    benchmark_task_version: v2
+    offline_compute_multiplier: 5
+    interaction_budget_matched: true
+    compute_budget_matched: false
+    local_files:
+      - robust_o2o/agents/pessimistic_q_ensemble.py
       - robust_o2o/replay.py
-    implementation_type: approximation
-    benchmark_role: optional_diagnostic
-    main_table_eligible: false
-    reproduction_status: approximation
-    parity_status: official_independent_policy_ensemble_missing
-    strict_final_eligible: false
-    strict_eligibility_scope: "Excluded from strict runs; diagnostic only"
-    reporting_rule_verified: false
-    implementation_status: "pqe_shared_actor_approx only; strict final fail-fast"
-    condition_status:
-      all_local_conditions: diagnostic_extension
-    known_paper_code_conflicts: []
-    local_divergences:
-      - "Current local actor/critic topology is not the upstream N=5 checkpoint-loaded policy ensemble"
-      - "Results are experimental_approximation/approximation and cannot be named PQE reference"
-    remaining_differences:
-      - "No N=5 independently pretrained policy/twin-critic members"
-      - "No upstream-equivalent policy moment-matching implementation"
+      - robust_o2o/experiment.py
+    frozen_protocol:
+      ensemble_size: 5
+      member_seed_rule: base_seed_plus_four_times_member_index
+      actors_independent: true
+      twin_critic_pairs_independent: true
+      target_critic_pairs_independent: true
+      shared_actor: false
+      shared_parameter_storage: false
+      member_pretrainer: plain_cql
+      member_offline_artifact: same_immutable_corrupted_artifact
+      member_checkpoint_count: 5
+      duplicate_checkpoint_content_forbidden: true
+      online_actor_loss: ensemble_mean_of_member_min_twin_q
+      target_update_rate: 0.005
+      actor_lr: 0.0003
+      critic_lr: 0.0003
+      temperature_lr: 0.0003
+      cql_online: false
+      deployed_policy: moment_matched_pre_tanh_gaussian
+      deterministic_evaluation: tanh_of_average_pre_tanh_mean
+      best_member_selection: false
+      replay: balanced_density_ratio_priority
+      density_temperature: 5.0
+      priority_clip: [0.001, 1000.0]
+      initial_online_fraction: 0.75
+      first_epoch_multiplier: 5
+      first_online_block_steps: 1000
+      online_buffer_size: 250000
+      weight_batch_size: 256
+
+remaining_limitations:
+  - >-
+    Cal-QL is a frozen source-aligned locomotion adaptation because the pinned
+    release does not publish an official locomotion recipe.
+  - >-
+    Pessimistic Q-Ensemble ports a public D4RL-v0 method to the benchmark's
+    common D4RL-v2 artifact; it must not be described as official v0 reproduction.
+  - >-
+    PQE performs approximately five times the offline gradient compute of a
+    single-agent baseline. The benchmark equalizes interaction budgets, not
+    wall-clock time or total gradient FLOPs.
+  - >-
+    Long D4RL/MuJoCo experiments are runtime evidence. If they have not been
+    executed, readiness reports them as PENDING rather than PASS.

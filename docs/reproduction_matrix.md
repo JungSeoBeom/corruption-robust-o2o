@@ -1,159 +1,142 @@
-# Reproduction matrix
+# Corruption-robust O2O reproduction matrix
 
 Audit basis: the pinned public repositories below and the local implementation,
-reviewed on 2026-08-21. An implementation-profile name or a unit test is not an
-end-to-end parity certificate.
+reviewed on 2026-08-21. This document describes the executable custom research
+benchmark. It does not claim bitwise or paper-budget reproduction.
 
-## Custom research benchmark contract
+## Five-main-baseline contract
 
-The separate `run_purpose=research_benchmark` path is not an exact reproduction
-claim and deliberately does not consume parity receipts or certificates. Its
-main table contains only `rpex` (`source_aligned_port`), `riql_naive`
-(`source_aligned_port`), and `wsrl` (`framework_port`). It permits explicit
-offline/online budgets, seeds, evaluation interval, episode count, and final
-window size.
+`run_purpose=research_benchmark` contains exactly these five main baselines:
 
-`cal_ql_locomotion_adaptation` is an `optional_adapted` task adaptation because
-the pinned Cal-QL release does not publish a locomotion recipe.
-`pqe_shared_actor_approx` is an `optional_diagnostic` approximation and must not
-be reported as the independent-policy Pessimistic Q-Ensemble. Both are excluded
-from `research_summary.csv`.
+```text
+rpex
+riql_naive
+wsrl
+cal_ql
+pessimistic_q_ensemble
+```
 
-All research main baselines consume the same cached offline corruption artifact
-and use replay-transition poisoning: online policies observe the clean state,
-the environment receives the clean policy action, and only the selected field
-of the transition stored in replay is modified. Evaluation uses a separate,
-clean environment and deterministic actions. The common final statistic first
-averages each seed's last `K` evaluations (default `K=3`), then computes the
-mean and population standard deviation across seed-level scores.
+Every method consumes the same condition-specific cached offline corruption
+artifact. Online corruption follows replay-transition poisoning: the clean
+state selects the action, that action is sent to the environment, and the
+selected field is modified only in the transition written to learner replay.
+Evaluation always uses a separate clean environment. The common result first
+averages each seed's last `K` clean evaluations (default `K=3`), then reports
+mean and population standard deviation across seed-level values.
 
-**Final benchmark status: NOT READY. Strict-final algorithm set: empty.** No
-current `run_55` learner is an `exact_upstream_port`,
-`official_adapter_verified`, or `end_to_end_verified` implementation. In
-particular, RPEX and RIQL-naive remain handwritten `source_aligned_port`s with
-only partial fixed-batch evidence; they are not strict-eligible. The audit must
-therefore report the RPEX/RIQL eligible subset, the five-baseline suite, random
-corruption, adversarial corruption, save/resume, strict environment, and the
-final benchmark as separate fail-closed decisions.
+Cal-QL and Pessimistic Q-Ensemble are main-table algorithms. Their qualified
+implementation scope is provenance, not a reason to omit them. Historical
+manifest values `cal_ql_locomotion_adaptation` and `pqe_shared_actor_approx`
+are read-only aliases and cannot be used for a new run.
 
-| Algorithm | Pinned source | Local implementation | Learner parity | Reporting rule | Strict inclusion |
-|---|---|---|---|---|---|
-| RPEX | [`felix-thu/RPEX`](https://github.com/felix-thu/RPEX) `35da71ee5151b6179d21b9a2b4ce1b6408aedd04` | Handwritten PyTorch `source_aligned_port` | `fixed_batch_partial`; no upstream-executed end-to-end learner/optimizer certificate | RPEX final-three rule is source-backed | No |
-| RIQL-naive | RPEX-vendored RIQL at the same pinned commit; original [`YangRui2015/RIQL`](https://github.com/YangRui2015/RIQL) is provenance only | Handwritten PyTorch `source_aligned_port` | `fixed_batch_partial`; no upstream-executed end-to-end learner/optimizer certificate | RPEX final-three rule is source-backed | No |
-| WSRL | [`zhouzypaul/wsrl`](https://github.com/zhouzypaul/wsrl) `ad4dc1248a138bc15d6e053f2d1dba1b8cfbaca2` | JAX/Flax-to-PyTorch `framework_port_unverified` | TD/CQL/actor/temperature/target/optimizer-step parity missing | `verified=false`; the local terminal rule is not yet certified by an upstream reporting fixture | No |
-| Cal-QL | [`nakamotoo/Cal-QL`](https://github.com/nakamotoo/Cal-QL) `ac6eafec22e8d60836573e1f488c7f626ce8a77e` | D4RL-locomotion `task_port` | Official recipes cover AntMaze and Adroit, not Hopper/HalfCheetah/Walker2d | Unverified for this unsupported task port | No; diagnostic only |
-| Pessimistic Q-Ensemble | [`shlee94/Off2OnRL`](https://github.com/shlee94/Off2OnRL) `6f298fa9ef040d725067d0f2775022bd2900d635` | `pqe_shared_actor_approx` / `approximation` | Official five independently pretrained actor/twin-critic members and policy moment matching are absent | Unverified for the approximation | No; diagnostic only |
+| Algorithm | Pinned source | Main local implementation | Task/version scope | Important limitation |
+|---|---|---|---|---|
+| RPEX | [`felix-thu/RPEX`](https://github.com/felix-thu/RPEX) `35da71ee5151b6179d21b9a2b4ce1b6408aedd04` | Source-aligned RIQL pretraining plus policy expansion and IPW | D4RL locomotion v2 | Method-faithful evaluation is stochastic; deterministic evaluation is secondary diagnostic output |
+| RIQL-naive | RPEX-vendored RIQL at the same pinned commit | Source-aligned RIQL objective in offline and online phases | D4RL locomotion v2 | Online phase intentionally creates fresh positive-LR actor/critic/value optimizers |
+| WSRL | [`zhouzypaul/wsrl`](https://github.com/zhouzypaul/wsrl) `ad4dc1248a138bc15d6e053f2d1dba1b8cfbaca2` | PyTorch framework port of CQL-REDQ pretraining, frozen warmup, and online SAC | D4RL locomotion v2 | Cross-framework numerical equality is not claimed |
+| Cal-QL | [`nakamotoo/Cal-QL`](https://github.com/nakamotoo/Cal-QL) `ac6eafec22e8d60836573e1f488c7f626ce8a77e` | `source_aligned_locomotion_adaptation` | Frozen Hopper/HalfCheetah/Walker2d adaptation on D4RL v2 | Public recipes cover AntMaze/Adroit, so this is not an official locomotion recipe |
+| Pessimistic Q-Ensemble | [`shlee94/Off2OnRL`](https://github.com/shlee94/Off2OnRL) `6f298fa9ef040d725067d0f2775022bd2900d635` | `source_aligned_d4rl_v2_port` with five independent actor/twin-critic members | Public v0 method ported to the common D4RL-v2 artifact | Offline gradient compute is about 5× a single-agent baseline; the suite is interaction-matched, not compute-matched |
 
-## Strict and diagnostic contracts
+## Method-specific executable invariants
 
-- `strict_final_algorithms()` currently returns `()`. Consequently
-  `primary_research_benchmark` and `final_benchmark` must reject before creating
-  a run directory. There is no authorized final-run command while this remains
-  true.
-- A future final run would additionally require a valid audit receipt bound to
-  the exact clean repository commit/worktree, upstream commits, fixture hashes,
-  runtime/platform, command, return code, and timestamp; exact seeds
-  `0,1,2,3,4`; official budgets; pinned datasets/checkpoints; certified
-  conditions; full save/resume coverage; and verified reporting. A passing
-  environment smoke alone is insufficient.
-- `500,000` offline plus `500,000` online is the default
-  `common_budget_diagnostic` schedule. It never becomes publication-eligible by
-  using the legacy environment backend or by completing successfully.
-- `paper_reproduction` is reserved and rejected. No baseline currently has a
-  complete paper-specific task, learner, condition, environment, seed, budget,
-  save/resume, and reporting certificate.
-- `common_benchmark_eligible` is a separate, explicitly non-paper comparison
-  label. It must not be used as evidence for `publication_eligible` or
-  `paper_reproduction_eligible`.
+### RPEX and RIQL-naive
 
-## Condition provenance
+- The research profile uses the pinned unsquashed Gaussian policy behavior.
+  Raw actions are sent to the environment and stored in replay without silent
+  clipping; out-of-bound diagnostics are logged.
+- The online update occurs before `env.step()` and replay insertion, matching
+  the public RPEX loop's use of the existing replay contents.
+- RIQL-naive resets actor, critic, and value Adam state at the online boundary
+  and removes the exhausted offline cosine scheduler. Its actor learning rate
+  remains positive.
+- RPEX's primary clean evaluation uses the public epsilon/Q policy-switching
+  behavior. A deterministic expansion evaluation is logged only as a secondary
+  diagnostic and is never silently substituted for the primary result.
 
-- Diagnostic `--corruption-suite random` means **clean plus four random
-  targets**. The strict random condition set contains only the four actual
-  random targets: observations, actions, rewards, and dynamics.
-- Clean is a `benchmark_transfer` for RPEX/RIQL because pinned
-  `RIQL_TRAIN_CONFIG.py` has no clean row. It is never auto-certified merely
-  because a clean run completed.
-- The v1 random fixture is upstream-derived but was generated under a runtime
-  different from the strict pins. It is diagnostic evidence, not a strict
-  condition certificate. A strict-runtime v2 receipt is missing.
-- The v1 Hopper adversarial-observation fixture covers only the optimizer core.
-  It cannot authorize a whole wrapper, a learner, or any strict adversarial
-  condition. The strict adversarial condition set is therefore empty.
-- HalfCheetah/Walker2d adversarial observations and all adversarial actions,
-  rewards, dynamics, and mixed rows are diagnostic-only. The pinned public
-  adversarial wrapper also contains execution defects; local repairs remain a
-  source-aligned port, not upstream equivalence.
-- Applying the RPEX corruption protocol to WSRL, Cal-QL, or PQE is a
-  `benchmark_transfer`/diagnostic extension, not that baseline's paper
-  condition.
+### WSRL
 
-## Missing executable evidence
+- Offline pretrainer: CQL with the REDQ critic ensemble.
+- Critics/target subset: `10/2`; online critic UTD: `4`.
+- Frozen-policy online collection: `5,000` steps.
+- Online learning uses online replay only; the offline dataset is not retained
+  in the online mixture.
+- Actor/critic/temperature learning rates are `1e-4/3e-4/1e-4`, target entropy
+  is `-action_dim`, and entropy is not added to the Bellman backup.
 
-The following evidence is absent and must stay fail-closed until produced by an
-executable workflow on the exact pinned Linux stack:
+### Cal-QL frozen locomotion adaptation
 
-- RPEX and RIQL-naive end-to-end learner/optimizer parity receipts generated
-  against the pinned upstream implementation;
-- RPEX online-constructor RNG-consumption and evaluation environment/reset/RNG
-  parity receipts;
-- strict-runtime v2 random-corruption fixture/receipt;
-- an end-to-end adversarial-wrapper fixture/receipt (the existing optimizer-core
-  v1 fixture is insufficient);
-- per-baseline × certified-condition online checkpoint save/resume-equivalence
-  receipts covering the complete serialized replay, RNG, optimizer, scheduler,
-  environment, counters, and logs;
-- a strict Linux x86_64 environment receipt with pinned Gym, D4RL, MuJoCo,
-  NumPy, PyTorch, dataset hashes, and attacker-checkpoint hashes;
-- WSRL fixed-batch numerical parity and source-backed reporting receipts.
+- Actor and both Q functions use exactly two 256-unit hidden layers with
+  orthogonal initialization. Actor/Q/temperature learning rates are
+  `1e-4/3e-4/1e-4`; target update rate is `0.005`.
+- The actor uses the SAC policy loss from the first update. BC warmup is `0`.
+- Cal-QL calibration is active offline and online. Current-state and next-state
+  policy-action proposals are both lower-bounded by valid MC returns.
+- CQL uses 10 sampled actions, temperature 1, importance sampling, max-target
+  backup, no backup entropy, and weight 5 in both phases.
+- Offline MC returns are recomputed after corruption. Online transitions stay
+  in a pending episode buffer until terminal or timeout; only complete
+  trajectories enter replay with exact post-corruption return-to-go. No fake
+  zero return is used.
+- Online batch mixing dynamically uses
+  `|D_offline|/(|D_offline|+|D_online-completed|)`. A completed trajectory
+  triggers trajectory-length × UTD updates.
 
-Receipts are external evidence, not hand-edited booleans. Missing, malformed,
-stale, source-mismatched, runtime-mismatched, nonzero-return-code, or dirty-tree
-receipts must be rejected.
+### Pessimistic Q-Ensemble D4RL-v2 port
 
-## Relevant upstream numerical protocol
+- Exactly five members are initialized with seeds `base_seed + 4*i`. Each owns
+  its actor, Q1, Q2, target Q1, target Q2, and optimizer state without shared
+  parameter storage.
+- Every member receives independent CQL pretraining batches from the same
+  immutable corrupted artifact. `stage=both` writes five content-distinct
+  member checkpoints before online fine-tuning; `stage=online` requires five
+  distinct checkpoint paths.
+- The deployed stochastic policy moment-matches the five pre-tanh Gaussians:
+  it averages means and uses
+  `mean(std² + mean²) - mean(mean)²` for variance, then samples and applies
+  `tanh`. Deterministic clean evaluation applies `tanh` to the average mean.
+- Online SAC uses each member's clipped twin-Q target. The actor maximizes the
+  ensemble mean of member-wise minimum Q, with temperature tuning and target
+  update rate `0.005`. CQL is offline-only.
+- Balanced replay uses the source density-ratio loss and priority formula with
+  temperature 5 and clipping `[1e-3, 1e3]`. Source-derived controls are initial
+  online fraction `0.75`, first epoch multiplier `5`, first online block
+  `1,000`, online buffer `250,000`, and weight batch `256`.
+- Clean evaluation always uses the ensemble moment policy; it never selects a
+  best member or best checkpoint.
 
-- RPEX offline corruption uses `np.random.RandomState(seed)`, a Bernoulli mask,
-  and a CPU `torch.Generator().manual_seed(seed)`. Online NumPy corruption
-  restarts from the experiment seed and consumes candidate noise even when the
-  mask is false.
-- RPEX defaults are offline rate `0.3`, online rate `0.5`, and epsilon `1.0`.
-  Online observation/dynamics use unit scale in normalized coordinates,
-  actions use dataset standard deviation, and random online rewards use
-  `30 × U[-1,1]`.
-- Offline replay samples with global-device `torch.randint` with replacement.
-  Online replay uses global Python `random` and `random.sample` without
-  replacement.
-- The pinned attack entry point uses RIQL's AWR policy update for every target.
-  AlignIQL is a diagnostic local option.
-- The upstream online phase creates fresh Adam optimizers and disables the
-  offline actor scheduler. The local implementation follows that intended
-  transition but lacks a certificate for the full constructor RNG trajectory.
-- Upstream epsilon-greedy evaluation consumes a stochastic-policy sample and a
-  CPU Torch mask before replacement by the greedy branch. Local action-level
-  behavior is aligned, but the separate evaluation environment and reset/seed
-  schedule are not certified equivalent.
-- WSRL locomotion's intended structure is CQL pretraining, 250k offline
-  updates, REDQ 10 critics/2-target subset, critic UTD 4, a frozen 5k warmup,
-  online-only replay, 500k online steps, and 20 deterministic evaluations.
+## Corruption and reporting provenance
 
-## Reporting eligibility
+- Diagnostic/research `--corruption-suite random` means clean plus four
+  individual replay-poisoning targets: observations, actions, rewards, and
+  dynamics.
+- Defaults follow RPEX: offline corruption rate `0.3`, online rate `0.5`, and
+  corruption range `1.0`.
+- Cal-QL recomputes MC return-to-go when reward corruption changes the stored
+  reward sequence. Observation, action, and dynamics corruption leave that
+  reward sequence unchanged.
+- The same clean-evaluation schedule, episode count, final window, seed list,
+  environment protocol, and interaction budgets are used for all five methods.
+  PQE's five-member offline compute is reported separately rather than hidden.
+- Failed, partial, or non-finite runs are not promoted to completed seed rows.
+  No best checkpoint, best evaluation, or best ensemble member selection is
+  used in the common summary.
 
-- RPEX/RPEX-vendored RIQL use the source-backed rule: sort online evaluations,
-  average the final three per seed, then compute the mean and population
-  standard deviation across seed scalars. This verified rule does not repair
-  missing learner or condition parity.
-- WSRL reporting remains `verified=false`. A terminal-20-episode local summary
-  and the repository's common final-three metric may be emitted only with their
-  distinct non-paper labels.
-- Cal-QL locomotion and local PQE cannot emit source-primary paper summaries
-  because one is an unsupported task port and the other is an approximation.
-- `paper_reproduction_summary.csv` contains only rows satisfying every
-  fail-closed paper eligibility field. An empty file is the correct current
-  result. Diagnostic outputs belong only in explicitly labeled common or
-  diagnostic summaries.
+## Readiness semantics
 
-The machine-readable sources of truth are
-`BASELINE_REPRODUCTION_REGISTRY`/`REPORTING_RULES` in
-`robust_o2o/fidelity.py`, the condition sets in `run_55_experiment.py`, and the
-receipt validator/audit. Documentation never grants eligibility.
+`scripts/check_research_readiness.py` is the practical preflight for this
+custom benchmark. Its launch conditions are algorithm structure, replay/update
+semantics, clean evaluation, adversarial checkpoint validity when selected,
+and collision-free output paths. It deliberately does not require an upstream
+RNG trajectory, numerical parity certificate, official paper step budget, or
+fixed seed cohort.
+
+Before training, checks that need completed trajectories or files are printed
+as `PENDING`; they are never represented as passing runtime evidence. A clean
+static result is therefore `CONFIG-READY / RUNTIME EVIDENCE PENDING`. Supplying
+`--run-dir` makes the checker validate Cal-QL's completed-trajectory MC-return
+metadata and PQE's five unique member checkpoint files/hashes. A supplied but
+invalid run directory fails closed.
+
+The older strict publication/audit machinery remains a separate historical
+workflow. It does not gate `run_purpose=research_benchmark`, and its receipt or
+parity status must not be confused with this executable custom comparison.

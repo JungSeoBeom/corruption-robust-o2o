@@ -6,7 +6,13 @@ import json
 from pathlib import Path
 from typing import Iterable, Optional
 
-from robust_o2o.fidelity import canonical_json_sha256
+import numpy as np
+
+from robust_o2o.fidelity import (
+    BASELINE_REPRODUCTION_REGISTRY,
+    HISTORICAL_RESULT_ALGORITHM_ALIASES,
+    canonical_json_sha256,
+)
 from robust_o2o.manifest import aggregation_signature
 
 
@@ -316,7 +322,56 @@ def _load_runs(root: Path):
                     }
                 ]
             )
-        frame["algorithm"] = manifest.get("algorithm", config.get("algorithm"))
+        raw_algorithm = str(
+            manifest.get("algorithm", config.get("algorithm"))
+        )
+        algorithm = HISTORICAL_RESULT_ALGORITHM_ALIASES.get(
+            raw_algorithm, raw_algorithm
+        )
+        reproduction_record = BASELINE_REPRODUCTION_REGISTRY.get(algorithm)
+        frame["algorithm"] = algorithm
+        frame["display_name"] = manifest.get(
+            "display_name",
+            (
+                reproduction_record.display_name
+                if reproduction_record is not None
+                else algorithm
+            ),
+        )
+        frame["task_scope"] = manifest.get(
+            "task_scope",
+            (
+                reproduction_record.task_scope
+                if reproduction_record is not None
+                else "unspecified"
+            ),
+        )
+        frame["offline_compute_multiplier"] = float(
+            manifest.get(
+                "offline_compute_multiplier",
+                (
+                    reproduction_record.offline_compute_multiplier
+                    if reproduction_record is not None
+                    else 1.0
+                ),
+            )
+        )
+        declared_ensemble_size = manifest.get("ensemble_size")
+        if declared_ensemble_size is None:
+            declared_ensemble_size = (
+                manifest.get("pqe_member_count")
+                if algorithm == "pessimistic_q_ensemble"
+                else 1
+            )
+        frame["ensemble_size"] = int(declared_ensemble_size or 1)
+        frame["evaluation_policy"] = (
+            completion_manifest.get(
+                "evaluation_policy",
+                manifest.get("evaluation_policy_profile"),
+            )
+            if completion_manifest is not None
+            else manifest.get("evaluation_policy_profile")
+        ) or config.get("evaluation_policy_profile", "legacy_unknown")
         frame["env_name"] = manifest.get("dataset_id", config.get("env_name"))
         frame["corruption"] = manifest.get(
             "corruption", config.get("corruption")
@@ -496,6 +551,23 @@ def _load_runs(root: Path):
                 "final_window_size", config.get("final_window_size", 3)
             )
         )
+        offline_gradient_updates = (
+            completion_manifest.get(
+                "total_offline_gradient_updates",
+                completion_manifest.get("offline_gradient_updates"),
+            )
+            if completion_manifest is not None
+            else manifest.get(
+                "total_offline_gradient_updates",
+                manifest.get("offline_gradient_updates"),
+            )
+        )
+        if offline_gradient_updates is None:
+            offline_gradient_updates = (
+                frame["planned_offline_steps"].iloc[0]
+                * frame["offline_compute_multiplier"].iloc[0]
+            )
+        frame["offline_gradient_updates"] = float(offline_gradient_updates)
         frame["critic_gradient_updates"] = completion_manifest.get(
             "critic_gradient_updates",
             completion_manifest.get("wsrl_online_critic_updates"),
@@ -513,6 +585,34 @@ def _load_runs(root: Path):
             completion_manifest.get("wsrl_online_temperature_updates"),
         ) if completion_manifest is not None else manifest.get(
             "temperature_updates"
+        )
+        frame["online_critic_updates"] = (
+            completion_manifest.get(
+                "online_critic_gradient_updates",
+                completion_manifest.get(
+                    "wsrl_online_critic_updates",
+                    completion_manifest.get("critic_gradient_updates"),
+                ),
+            )
+            if completion_manifest is not None
+            else manifest.get(
+                "online_critic_gradient_updates",
+                manifest.get("critic_gradient_updates"),
+            )
+        )
+        frame["online_actor_updates"] = (
+            completion_manifest.get(
+                "online_actor_gradient_updates",
+                completion_manifest.get(
+                    "wsrl_online_actor_updates",
+                    completion_manifest.get("actor_gradient_updates"),
+                ),
+            )
+            if completion_manifest is not None
+            else manifest.get(
+                "online_actor_gradient_updates",
+                manifest.get("actor_gradient_updates"),
+            )
         )
         frame["configured_utd"] = manifest.get(
             "configured_utd", manifest.get("utd_ratio")
@@ -744,6 +844,20 @@ def plot_aggregate(
         x_label = (
             "Online environment steps" if phase == "online" else "Offline updates"
         )
+    if not frame.empty:
+        plotted_scores = pd.to_numeric(
+            frame["normalized_return_mean"], errors="raise"
+        ).to_numpy(dtype=np.float64)
+        if not np.isfinite(plotted_scores).all():
+            invalid_runs = sorted(
+                frame.loc[
+                    ~np.isfinite(plotted_scores), "run_dir"
+                ].astype(str).unique()
+            )
+            raise RuntimeError(
+                "Completed/selected plot input contains NaN or Inf scores: "
+                + ", ".join(invalid_runs)
+            )
 
     figure, axis = plt.subplots(figsize=(10, 6))
     summary_frames = []
@@ -781,14 +895,13 @@ def plot_aggregate(
         for key, value in zip(group_keys, group):
             summary[key] = value
         summary_frames.append(summary)
-        label = f"{group[0]} [{group[4]}]"
+        display_name = str(group_frame["display_name"].iloc[0])
+        label = f"{display_name} [{group[4]}]"
         if group_frame["suite_profile"].iloc[0] in (
             "common_budget_robustness",
             "common_budget_diagnostic",
         ):
             label += " | COMMON-BUDGET / NOT PAPER REPRO"
-        if group_frame["implementation_fidelity"].iloc[0] == "approximation":
-            label += " | PQE shared-actor approximation"
         if (
             group_frame["adversarial_attack_profile"].iloc[0]
             == "experimental_sign_pgd"

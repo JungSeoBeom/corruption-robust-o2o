@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import itertools
 import math
 from typing import Dict
 
@@ -11,13 +10,18 @@ from torch.distributions import Normal, kl_divergence
 
 from ..cql import importance_sampled_cql
 from ..config import ExperimentConfig
-from ..networks import DensityRatioNetwork, EnsembleQNetwork, TanhGaussianPolicy
+from ..networks import EnsembleQNetwork, TanhGaussianPolicy
 from ..replay import TensorBatch
 from .base import BaseAgent, gradient_norm, soft_update
 
 
 class SACEnsembleAgent(BaseAgent):
-    """Shared implementation for UWMSG, WSRL, RO2O, and Pessimistic Q-Ensemble."""
+    """Shared implementation for UWMSG, WSRL, and RO2O.
+
+    The canonical Pessimistic Q-Ensemble has a dedicated agent with five
+    independent policies and twin critics; it must never enter this
+    shared-actor implementation.
+    """
 
     def __init__(
         self,
@@ -59,30 +63,12 @@ class SACEnsembleAgent(BaseAgent):
             wsrl_profile=wsrl_profile,
         )
         self.target_critic = copy.deepcopy(self.critic).requires_grad_(False)
-        self.critic2 = (
-            EnsembleQNetwork(
-                state_dim,
-                action_dim,
-                config.hidden_dim,
-                max(config.hidden_layers, 3),
-                config.sac_num_critics,
-                layer_norm=False,
-            )
-            if self.variant == "pqe_shared_actor_approx"
-            else None
-        )
-        self.target_critic2 = (
-            copy.deepcopy(self.critic2).requires_grad_(False)
-            if self.critic2 is not None
-            else None
-        )
-        self.density_ratio = (
-            DensityRatioNetwork(
-                state_dim, action_dim, config.hidden_dim, config.hidden_layers
-            )
-            if self.variant == "pqe_shared_actor_approx"
-            else None
-        )
+        # Historical shared-actor PQE execution was removed.  These optional
+        # attributes stay ``None`` only to keep old generic optimizer payloads
+        # readable; no canonical algorithm activates them.
+        self.critic2 = None
+        self.target_critic2 = None
+        self.density_ratio = None
         alpha_parameter_init = (
             math.log(math.expm1(1.0))
             if self.variant == "wsrl"
@@ -98,13 +84,8 @@ class SACEnsembleAgent(BaseAgent):
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(), lr=config.actor_learning_rate
         )
-        critic_parameters = self.critic.parameters()
-        if self.critic2 is not None:
-            critic_parameters = itertools.chain(
-                critic_parameters, self.critic2.parameters()
-            )
         self.critic_optimizer = torch.optim.Adam(
-            critic_parameters, lr=config.critic_learning_rate
+            self.critic.parameters(), lr=config.critic_learning_rate
         )
         self.alpha_optimizer = torch.optim.Adam(
             [self.log_alpha], lr=config.temperature_learning_rate
@@ -140,12 +121,9 @@ class SACEnsembleAgent(BaseAgent):
         ).mean()
 
     def _cql_loss_enabled(self) -> bool:
-        """CQL is an offline pretrainer only for WSRL and the PQE port."""
+        """CQL is an offline pretrainer only for WSRL in this agent family."""
 
-        return (
-            self.variant in ("wsrl", "pqe_shared_actor_approx")
-            and not self.online_phase
-        )
+        return self.variant == "wsrl" and not self.online_phase
 
     def select_action(
         self,

@@ -144,6 +144,34 @@ class AggregateResultsTest(unittest.TestCase):
                 "common_mean_last_3_online_evaluations_per_seed_then_population_mean_std__partial_2_of_3",
             )
 
+    def test_historical_result_algorithm_names_load_as_canonical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._make_run(
+                root, "cal_ql_locomotion_adaptation", 0, 70.0, 2.0
+            )
+            self._make_run(
+                root, "pqe_shared_actor_approx", 0, 60.0, 3.0
+            )
+            frame = load_runs(root)
+        self.assertEqual(
+            set(frame["algorithm"]),
+            {"cal_ql", "pessimistic_q_ensemble"},
+        )
+
+    def test_completed_nan_curve_fails_instead_of_being_silently_dropped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._make_run(root, "rpex", 0, float("nan"), 2.0)
+            with self.assertRaisesRegex(RuntimeError, "NaN or Inf"):
+                plot_aggregate(
+                    root,
+                    root / "comparison.png",
+                    env_name="hopper-medium-replay-v2",
+                    corruption="random",
+                    target="mixed",
+                )
+
     def test_three_comparison_plots_are_written(self):
         with tempfile.TemporaryDirectory() as directory:
             comparison_dir = Path(directory)

@@ -6,6 +6,7 @@ from ..config import ExperimentConfig
 from .base import BaseAgent
 from .calql import CalQLAgent
 from .iql_family import IQLFamilyAgent
+from .pessimistic_q_ensemble import PessimisticQEnsembleAgent
 from .sac_family import SACEnsembleAgent
 
 
@@ -107,17 +108,18 @@ def build_agent(
 ) -> BaseAgent:
     _apply_rpex_riql_defaults(config)
     _apply_uwmsg_defaults(config)
-    if config.algorithm == "pqe_shared_actor_approx" and config.sac_num_critics == 10:
-        config.sac_num_critics = 5
     if config.algorithm in ("rpex", "riql_pex", "riql_naive", "pex"):
         return IQLFamilyAgent(config, state_dim, action_dim, max_action, device)
-    if config.algorithm == "cal_ql_locomotion_adaptation":
+    if config.algorithm == "cal_ql":
         return CalQLAgent(config, state_dim, action_dim, max_action, device)
+    if config.algorithm == "pessimistic_q_ensemble":
+        return PessimisticQEnsembleAgent(
+            config, state_dim, action_dim, max_action, device
+        )
     if config.algorithm in (
         "uwmsg",
         "wsrl",
         "ro2o",
-        "pqe_shared_actor_approx",
     ):
         return SACEnsembleAgent(config, state_dim, action_dim, max_action, device)
     raise ValueError(f"Unsupported algorithm: {config.algorithm}")

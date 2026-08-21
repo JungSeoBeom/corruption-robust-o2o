@@ -63,24 +63,38 @@ RUN_PURPOSES = (
     "final_benchmark",
 )
 
-# The practical custom-budget benchmark deliberately separates methods that
-# can be compared in its main table from task adaptations and approximations.
-# These declarations are the single source of truth used by launchers,
-# manifests, reporting, and the lightweight readiness checker.
-MAIN_BASELINES = ("rpex", "riql_naive", "wsrl")
-OPTIONAL_ADAPTED_BASELINES = ("cal_ql_locomotion_adaptation",)
-OPTIONAL_APPROXIMATION_BASELINES = ("pqe_shared_actor_approx",)
-OPTIONAL_BASELINES = (
-    *OPTIONAL_ADAPTED_BASELINES,
-    *OPTIONAL_APPROXIMATION_BASELINES,
+# Canonical algorithms for new research-benchmark runs.  Cal-QL remains
+# explicitly labelled as a locomotion adaptation and PQE as a D4RL-v2 port;
+# those task-scope qualifications do not make either method optional.
+MAIN_BASELINES = (
+    "rpex",
+    "riql_naive",
+    "wsrl",
+    "cal_ql",
+    "pessimistic_q_ensemble",
 )
-RESEARCH_BASELINES = (*MAIN_BASELINES, *OPTIONAL_BASELINES)
+# Kept as empty imports so older launcher/reporting code fails closed instead
+# of breaking at import time while it migrates to the five-main-baseline
+# contract.
+OPTIONAL_ADAPTED_BASELINES: tuple[str, ...] = ()
+OPTIONAL_APPROXIMATION_BASELINES: tuple[str, ...] = ()
+OPTIONAL_BASELINES: tuple[str, ...] = ()
+RESEARCH_BASELINES = MAIN_BASELINES
+
+# Read-only normalization for manifests produced before the canonical names
+# were introduced.  Launch configuration must not use this mapping: old names
+# are not registry entries and must never appear in a new run directory.
+HISTORICAL_RESULT_ALGORITHM_ALIASES: Mapping[str, str] = {
+    "cal_ql_locomotion_adaptation": "cal_ql",
+    "pqe_shared_actor_approx": "pessimistic_q_ensemble",
+}
 BENCHMARK_ROLES = ("main", "optional_adapted", "optional_diagnostic", "diagnostic")
 
 ONLINE_REPLAY_PROFILES = (
     "official_code_online_only",
     "paper_offline_online_mixture",
     "fixed_offline_online_mixture",
+    "dynamic_offline_online_mixture",
     "balanced_density_replay",
 )
 EVALUATION_POLICY_PROFILES = (
@@ -106,7 +120,13 @@ LEGACY_ACTION_EXECUTION_PROFILE_ALIASES = {
     "environment_clip": "clip_to_action_space",
 }
 POLICY_EXTRACTIONS = ("awr", "align_iql")
-TASK_PROFILES = ("official_supported_task", "d4rl_locomotion_port")
+TASK_PROFILES = (
+    "official_supported_task",
+    "d4rl_locomotion_adaptation",
+    "d4rl_v2_port",
+    # Historical manifest value retained for read compatibility only.
+    "d4rl_locomotion_port",
+)
 ADVERSARIAL_ATTACK_PROFILES = (
     "rpex_official_adam",
     "experimental_sign_pgd",
@@ -132,9 +152,7 @@ UPSTREAM_COMMITS: Mapping[str, str] = {
     "riql_pex": "35da71ee5151b6179d21b9a2b4ce1b6408aedd04",
     "wsrl": "ad4dc1248a138bc15d6e053f2d1dba1b8cfbaca2",
     "cal_ql": "ac6eafec22e8d60836573e1f488c7f626ce8a77e",
-    "cal_ql_locomotion_adaptation": "ac6eafec22e8d60836573e1f488c7f626ce8a77e",
     "pessimistic_q_ensemble": "6f298fa9ef040d725067d0f2775022bd2900d635",
-    "pqe_shared_actor_approx": "6f298fa9ef040d725067d0f2775022bd2900d635",
 }
 
 
@@ -151,6 +169,11 @@ class BaselineReproductionRecord:
     remaining_deviation: str
     benchmark_role: str = "diagnostic"
     main_table_eligible: bool = False
+    display_name: str = ""
+    task_scope: str = "unspecified"
+    upstream_task_version: str | None = None
+    benchmark_task_version: str | None = None
+    offline_compute_multiplier: float = 1.0
 
     def __post_init__(self) -> None:
         if self.benchmark_role not in BENCHMARK_ROLES:
@@ -219,6 +242,10 @@ BASELINE_REPRODUCTION_REGISTRY: Mapping[str, BaselineReproductionRecord] = {
         ),
         benchmark_role="main",
         main_table_eligible=True,
+        display_name="RPEX",
+        task_scope="d4rl_locomotion_v2",
+        upstream_task_version="v2",
+        benchmark_task_version="v2",
     ),
     "riql_naive": BaselineReproductionRecord(
         paper_title="Towards Robust Offline Reinforcement Learning under Diverse Data Corruption",
@@ -235,6 +262,10 @@ BASELINE_REPRODUCTION_REGISTRY: Mapping[str, BaselineReproductionRecord] = {
         ),
         benchmark_role="main",
         main_table_eligible=True,
+        display_name="RIQL-naive",
+        task_scope="d4rl_locomotion_v2",
+        upstream_task_version="v2",
+        benchmark_task_version="v2",
     ),
     "wsrl": BaselineReproductionRecord(
         paper_title="Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data",
@@ -248,32 +279,53 @@ BASELINE_REPRODUCTION_REGISTRY: Mapping[str, BaselineReproductionRecord] = {
         remaining_deviation="optimizer-step parity against pinned JAX/Flax output is unverified",
         benchmark_role="main",
         main_table_eligible=True,
+        display_name="WSRL",
+        task_scope="d4rl_locomotion_v2",
+        upstream_task_version="v2",
+        benchmark_task_version="v2",
     ),
-    "cal_ql_locomotion_adaptation": BaselineReproductionRecord(
+    "cal_ql": BaselineReproductionRecord(
         paper_title="Cal-QL: Calibrated Offline RL Pre-Training for Efficient Online Fine-Tuning",
         upstream_repository="https://github.com/nakamotoo/Cal-QL",
-        upstream_commit=UPSTREAM_COMMITS["cal_ql_locomotion_adaptation"],
+        upstream_commit=UPSTREAM_COMMITS["cal_ql"],
         official_task_support="official release recipes: AntMaze and Adroit",
-        implementation_type="task_adaptation",
+        implementation_type="source_aligned_locomotion_adaptation",
         reproduction_status="task_port",
         parity_status="unverified",
         strict_final_eligible=False,
-        remaining_deviation="Hopper/HalfCheetah/Walker2d recipes are absent upstream",
-        benchmark_role="optional_adapted",
-        main_table_eligible=False,
+        remaining_deviation=(
+            "the frozen Hopper/HalfCheetah/Walker2d configuration is a "
+            "source-aligned adaptation because no official locomotion recipe "
+            "is released upstream"
+        ),
+        benchmark_role="main",
+        main_table_eligible=True,
+        display_name="Cal-QL (D4RL locomotion adaptation)",
+        task_scope="d4rl_locomotion_adaptation",
+        upstream_task_version=None,
+        benchmark_task_version="v2",
     ),
-    "pqe_shared_actor_approx": BaselineReproductionRecord(
+    "pessimistic_q_ensemble": BaselineReproductionRecord(
         paper_title="Offline-to-Online Reinforcement Learning via Balanced Replay and Pessimistic Q-Ensemble",
         upstream_repository="https://github.com/shlee94/Off2OnRL",
-        upstream_commit=UPSTREAM_COMMITS["pqe_shared_actor_approx"],
+        upstream_commit=UPSTREAM_COMMITS["pessimistic_q_ensemble"],
         official_task_support="D4RL MuJoCo v0 recipes in the public release",
-        implementation_type="approximation",
-        reproduction_status="approximation",
+        implementation_type="source_aligned_d4rl_v2_port",
+        reproduction_status="task_port",
         parity_status="unverified",
         strict_final_eligible=False,
-        remaining_deviation="no N=5 independently pretrained actor/twin-critic ensemble",
-        benchmark_role="optional_diagnostic",
-        main_table_eligible=False,
+        remaining_deviation=(
+            "the public v0 method is ported to the common D4RL-v2 transition "
+            "artifact; interaction budgets are matched but offline compute is "
+            "approximately five times a single-agent baseline"
+        ),
+        benchmark_role="main",
+        main_table_eligible=True,
+        display_name="Pessimistic Q-Ensemble (D4RL-v2 port)",
+        task_scope="d4rl_v2_port",
+        upstream_task_version="v0",
+        benchmark_task_version="v2",
+        offline_compute_multiplier=5.0,
     ),
 }
 
@@ -316,7 +368,7 @@ REPORTING_RULES: Mapping[str, ReportingRule] = {
         "zhouzypaul/wsrl finetune.py terminal evaluation",
         False,
     ),
-    "cal_ql_locomotion_adaptation": ReportingRule(
+    "cal_ql": ReportingRule(
         "upstream_reporting_unverified",
         "online",
         1,
@@ -324,12 +376,12 @@ REPORTING_RULES: Mapping[str, ReportingRule] = {
         "nakamotoo/Cal-QL (locomotion unsupported)",
         False,
     ),
-    "pqe_shared_actor_approx": ReportingRule(
+    "pessimistic_q_ensemble": ReportingRule(
         "upstream_reporting_unverified",
         "online",
         1,
         10,
-        "shlee94/Off2OnRL (local implementation is an approximation)",
+        "shlee94/Off2OnRL (D4RL-v2 task port)",
         False,
     ),
 }

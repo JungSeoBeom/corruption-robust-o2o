@@ -452,6 +452,35 @@ def raw_monte_carlo_returns(
     return returns
 
 
+def converted_monte_carlo_returns(
+    dataset: Mapping[str, np.ndarray], discount: float
+) -> np.ndarray:
+    """Return-to-go over the transitions retained by qlearning_dataset.
+
+    With ``terminate_on_end=False`` D4RL drops the timeout row before forming
+    the replay dataset. Cal-QL therefore must not leak the dropped row's reward
+    into the final retained transition's calibration target.
+    """
+
+    if "episode_id" not in dataset:
+        raise KeyError("converted MC returns require episode_id")
+    rewards = np.asarray(dataset["rewards"], dtype=np.float64).reshape(-1)
+    episode_ids = np.asarray(dataset["episode_id"], dtype=np.int64).reshape(-1)
+    if len(rewards) != len(episode_ids):
+        raise ValueError("rewards and episode_id have different lengths")
+    returns = np.empty(len(rewards), dtype=np.float32)
+    running = 0.0
+    next_episode: int | None = None
+    for index in range(len(rewards) - 1, -1, -1):
+        episode = int(episode_ids[index])
+        if next_episode is None or episode != next_episode:
+            running = 0.0
+        running = float(rewards[index]) + discount * running
+        returns[index] = running
+        next_episode = episode
+    return returns
+
+
 def raw_episode_ids(
     raw: Mapping[str, np.ndarray], max_episode_steps: int
 ) -> np.ndarray:
@@ -599,13 +628,12 @@ def load_d4rl_dataset(
         max_episode_steps = _max_episode_steps(env)
         valid_indices = qlearning_valid_indices(raw, max_episode_steps)
         dataset = _index_aware_qlearning_dataset(raw, valid_indices)
-        raw_returns = raw_monte_carlo_returns(raw, discount, max_episode_steps)
-        dataset["mc_returns"] = raw_returns[valid_indices].astype(
-            np.float32, copy=True
-        )
         dataset["episode_id"] = raw_episode_ids(raw, max_episode_steps)[
             valid_indices
         ].astype(np.float32, copy=True)
+        dataset["mc_returns"] = converted_monte_carlo_returns(
+            dataset, discount
+        )
         dataset["mc_calibration_valid"] = np.ones(
             len(valid_indices), dtype=np.float32
         )
@@ -628,11 +656,10 @@ def load_d4rl_dataset(
         key: np.asarray(official[key], dtype=np.float32).copy()
         for key in STANDARD_DATASET_KEYS
     }
-    raw_returns = raw_monte_carlo_returns(raw, discount, max_episode_steps)
-    dataset["mc_returns"] = raw_returns[valid_indices].astype(np.float32, copy=True)
     dataset["episode_id"] = raw_episode_ids(raw, max_episode_steps)[
         valid_indices
     ].astype(np.float32, copy=True)
+    dataset["mc_returns"] = converted_monte_carlo_returns(dataset, discount)
     dataset["mc_calibration_valid"] = np.ones(
         len(valid_indices), dtype=np.float32
     )

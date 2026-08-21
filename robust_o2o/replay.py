@@ -13,6 +13,11 @@ from .environment import Dataset
 TensorBatch = Dict[str, torch.Tensor]
 NUMPY_REPLAY_SAMPLING = "private_numpy_default_rng"
 RPEX_OFFICIAL_REPLAY_SAMPLING = "rpex_official_global_rng"
+# Use a stable, non-finite sentinel for transitions whose episode return is not
+# known.  NaN would also fail Cal-QL's finite-target check, but NaN != NaN makes
+# otherwise exact replay checkpoint/resume comparisons fail.  Negative
+# infinity remains unmistakably invalid without manufacturing a zero return.
+INVALID_MC_RETURN = np.float32(-np.inf)
 
 
 def _tensor_batch(dataset: Dataset, indices: np.ndarray, device: torch.device) -> TensorBatch:
@@ -126,7 +131,12 @@ class ReplayBuffer:
         self.rewards = np.empty(capacity, dtype=np.float32)
         self.next_states = np.empty((capacity, state_dim), dtype=np.float32)
         self.terminals = np.empty(capacity, dtype=np.float32)
-        self.mc_returns = np.zeros(capacity, dtype=np.float32)
+        # A missing online return-to-go is unknown, not zero. Cal-QL samples
+        # only completed trajectories and fails if any non-finite value reaches
+        # its loss.
+        self.mc_returns = np.full(
+            capacity, INVALID_MC_RETURN, dtype=np.float32
+        )
         self.priorities = np.ones(capacity, dtype=np.float64)
         self.position = 0
         self.size = 0
@@ -151,6 +161,7 @@ class ReplayBuffer:
         next_state: np.ndarray,
         terminal: float,
         priority: float = 1.0,
+        mc_return: Optional[float] = None,
     ) -> None:
         index = self.position
         self.states[index] = state
@@ -158,9 +169,54 @@ class ReplayBuffer:
         self.rewards[index] = reward
         self.next_states[index] = next_state
         self.terminals[index] = terminal
+        self.mc_returns[index] = (
+            INVALID_MC_RETURN if mc_return is None else float(mc_return)
+        )
         self.priorities[index] = max(float(priority), 1e-6)
         self.position = (self.position + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
+
+    def add_batch(
+        self,
+        observations: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        next_observations: np.ndarray,
+        terminals: np.ndarray,
+        *,
+        mc_returns: Optional[np.ndarray] = None,
+        priorities: Optional[np.ndarray] = None,
+    ) -> None:
+        """Insert an aligned trajectory/batch without manufacturing targets."""
+
+        count = int(len(rewards))
+        fields = (observations, actions, next_observations, terminals)
+        if any(len(field) != count for field in fields):
+            raise ValueError("ReplayBuffer.add_batch fields have different lengths")
+        if mc_returns is not None and len(mc_returns) != count:
+            raise ValueError("mc_returns length does not match replay batch")
+        if priorities is not None and len(priorities) != count:
+            raise ValueError("priorities length does not match replay batch")
+        for index in range(count):
+            self.add(
+                observations[index],
+                actions[index],
+                float(rewards[index]),
+                next_observations[index],
+                float(terminals[index]),
+                priority=(
+                    1.0 if priorities is None else float(priorities[index])
+                ),
+                mc_return=(
+                    None if mc_returns is None else float(mc_returns[index])
+                ),
+            )
+
+    @property
+    def mc_return_valid_fraction(self) -> float:
+        if self.size == 0:
+            return 0.0
+        return float(np.isfinite(self.mc_returns[: self.size]).mean())
 
     def sample(
         self,
@@ -252,10 +308,15 @@ class ReplayBuffer:
             "rewards",
             "next_states",
             "terminals",
-            "mc_returns",
             "priorities",
         ):
             getattr(self, name)[:size] = np.asarray(state[name])
+        if "mc_returns" in state:
+            self.mc_returns[:size] = np.asarray(state["mc_returns"])
+        else:
+            # Historical non-Cal-QL replays had no trajectory target. Never
+            # manufacture zero as a valid calibration return.
+            self.mc_returns[:size] = INVALID_MC_RETURN
         self.position = int(state["position"])
         self.size = size
         saved_profile = state.get("sampling_profile", NUMPY_REPLAY_SAMPLING)
@@ -346,21 +407,51 @@ def balanced_priority_batch(
     batch_size: int,
     device: torch.device,
 ) -> TensorBatch:
-    """Sample the official Off2OnRL-style combined priority mass."""
+    """Sample proportionally from the logical offline+online priority replay."""
     if online.size == 0:
         raise ValueError("Balanced replay requires at least one online transition")
-    offline_mass = float(np.maximum(offline.priorities, 1e-12).sum())
-    online_mass = float(
-        np.maximum(online.priorities[: online.size], 1e-12).sum()
+    priorities = np.concatenate(
+        (offline.priorities, online.priorities[: online.size])
     )
-    online_fraction = online_mass / (offline_mass + online_mass)
-    online_count = int(round(batch_size * online_fraction))
-    online_count = min(max(online_count, 1), batch_size - 1, online.size)
-    offline_count = batch_size - online_count
-    return concatenate_batches(
-        offline.sample(offline_count, device, prioritized=True),
-        online.sample(online_count, device, prioritized=True),
+    logical_indices = online.rng.choice(
+        len(priorities),
+        size=batch_size,
+        replace=True,
+        p=_safe_probabilities(priorities),
     )
+    offline_mask = logical_indices < offline.size
+    offline_indices = logical_indices[offline_mask]
+    online_indices = logical_indices[~offline_mask] - offline.size
+    batches: list[TensorBatch] = []
+    if len(offline_indices):
+        batch = _tensor_batch(offline.dataset, offline_indices, device)
+        batch["_indices"] = torch.as_tensor(
+            offline_indices, dtype=torch.long, device=device
+        )
+        batch["_source"] = torch.zeros(
+            len(offline_indices), dtype=torch.long, device=device
+        )
+        batches.append(batch)
+    if len(online_indices):
+        raw = {
+            "observations": online.states[online_indices],
+            "actions": online.actions[online_indices],
+            "rewards": online.rewards[online_indices],
+            "next_observations": online.next_states[online_indices],
+            "terminals": online.terminals[online_indices],
+            "mc_returns": online.mc_returns[online_indices],
+        }
+        batch = _tensor_batch(raw, np.arange(len(online_indices)), device)
+        batch["_indices"] = torch.as_tensor(
+            online_indices, dtype=torch.long, device=device
+        )
+        batch["_source"] = torch.ones(
+            len(online_indices), dtype=torch.long, device=device
+        )
+        batches.append(batch)
+    result = concatenate_batches(*batches)
+    assert_no_corruption_labels(result)
+    return result
 
 
 def sample_pqe_update_batches(
@@ -370,18 +461,20 @@ def sample_pqe_update_batches(
     offline_ratio: float,
     device: torch.device,
     prioritized_rl: bool,
+    density_batch_size: Optional[int] = None,
 ) -> tuple[TensorBatch, TensorBatch, TensorBatch]:
     """Route uniform density data separately from the PQE RL replay batch."""
-    if online.size < batch_size:
+    density_batch_size = int(density_batch_size or batch_size)
+    if online.size < density_batch_size:
         raise ValueError(
             f"PQE density replay contains {online.size} transitions; "
-            f"{batch_size} are required"
+            f"{density_batch_size} are required"
         )
     density_offline_batch = offline.sample(
-        batch_size, device, prioritized=False
+        density_batch_size, device, prioritized=False
     )
     density_online_batch = online.sample(
-        batch_size, device, prioritized=False
+        density_batch_size, device, prioritized=False
     )
     if prioritized_rl:
         rl_batch = balanced_priority_batch(offline, online, batch_size, device)

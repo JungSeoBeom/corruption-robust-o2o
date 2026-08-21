@@ -1,23 +1,21 @@
-# Baseline fidelity overhaul report (superseded snapshot)
+# Baseline fidelity overhaul report (historical snapshot, current addendum)
 
 Audit date: 2026-08-21
 
 This report preserves the earlier overhaul history. Its former exactness and
 launch-readiness conclusions are superseded by `docs/reproduction_matrix.md`
-and `BASELINE_REPRODUCTION_REGISTRY`. No long reinforcement-learning run was
-performed. The machine used for the checks was macOS, so strict D4RL-v2 runtime
-success is intentionally not claimed.
+and `BASELINE_REPRODUCTION_REGISTRY`.
 
-Current conservative decision: **FINAL BENCHMARK NOT READY; strict-final
-algorithm set empty**. RPEX and RIQL-naive remain handwritten
-`source_aligned_port`s with `fixed_batch_partial` evidence, not verified
-upstream adapters or end-to-end learner ports. WSRL is an unverified framework
-port and its reporting rule is `verified=false`; Cal-QL locomotion is a task
-port; PQE is an approximation. The random and adversarial v1 fixtures are
-diagnostic/runtime-mismatched, and the latter covers only the Hopper
-observation optimizer core. Required learner, online-constructor/evaluation
-RNG, strict condition, full save/resume, reporting, and Linux receipts are
-missing. The current Mac is diagnostic-only. No final-run command is authorized.
+Current addendum: the custom `research_benchmark` now has five main baselines:
+RPEX, RIQL-naive, WSRL, Cal-QL, and Pessimistic Q-Ensemble. Cal-QL is explicitly
+labelled a frozen D4RL locomotion adaptation. PQE is now a dedicated five-member
+independent-actor/twin-critic D4RL-v2 port; the old shared-actor approximation
+is not executable. Both methods enter the same main research summary. This
+does not promote any port to an official paper reproduction, and it does not
+make the strict publication/final-benchmark certificate gate pass. The local
+macOS Gymnasium protocol remains diagnostic; strict D4RL-v2 runtime success is
+not claimed here. These strict-publication limitations do not block a custom
+`research_benchmark` run.
 
 Condition scope is also fail-closed: diagnostic random is clean plus four
 random targets, while strict random contains only the four actual corruption
@@ -28,15 +26,15 @@ external receipts bound to the exact clean repository state, upstream commits,
 fixture/dataset/checkpoint hashes, runtime/platform, command, return code, and
 timestamp; a boolean or successful local test is insufficient.
 
-## A. Baseline fidelity matrix
+## A. Current baseline fidelity matrix
 
 | Baseline | Upstream commit | Current conservative status | Parity status | Strict locomotion status |
 |---|---|---|---|---|
 | RPEX / RIQL-naive | `felix-thu/RPEX@35da71ee5151b6179d21b9a2b4ce1b6408aedd04` | `source_aligned_port` | `fixed_batch_partial`; no upstream-executed complete learner/optimizer parity | Excluded; `strict_final_eligible=false` |
 | RPEX paper interpretation | Same source plus paper semantics | `paper_code_conflict` sensitivity profile | No complete learner optimizer parity | Not the default final profile |
 | WSRL locomotion | `zhouzypaul/wsrl@ad4dc1248a138bc15d6e053f2d1dba1b8cfbaca2` | `framework_port_unverified` | Fixed-batch JAX/PyTorch and source-backed reporting parity missing | Excluded |
-| Cal-QL locomotion | `nakamotoo/Cal-QL@ac6eafec22e8d60836573e1f488c7f626ce8a77e` | `task_port` | Official public recipes are AntMaze/Adroit, not D4RL locomotion | Excluded; diagnostic only |
-| Pessimistic Q-Ensemble | `shlee94/Off2OnRL@6f298fa9ef040d725067d0f2775022bd2900d635` | `approximation` | Five independent checkpoint-loaded actors/twin critics are not implemented | Excluded; diagnostic only |
+| Cal-QL locomotion | `nakamotoo/Cal-QL@ac6eafec22e8d60836573e1f488c7f626ce8a77e` | `source_aligned_locomotion_adaptation`; main research baseline | Official public recipes are AntMaze/Adroit, not D4RL locomotion | Included in custom research benchmark; not an official locomotion reproduction |
+| Pessimistic Q-Ensemble | `shlee94/Off2OnRL@6f298fa9ef040d725067d0f2775022bd2900d635` | `source_aligned_d4rl_v2_port`; main research baseline | Five independent CQL members, actors, twin critics, and checkpoints are implemented | Included in custom research benchmark; v0→v2 port, not an official v0 reproduction |
 
 The provenance file is `docs/baseline_fidelity_manifest.yaml`; the current
 machine-readable eligibility source is `BASELINE_REPRODUCTION_REGISTRY`.
@@ -75,7 +73,14 @@ until a citable source supplies the missing definition.
 - `robust_o2o/agents/sac_family.py`: WSRL REDQ 10/2 with replacement, full-10
   actor minimum, subset CQL, official `-action_dim` target entropy with a
   softplus Geq multiplier, no entropy backup, and 4:1:1
-  critic/actor/temperature schedule. Entropy zero is legacy-only.
+  critic/actor/temperature schedule. Entropy zero is legacy-only. Canonical
+  PQE is intentionally not routed through this shared-actor class.
+- `robust_o2o/agents/calql.py` and `robust_o2o/calql_online.py`: frozen 2x256
+  Cal-QL SAC/CQL adaptation, phase-independent calibration, dynamic replay
+  mixing, and completed-trajectory post-corruption return-to-go handling.
+- `robust_o2o/agents/pessimistic_q_ensemble.py`: five independent CQL members,
+  moment-matched policy, density-ratio objective, and proportional priority
+  replay for the D4RL-v2 port.
 - `robust_o2o/corruption.py`: explicit pre/post timing, official Adam versus
   opt-in sign-PGD, separate offline/online reward rules, official unit-scale
   online observation/dynamics attacks, dedicated RNG, identity-complete locked
@@ -94,9 +99,9 @@ until a citable source supplies the missing definition.
   summaries, explicit common-budget/approximation/oracle labels, and opt-in
   running-run diagnostics.
 - `run_55_experiment.py`, `run_all_algorithms.py`, and `run_matrix.py`: suite and
-  implementation profile propagation. The diagnostic `run_55` default remains
-  500k/500k and is explicitly common-budget, not paper reproduction. Strict
-  RPEX/RIQL-naive runs instead lock 2,000,001/1,000,001 and seeds 0..4.
+  implementation profile propagation. The five-main custom research default
+  remains 500k/500k and is explicitly an interaction-budget comparison, not a
+  paper reproduction or a compute-matched comparison.
 - `scripts/preflight_strict.py`: Linux x86_64 pinned D4RL-v2 bounded preflight.
 - `tests/`: fixed-tensor, architecture, schedule, paired-corruption, atomic
   multiprocessing cache, manifest, and deterministic checkpoint/resume tests.
@@ -235,33 +240,31 @@ python run_experiment.py --algorithm wsrl \
   --implementation-profile official_code_reference --seed 0
 ```
 
-Optional Cal-QL locomotion adaptation:
+Main-table Cal-QL locomotion adaptation:
 
 ```bash
-python run_experiment.py --algorithm cal_ql_locomotion_adaptation \
+python run_experiment.py --algorithm cal_ql \
   --env-name hopper-medium-replay-v2 --corruption clean --stage both \
   --run-purpose research_benchmark --suite-profile research_benchmark \
   --implementation-profile research_benchmark --seed 0
 ```
 
-An upstream-equivalent Off2OnRL/PQE implementation is unavailable. This command
-must fail before training until the five official member checkpoints and a
-verified implementation exist:
+Main-table Off2OnRL/PQE D4RL-v2 port (five independently pretrained members):
 
 ```bash
 python run_experiment.py --algorithm pessimistic_q_ensemble \
   --env-name hopper-medium-replay-v2 --corruption clean --stage both \
-  --suite-profile method_fidelity \
-  --implementation-profile official_code_reference
+  --run-purpose research_benchmark --suite-profile research_benchmark \
+  --implementation-profile research_benchmark --seed 0
 ```
 
-Custom-budget main 3×5 (clean plus four random targets):
+Custom-budget main 5×5 (clean plus four random targets):
 
 ```bash
 python run_55_experiment.py \
   --env-name hopper-medium-replay-v2 \
   --run-purpose research_benchmark --suite-profile research_benchmark \
-  --algorithms rpex,riql_naive,wsrl --seeds 0
+  --algorithms rpex,riql_naive,wsrl,cal_ql,pessimistic_q_ensemble --seeds 0
 ```
 
 Paired adversarial RNG run (repeat for each intended learner seed):

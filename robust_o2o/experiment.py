@@ -13,6 +13,7 @@ import torch
 
 from .agents import build_agent
 from .config import LEGACY_PROTOCOL, ExperimentConfig
+from .calql_online import CalQLTrajectoryAccumulator, dynamic_batch_counts
 from .corruption import (
     AttackOracle,
     OnlineCorruptionAudit,
@@ -47,6 +48,7 @@ from .replay import (
     RPEX_OFFICIAL_REPLAY_SAMPLING,
     OfflineDataset,
     ReplayBuffer,
+    concatenate_batches,
     mixed_batch,
     sample_pqe_update_batches,
     update_sample_priorities,
@@ -380,11 +382,26 @@ def _parameter_snapshot(agent: object) -> Dict[str, list[torch.Tensor]]:
     actor = getattr(agent, "actor", None)
     if actor is not None:
         groups["actor"] = [parameter.detach().clone() for parameter in actor.parameters()]
+    else:
+        actors = getattr(agent, "actors", None)
+        if actors is not None:
+            groups["actor"] = [
+                parameter.detach().clone()
+                for module in actors
+                for parameter in module.parameters()
+            ]
     critic_modules = []
     for name in ("critic", "critic2", "q1", "q2", "value"):
         module = getattr(agent, name, None)
         if module is not None:
             critic_modules.append(module)
+    for name in (
+        "q1_members",
+        "q2_members",
+    ):
+        modules = getattr(agent, name, None)
+        if modules is not None:
+            critic_modules.extend(list(modules))
     groups["critic"] = [
         parameter.detach().clone()
         for module in critic_modules
@@ -662,6 +679,134 @@ def _prune_periodic_checkpoints(directory: Path, keep_last: int) -> None:
         checkpoint.unlink()
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _save_pqe_member_checkpoints(
+    directory: Path,
+    agent: object,
+    config: ExperimentConfig,
+    normalizer: StateNormalizer,
+    state_dim: int,
+    action_dim: int,
+    manifest_tag: str,
+) -> list[Path]:
+    """Write five independently loadable CQL members before online PQE."""
+
+    states = agent.member_checkpoint_states()
+    if len(states) != 5:
+        raise RuntimeError("PQE offline checkpoint must contain five members")
+    member_directory = directory / "members"
+    member_directory.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    hashes: list[str] = []
+    for index, member_state in enumerate(states):
+        path = member_directory / (
+            f"member_{index}_seed_{member_state['member_seed']}_manifest_"
+            f"{manifest_tag}.pt"
+        )
+        payload = {
+            "format_version": 1,
+            "format": "pqe_independent_member_checkpoint_v1",
+            "algorithm": "pessimistic_q_ensemble",
+            "env_name": config.env_name,
+            "protocol": config.protocol,
+            "state_dim": state_dim,
+            "action_dim": action_dim,
+            "environment_fingerprint": getattr(
+                config, "_environment_fingerprint", None
+            ),
+            "normalizer": normalizer.state_dict(),
+            "normalizer_sha256": normalizer_sha256(normalizer),
+            "member": member_state,
+            "offline_artifact_identity": getattr(
+                agent, "offline_artifact_identity", None
+            ),
+        }
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        torch.save(payload, temporary)
+        temporary.replace(path)
+        digest = _file_sha256(path)
+        agent.record_member_checkpoint_hash(index, digest)
+        paths.append(path)
+        hashes.append(digest)
+    if len(set(hashes)) != 5:
+        raise RuntimeError("PQE member checkpoints are not content-distinct")
+    return paths
+
+
+def _load_pqe_member_checkpoints(
+    paths: tuple[str, ...],
+    agent: object,
+    config: ExperimentConfig,
+    normalizer: StateNormalizer,
+    state_dim: int,
+    action_dim: int,
+    device: torch.device,
+) -> None:
+    if len(paths) != 5 or len(set(paths)) != 5:
+        raise ValueError("PQE online stage requires five unique member paths")
+    payloads: list[Dict[str, Any]] = []
+    hashes: list[str] = []
+    for index, value in enumerate(paths):
+        path = Path(value).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"PQE member checkpoint does not exist: {path}")
+        payload = _torch_load(path, device)
+        expected = {
+            "format": "pqe_independent_member_checkpoint_v1",
+            "algorithm": "pessimistic_q_ensemble",
+            "env_name": config.env_name,
+            "protocol": config.protocol,
+            "state_dim": state_dim,
+            "action_dim": action_dim,
+            "environment_fingerprint": getattr(
+                config, "_environment_fingerprint", None
+            ),
+            "normalizer_sha256": normalizer_sha256(normalizer),
+        }
+        mismatches = {
+            key: {"actual": payload.get(key), "expected": expected_value}
+            for key, expected_value in expected.items()
+            if payload.get(key) != expected_value
+        }
+        if mismatches:
+            raise ValueError(
+                f"PQE member checkpoint {index} provenance mismatch: {mismatches}"
+            )
+        if "member" not in payload:
+            raise ValueError(f"PQE member checkpoint {index} has no member state")
+        payloads.append(payload)
+        hashes.append(_file_sha256(path))
+    if len(set(hashes)) != 5:
+        raise ValueError("duplicate PQE member checkpoint file content is forbidden")
+    artifact_identities = {
+        tuple(payload["offline_artifact_identity"])
+        for payload in payloads
+        if payload.get("offline_artifact_identity") is not None
+    }
+    if len(artifact_identities) != 1:
+        raise ValueError("PQE members are not bound to one offline artifact")
+    loaded_artifact_identity = next(iter(artifact_identities))
+    current_artifact_identity = getattr(agent, "offline_artifact_identity", None)
+    if (
+        current_artifact_identity is not None
+        and tuple(current_artifact_identity) != loaded_artifact_identity
+    ):
+        raise ValueError(
+            "PQE member checkpoints were trained on a different corrupted artifact"
+        )
+    agent.load_member_checkpoint_states(
+        [payload["member"] for payload in payloads], hashes
+    )
+    agent.offline_artifact_identity = loaded_artifact_identity
+
+
 def _save_phase_checkpoint(
     logger: RunLogger,
     agent: object,
@@ -683,6 +828,24 @@ def _save_phase_checkpoint(
         if final
         else f"step_{step:09d}_manifest_{manifest_tag}.pt"
     )
+    if (
+        config.algorithm == "pessimistic_q_ensemble"
+        and phase == "offline"
+        and final
+    ):
+        member_paths = _save_pqe_member_checkpoints(
+            directory,
+            agent,
+            config,
+            normalizer,
+            state_dim,
+            action_dim,
+            manifest_tag,
+        )
+        logger.logger.info(
+            "PQE member checkpoints saved: %s",
+            ", ".join(str(member_path) for member_path in member_paths),
+        )
     save_checkpoint(
         path,
         agent,
@@ -807,12 +970,28 @@ def _restore_agent_config(config: ExperimentConfig, payload: Dict[str, Any]) -> 
         "backup_entropy",
         "cql_max_target_backup",
         "calibration_mask_mode",
+        "enable_calql",
+        "cql_importance_sample",
+        "orthogonal_initialization",
+        "policy_log_std_multiplier",
+        "policy_log_std_offset",
         "wsrl_num_critics",
         "wsrl_target_critic_subsample_size",
         "wsrl_layer_norm",
         "wsrl_utd_ratio",
         "wsrl_per_critic_batch_size",
         "mc_return_source",
+        "pqe_ensemble_size",
+        "pqe_member_offline_steps",
+        "pqe_init_online_fraction",
+        "pqe_first_epoch_multiplier",
+        "pqe_first_online_block_steps",
+        "pqe_online_buffer_size",
+        "pqe_weight_batch_size",
+        "pqe_priority_temperature",
+        "pqe_target_update_period",
+        "priority_floor",
+        "priority_ceiling",
         "action_distribution",
         "ro2o_beta_policy",
         "ro2o_beta_ood",
@@ -841,7 +1020,7 @@ def _evaluate(
     env_steps: int,
 ) -> None:
     modes = (
-        ("deterministic_diagnostic", "method_faithful")
+        ("method_faithful", "deterministic_diagnostic")
         if config.evaluation_mode == "both"
         else (config.evaluation_mode,)
     )
@@ -862,7 +1041,9 @@ def _evaluate(
         for mode in modes
     }
     primary_mode = (
-        "deterministic_diagnostic"
+        "method_faithful"
+        if config.algorithm == "rpex" and "method_faithful" in evaluations
+        else "deterministic_diagnostic"
         if "deterministic_diagnostic" in evaluations
         else modes[0]
     )
@@ -1040,8 +1221,36 @@ def run_experiment(
         # from preprocessing, adversarial attacks, and cache hit/miss state.
         seed_everything(config.learner_seed)
         agent = build_agent(config, state_dim, action_dim, max_action, device)
+        if config.algorithm == "pessimistic_q_ensemble":
+            artifact_identity = (
+                str(corruption_stats.get("cache_key", "clean")),
+                str(corruption_stats["final_artifact_sha256"]),
+            )
+            agent.bind_offline_artifact(*artifact_identity)
         if checkpoint_payload is not None:
             agent.load_checkpoint_state(checkpoint_payload["agent"])
+            if (
+                config.algorithm == "pessimistic_q_ensemble"
+                and tuple(agent.offline_artifact_identity or ())
+                != artifact_identity
+            ):
+                raise ValueError(
+                    "PQE checkpoint offline artifact differs from this run's "
+                    "corrupted D4RL-v2 artifact"
+                )
+        elif (
+            config.algorithm == "pessimistic_q_ensemble"
+            and config.stage == "online"
+        ):
+            _load_pqe_member_checkpoints(
+                config.pqe_member_checkpoints,
+                agent,
+                config,
+                normalizer,
+                state_dim,
+                action_dim,
+                device,
+            )
         if resume_payload is not None:
             restore_global_rng_state(resume_payload["global_rng"], oracle=oracle)
 
@@ -1072,6 +1281,11 @@ def run_experiment(
                 "offline_corruption": corruption_stats,
                 "normalizer": normalizer.diagnostics(corrupted_dataset),
                 "normalizer_sha256": normalizer_sha256(normalizer),
+                **(
+                    agent.algorithm_metadata()
+                    if hasattr(agent, "algorithm_metadata")
+                    else {}
+                ),
                 "legacy_checkpoint_without_fingerprint_loaded": bool(
                     getattr(
                         config,
@@ -1103,12 +1317,11 @@ def run_experiment(
             config.corruption_target,
             device,
         )
-        if config.algorithm == "pqe_shared_actor_approx":
-            logger.logger.warning(
-                "Pessimistic Q-Ensemble uses implementation_variant=%s: "
-                "one shared actor with critic ensembles, not the exact official "
-                "Off2OnRL independent actor/critic ensemble.",
-                config.implementation_variant,
+        if config.algorithm == "pessimistic_q_ensemble":
+            logger.logger.info(
+                "PQE uses five independent actor/twin-critic CQL members; "
+                "offline compute multiplier=%d",
+                config.pqe_ensemble_size,
             )
         logger.logger.info(
             "dataset=%d offline_steps=%d online_steps=%d offline_ratio=%.2f",
@@ -1183,6 +1396,11 @@ def run_experiment(
                     "actual_online_steps": 0,
                     "episode_boundary_overshoot": 0,
                     **_runtime_update_metadata(config, agent),
+                    **(
+                        agent.algorithm_metadata()
+                        if hasattr(agent, "algorithm_metadata")
+                        else {}
+                    ),
                 }
             )
         if diagnostic_snapshot is not None:
@@ -1237,18 +1455,44 @@ def _run_offline(
     resume_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     logger.logger.info("offline pre-training started")
+    is_pqe = config.algorithm == "pessimistic_q_ensemble"
+    offline_budget = int(
+        config.pqe_member_offline_steps if is_pqe else config.offline_steps
+    )
+    pqe_member_datasets = (
+        [
+            OfflineDataset(
+                offline.dataset,
+                seed=int(member_seed),
+                sampling_profile=NUMPY_REPLAY_SAMPLING,
+            )
+            for member_seed in agent.member_seeds
+        ]
+        if is_pqe
+        else []
+    )
     last_metrics: Dict[str, float] = {}
     accumulator = MetricAccumulator()
     start_step = 0
     if resume_state is not None and resume_state.get("phase") == "offline":
         _validate_writer_positions(logger, resume_state)
         start_step = int(resume_state["phase_step"])
-        if start_step > config.offline_steps:
+        if start_step > offline_budget:
             raise ValueError(
                 "offline resume checkpoint exceeds the configured update budget: "
-                f"checkpoint={start_step}, configured={config.offline_steps}"
+                f"checkpoint={start_step}, configured={offline_budget}"
             )
-        if start_step == config.offline_steps:
+        if is_pqe:
+            sampler_states = resume_state.get("pqe_member_offline_datasets")
+            if not isinstance(sampler_states, list) or len(sampler_states) != 5:
+                raise ValueError(
+                    "PQE offline resume requires five member sampler states"
+                )
+            for sampler, sampler_state in zip(
+                pqe_member_datasets, sampler_states
+            ):
+                sampler.load_state_dict(sampler_state)
+        if start_step == offline_budget:
             logger.logger.info(
                 "offline resume is already complete at update=%d; no new "
                 "evaluation, optimizer update, or checkpoint write was executed",
@@ -1260,9 +1504,17 @@ def _run_offline(
             for key, values in resume_state.get("metric_accumulator", {}).items()
         }
     parameter_snapshot = _parameter_snapshot(agent)
-    for step in range(start_step + 1, config.offline_steps + 1):
-        batch = offline.sample(config.batch_size, device)
-        last_metrics = agent.update(batch)
+    for step in range(start_step + 1, offline_budget + 1):
+        if is_pqe:
+            last_metrics = agent.update(
+                member_batches=[
+                    sampler.sample(config.batch_size, device)
+                    for sampler in pqe_member_datasets
+                ]
+            )
+        else:
+            batch = offline.sample(config.batch_size, device)
+            last_metrics = agent.update(batch)
         accumulator.add(last_metrics)
         if step % config.train_log_period == 0:
             parameter_deltas, parameter_snapshot = _parameter_deltas(
@@ -1281,6 +1533,9 @@ def _run_offline(
                     "replay_size_online": 0.0,
                     "offline_batch_fraction": 1.0,
                     "online_batch_fraction": 0.0,
+                    "offline_compute_multiplier": float(
+                        config.pqe_ensemble_size if is_pqe else 1
+                    ),
                 },
             )
         if step % config.eval_period == 0:
@@ -1299,7 +1554,7 @@ def _run_offline(
         if (
             period > 0
             and step % period == 0
-            and step != config.offline_steps
+            and step != offline_budget
         ):
             _save_phase_checkpoint(
                 logger,
@@ -1317,6 +1572,9 @@ def _run_offline(
                     "phase_step": step,
                     "episode_boundary": True,
                     "offline_dataset": offline.state_dict(),
+                    "pqe_member_offline_datasets": [
+                        sampler.state_dict() for sampler in pqe_member_datasets
+                    ],
                     "global_rng": capture_global_rng_state(),
                     "metric_accumulator": accumulator.values,
                     "writer_append_position": _writer_positions(logger),
@@ -1325,8 +1583,8 @@ def _run_offline(
     if (
         config.implementation_profile != "official_code_reference"
         and (
-            config.offline_steps == 0
-            or config.offline_steps % config.eval_period != 0
+            offline_budget == 0
+            or offline_budget % config.eval_period != 0
         )
     ):
         _evaluate(
@@ -1337,7 +1595,7 @@ def _run_offline(
             normalizer,
             device,
             "offline",
-            config.offline_steps,
+            offline_budget,
             0,
         )
     _save_phase_checkpoint(
@@ -1346,16 +1604,19 @@ def _run_offline(
         config,
         normalizer,
         "offline",
-        config.offline_steps,
+        offline_budget,
         0,
         state_dim,
         action_dim,
         final=True,
         resume_state={
             "phase": "offline",
-            "phase_step": config.offline_steps,
+            "phase_step": offline_budget,
             "episode_boundary": True,
             "offline_dataset": offline.state_dict(),
+            "pqe_member_offline_datasets": [
+                sampler.state_dict() for sampler in pqe_member_datasets
+            ],
             "global_rng": capture_global_rng_state(),
             "metric_accumulator": accumulator.values,
             "writer_append_position": _writer_positions(logger),
@@ -1380,12 +1641,18 @@ def _run_online(
     resume_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     logger.logger.info("online fine-tuning started")
+    is_pqe = config.algorithm == "pessimistic_q_ensemble"
+    is_calql = config.algorithm == "cal_ql"
+    is_wsrl = config.algorithm == "wsrl"
     replay = ReplayBuffer(
         state_dim,
         action_dim,
-        config.replay_size,
+        config.pqe_online_buffer_size if is_pqe else config.replay_size,
         config.replay_seed,
         sampling_profile=offline.sampling_profile,
+    )
+    calql_trajectory = (
+        CalQLTrajectoryAccumulator(config.discount) if is_calql else None
     )
     rng = make_numpy_corruption_rng(config)
     state_std = raw_dataset["observations"].std(axis=0).astype(np.float32)
@@ -1432,6 +1699,13 @@ def _run_online(
             else start_env_step >= config.online_steps
         )
         if already_complete:
+            if is_calql:
+                trajectory_state = resume_state.get("calql_trajectory")
+                if trajectory_state is None:
+                    raise ValueError(
+                        "Cal-QL online resume is missing trajectory-return state"
+                    )
+                calql_trajectory.load_state_dict(trajectory_state)
             corruption_audit = OnlineCorruptionAudit(
                 resume_state.get("online_corruption_audit")
             )
@@ -1449,6 +1723,17 @@ def _run_online(
                         start_env_step - config.online_steps, 0
                     ),
                     "resume_noop_already_complete": True,
+                    "raw_action_oob_fraction": (
+                        float(resume_state.get("raw_oob", 0) / start_env_step)
+                        if start_env_step > 0
+                        else 0.0
+                    ),
+                    "raw_action_abs_max": float(
+                        resume_state.get("raw_action_abs_max", 0.0)
+                    ),
+                    "executed_action_abs_max": float(
+                        resume_state.get("executed_action_abs_max", 0.0)
+                    ),
                 }
             )
             online_corruption_metadata.update(
@@ -1466,6 +1751,10 @@ def _run_online(
                     online_environment_steps=start_env_step,
                 )
             )
+            if is_calql:
+                online_corruption_metadata.update(calql_trajectory.metadata())
+            if is_pqe and hasattr(agent, "algorithm_metadata"):
+                online_corruption_metadata.update(agent.algorithm_metadata())
             with (logger.run_dir / "online_corruption_manifest.json").open(
                 "w", encoding="utf-8"
             ) as stream:
@@ -1483,11 +1772,26 @@ def _run_online(
             )
             return
         replay.load_state_dict(resume_state["online_replay"])
+        if is_calql:
+            trajectory_state = resume_state.get("calql_trajectory")
+            if trajectory_state is None:
+                raise ValueError(
+                    "Cal-QL online resume is missing trajectory-return state"
+                )
+            calql_trajectory.load_state_dict(trajectory_state)
         restore_global_rng_state(resume_state["global_rng"], rng, oracle)
         restore_environment_rng_state(env, resume_state["environment_rng"])
         raw_state = None
     else:
-        raw_state = reset_env(env, seed=config.train_env_seed, protocol=config.protocol)
+        # A valid custom research budget may contain no online interaction.
+        # Keep that state at an episode boundary so the final exact-resume
+        # snapshot is well-defined instead of resetting an episode that is
+        # never stepped.
+        raw_state = (
+            reset_env(env, seed=config.train_env_seed, protocol=config.protocol)
+            if config.online_steps > 0
+            else None
+        )
     episode_steps = 0
     episode_return = 0.0
     corrupted_online = int(resume_state.get("corrupted_online", 0)) if online_resume else 0
@@ -1503,33 +1807,42 @@ def _run_online(
         }
     parameter_snapshot = _parameter_snapshot(agent)
     offline_ratio = config.effective_offline_ratio
-    if config.algorithm == "wsrl" and not np.isclose(offline_ratio, 0.0):
+    current_offline_ratio = float(offline_ratio)
+    if is_wsrl and not np.isclose(offline_ratio, 0.0):
         raise ValueError(
             "WSRL online fine-tuning is online-replay-only; "
             f"effective_offline_ratio must be 0.0, got {offline_ratio}"
         )
     warmup = (
         max(config.initial_collection_steps, config.warmup_steps)
-        if config.algorithm == "wsrl"
+        if is_wsrl
+        else config.pqe_first_online_block_steps
+        if is_pqe
+        else 0
+        if is_calql
         else config.initial_collection_steps
     )
     action_low = np.asarray(env.action_space.low, dtype=np.float32)
     action_high = np.asarray(env.action_space.high, dtype=np.float32)
     raw_action_abs_max = float(resume_state.get("raw_action_abs_max", 0.0)) if online_resume else 0.0
     executed_action_abs_max = float(resume_state.get("executed_action_abs_max", 0.0)) if online_resume else 0.0
+    raw_oob = int(resume_state.get("raw_oob", 0)) if online_resume else 0
     executed_oob = int(resume_state.get("executed_oob", 0)) if online_resume else 0
     replay_mismatch = int(resume_state.get("replay_mismatch", 0)) if online_resume else 0
     priority_metrics: Dict[str, float] = {}
-    desired_online_fraction = 1.0 - offline_ratio
     initial_online_priority = (
-        offline.size
-        * desired_online_fraction
-        / max(offline_ratio * max(warmup, 1), 1e-12)
-        if config.algorithm == "pqe_shared_actor_approx"
-        and config.pqe_replay_mode == "balanced_density"
-        and offline_ratio > 0.0
+        agent.initial_online_priority(
+            offline.size, config.pqe_first_online_block_steps
+        )
+        if is_pqe
         else 1.0
     )
+    pqe_first_block_updates_applied = bool(
+        resume_state.get("pqe_first_block_updates_applied", False)
+    ) if online_resume else False
+    pqe_first_block_update_count = int(
+        resume_state.get("pqe_first_block_update_count", 0)
+    ) if online_resume else 0
 
     def online_resume_snapshot(step: int) -> Dict[str, Any]:
         if not episode_boundary or raw_state is not None:
@@ -1549,8 +1862,14 @@ def _run_online(
             "online_corruption_audit": corruption_audit.state_dict(),
             "raw_action_abs_max": raw_action_abs_max,
             "executed_action_abs_max": executed_action_abs_max,
+            "raw_oob": raw_oob,
             "executed_oob": executed_oob,
             "replay_mismatch": replay_mismatch,
+            "calql_trajectory": (
+                calql_trajectory.state_dict() if is_calql else None
+            ),
+            "pqe_first_block_updates_applied": pqe_first_block_updates_applied,
+            "pqe_first_block_update_count": pqe_first_block_update_count,
             "metric_accumulator": accumulator.values,
             "writer_append_position": _writer_positions(logger),
             "online_initial_actor_updates": online_initial_update_counts[
@@ -1575,14 +1894,13 @@ def _run_online(
             start_env_step + 1, config.online_steps + 1
         )
 
-    # The pinned RPEX loop samples the policy action, updates from the replay
-    # already present in memory, and only then calls env.step/adds the new
-    # transition.  Keeping that ordering is observable because both replay
-    # membership and the Torch RNG state affect the update.  Other profiles
-    # retain this repository's post-transition update schedule.
-    official_pre_transition_updates = rpex_episode_boundary_budget
-    is_pqe = config.algorithm == "pqe_shared_actor_approx"
-    is_wsrl = config.algorithm == "wsrl"
+    # RPEX/RIQL source ordering is independent of whether the controller uses
+    # the official episode-overshoot budget or the exact custom budget.
+    official_pre_transition_updates = (
+        config.algorithm in ("rpex", "riql_naive", "riql_pex")
+        and config.implementation_profile
+        in ("official_code_reference", "research_benchmark")
+    )
     update_batch_size = (
         config.wsrl_per_critic_batch_size
         if is_wsrl
@@ -1594,8 +1912,10 @@ def _run_online(
         else 0
     )
     required_online_samples = (
-        config.batch_size
+        config.pqe_weight_batch_size
         if is_pqe
+        else 1
+        if is_calql
         else wsrl_total_batch_size
         if is_wsrl
         else max(
@@ -1620,10 +1940,20 @@ def _run_online(
 
     def perform_online_updates(env_step: int, *, before_transition: bool) -> None:
         nonlocal last_metrics, priority_metrics
+        nonlocal pqe_first_block_updates_applied, pqe_first_block_update_count
 
+        if is_calql:
+            # Cal-QL is updated only after a complete trajectory has exact RTG.
+            return
         if is_wsrl:
             can_update = (
                 env_step >= wsrl_first_update_step
+                and replay.size >= required_online_samples
+            )
+        elif is_pqe:
+            can_update = (
+                not before_transition
+                and env_step >= config.pqe_first_online_block_steps
                 and replay.size >= required_online_samples
             )
         elif before_transition:
@@ -1650,7 +1980,17 @@ def _run_online(
             accumulator.add(last_metrics)
             return
 
-        update_repeats = config.updates_per_step
+        if is_pqe and not pqe_first_block_updates_applied:
+            normal_update_count = (
+                config.pqe_first_online_block_steps * config.updates_per_step
+            )
+            update_repeats = agent.online_update_count_for_block(
+                0, normal_update_count
+            )
+            pqe_first_block_updates_applied = True
+            pqe_first_block_update_count = update_repeats
+        else:
+            update_repeats = config.updates_per_step
         for _ in range(update_repeats):
             prioritized = (
                 is_pqe and config.pqe_replay_mode == "balanced_density"
@@ -1667,6 +2007,7 @@ def _run_online(
                     offline_ratio,
                     device,
                     prioritized_rl=prioritized,
+                    density_batch_size=config.pqe_weight_batch_size,
                 )
                 last_metrics = agent.update(
                     rl_batch=batch,
@@ -1693,6 +2034,34 @@ def _run_online(
                 priority_metrics = update_sample_priorities(
                     offline, replay, batch, priorities
                 )
+
+    def perform_calql_trajectory_updates(completed: object) -> None:
+        nonlocal last_metrics, current_offline_ratio
+
+        if not is_calql:
+            raise RuntimeError("Cal-QL trajectory update called for another algorithm")
+        update_count = completed.update_count(config.updates_per_step)
+        for _ in range(update_count):
+            offline_count, online_count, ratio = dynamic_batch_counts(
+                config.batch_size, offline.size, replay.size
+            )
+            if online_count <= 0:
+                raise RuntimeError(
+                    "Cal-QL dynamic mixture produced no completed online sample"
+                )
+            batch = concatenate_batches(
+                offline.sample(offline_count, device),
+                replay.sample(
+                    online_count,
+                    device,
+                    replace=True,
+                ),
+            )
+            last_metrics = agent.update(batch)
+            last_metrics["calql_dynamic_offline_ratio"] = float(ratio)
+            last_metrics["calql_trajectory_update_count"] = float(update_count)
+            accumulator.add(last_metrics)
+            current_offline_ratio = float(ratio)
     actual_online_steps = start_env_step
     for env_step in online_step_iterator:
         actual_online_steps = env_step
@@ -1743,6 +2112,9 @@ def _run_online(
             else raw_action_np.copy()
         )
         raw_action_abs_max = max(raw_action_abs_max, float(np.abs(raw_action_np).max()))
+        raw_oob += int(
+            np.any(raw_action_np < action_low) or np.any(raw_action_np > action_high)
+        )
         executed_action_abs_max = max(
             executed_action_abs_max, float(np.abs(executed_action).max())
         )
@@ -1756,6 +2128,10 @@ def _run_online(
         )
         episode_steps += 1
         episode_return += reward
+        episode_timeout = bool(
+            truncated or episode_steps >= config.max_episode_steps
+        )
+        episode_finished = bool(terminated or episode_timeout)
 
         if not pre_action:
             selected_target = sample_online_corruption_target(config, rng)
@@ -1819,16 +2195,36 @@ def _run_online(
             normalizer,
             normalized_replay_poisoning,
         )
-        replay.add(
-            replay_state,
-            stored_action,
-            stored_reward,
-            replay_next_state,
-            float(terminated),
-            priority=initial_online_priority,
-        )
+        if is_calql:
+            completed = calql_trajectory.append(
+                observation=replay_state,
+                action=stored_action,
+                reward=stored_reward,
+                next_observation=replay_next_state,
+                terminal=bool(terminated),
+                timeout=episode_timeout,
+            )
+            if completed is not None:
+                replay.add_batch(
+                    completed.batch["observations"],
+                    completed.batch["actions"],
+                    completed.batch["rewards"],
+                    completed.batch["next_observations"],
+                    completed.batch["terminals"],
+                    mc_returns=completed.batch["mc_returns"],
+                )
+                perform_calql_trajectory_updates(completed)
+        else:
+            replay.add(
+                replay_state,
+                stored_action,
+                stored_reward,
+                replay_next_state,
+                float(terminated),
+                priority=initial_online_priority,
+            )
         raw_state = raw_next_state
-        if terminated or truncated or episode_steps >= config.max_episode_steps:
+        if episode_finished:
             raw_state = None
             episode_steps = 0
             episode_return = 0.0
@@ -1909,18 +2305,45 @@ def _run_online(
                     "replay_size": float(replay.size),
                     "replay_size_offline": float(offline.size),
                     "replay_size_online": float(replay.size),
-                    "offline_batch_fraction": float(offline_ratio),
-                    "online_batch_fraction": float(1.0 - offline_ratio),
+                    "offline_batch_fraction": float(current_offline_ratio),
+                    "online_batch_fraction": float(1.0 - current_offline_ratio),
                     "parameters_frozen_during_warmup": float(
                         config.algorithm == "wsrl"
                     ),
-                    "offline_data_retained_online": float(offline_ratio > 0.0),
+                    "offline_data_retained_online": float(
+                        current_offline_ratio > 0.0
+                    ),
                     **wsrl_update_metrics,
                     "online_corruption_fraction": corrupted_online / env_step,
                     "raw_action_abs_max": raw_action_abs_max,
                     "executed_action_abs_max": executed_action_abs_max,
+                    "raw_action_oob_fraction": raw_oob / env_step,
                     "executed_action_oob_fraction": executed_oob / env_step,
                     "replay_env_action_mismatch_fraction": replay_mismatch / env_step,
+                    **(
+                        {
+                            key: float(value)
+                            for key, value in calql_trajectory.metadata().items()
+                        }
+                        if is_calql
+                        else {}
+                    ),
+                    **(
+                        {
+                            "pqe_initial_online_priority": float(
+                                initial_online_priority
+                            ),
+                            "pqe_first_block_updates_applied": float(
+                                pqe_first_block_updates_applied
+                            ),
+                            "pqe_first_block_update_count": float(
+                                pqe_first_block_update_count
+                            ),
+                            "pqe_member_count": float(config.pqe_ensemble_size),
+                        }
+                        if is_pqe
+                        else {}
+                    ),
                     **priority_metrics,
                 },
             )
@@ -2041,6 +2464,46 @@ def _run_online(
             online_environment_steps=actual_online_steps,
         )
     )
+    online_corruption_metadata.update(
+        {
+            "raw_action_oob_fraction": (
+                float(raw_oob / actual_online_steps)
+                if actual_online_steps > 0
+                else 0.0
+            ),
+            "raw_action_abs_max": raw_action_abs_max,
+            "executed_action_abs_max": executed_action_abs_max,
+            "executed_action_oob_fraction": (
+                float(executed_oob / actual_online_steps)
+                if actual_online_steps > 0
+                else 0.0
+            ),
+        }
+    )
+    if is_calql:
+        online_corruption_metadata.update(calql_trajectory.metadata())
+        online_corruption_metadata["online_calibration_bound_rate"] = float(
+            last_metrics.get("online_calibration_bound_rate", 0.0)
+        )
+        online_corruption_metadata["calql_online_cql_enabled"] = True
+        online_corruption_metadata["calql_dynamic_offline_ratio"] = float(
+            current_offline_ratio
+        )
+    if is_pqe:
+        online_corruption_metadata.update(agent.algorithm_metadata())
+        online_corruption_metadata.update(
+            {
+                "pqe_initial_online_priority": float(initial_online_priority),
+                "pqe_first_block_updates_applied": bool(
+                    pqe_first_block_updates_applied
+                ),
+                "pqe_first_block_update_count": int(
+                    pqe_first_block_update_count
+                ),
+                "priority_replay_offline": offline.priority_statistics(),
+                "priority_replay_online": replay.priority_statistics(),
+            }
+        )
     with (logger.run_dir / "online_corruption_manifest.json").open(
         "w", encoding="utf-8"
     ) as stream:

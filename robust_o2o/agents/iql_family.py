@@ -180,9 +180,14 @@ class IQLFamilyAgent(BaseAgent):
     def begin_online(self) -> None:
         if self.online_phase:
             return
+        fresh_online_optimizers = self.config.algorithm in (
+            "rpex",
+            "riql_naive",
+            "riql_pex",
+        )
         official_phase_transition = (
             self.config.implementation_profile == "official_code_reference"
-            and self.config.algorithm in ("rpex", "riql_naive", "riql_pex")
+            and fresh_online_optimizers
         )
         if self.expansion:
             self.offline_actor = copy.deepcopy(self.actor).eval().requires_grad_(False)
@@ -195,11 +200,15 @@ class IQLFamilyAgent(BaseAgent):
                 if torch.cuda.is_available():
                     torch.cuda.manual_seed_all(self.config.learner_seed)
             self.actor = self._make_online_actor()
-        if official_phase_transition:
+        if fresh_online_optimizers:
             # The pinned online constructors create fresh Adam instances and
             # load module weights only; no offline optimizer/scheduler state is
-            # restored. This is especially important because the offline actor
-            # cosine schedule has reached (approximately) zero learning rate.
+            # restored. Apply the same phase boundary to the custom-budget
+            # research benchmark: otherwise RIQL-naive retains the exhausted
+            # offline cosine schedule (and its Adam moments) while claiming to
+            # perform online fine-tuning. Module weights remain untouched for
+            # RIQL-naive; RPEX/RIQL+PEX have already installed their new online
+            # policy above.
             self.q_optimizer = torch.optim.Adam(
                 self.critic.parameters(), lr=self.config.critic_learning_rate
             )

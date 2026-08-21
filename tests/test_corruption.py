@@ -93,10 +93,13 @@ class CorruptionTest(unittest.TestCase):
                 outputs.append(output)
         self.assertFalse(
             np.array_equal(
-                outputs[0]["mc_calibration_valid"],
-                outputs[1]["mc_calibration_valid"],
+                outputs[0]["observations"], outputs[1]["observations"]
             )
         )
+        for output in outputs:
+            np.testing.assert_array_equal(
+                output["mc_calibration_valid"], np.ones(100, dtype=np.float32)
+            )
 
     def test_random_mixed_allocates_each_row_to_one_target(self):
         config = ExperimentConfig(

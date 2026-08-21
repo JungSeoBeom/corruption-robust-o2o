@@ -21,6 +21,7 @@ class AgentSmokeTest(unittest.TestCase):
             num_critics=3,
             sac_num_critics=3,
             cql_n_actions=2,
+            pqe_weight_batch_size=8,
             ro2o_sample_size=2,
             offline_steps=1,
             online_steps=1,
@@ -43,12 +44,25 @@ class AgentSmokeTest(unittest.TestCase):
             with self.subTest(algorithm=algorithm):
                 config = self._config(algorithm)
                 agent = build_agent(config, 5, 2, 1.0, torch.device("cpu"))
-                metrics = agent.update(self._batch())
+                if algorithm == "pessimistic_q_ensemble":
+                    metrics = agent.update(
+                        member_batches=[self._batch() for _ in range(5)]
+                    )
+                else:
+                    metrics = agent.update(self._batch())
                 self.assertTrue(metrics)
                 action = agent.select_action(torch.randn(5), evaluate=True)
                 self.assertEqual(tuple(action.shape), (2,))
                 agent.begin_online()
-                online_metrics = agent.update(self._batch())
+                if algorithm == "pessimistic_q_ensemble":
+                    online_metrics = agent.update(
+                        rl_batch=self._batch(),
+                        density_offline_batch=self._batch(),
+                        density_online_batch=self._batch(),
+                        rl_batch_prioritized=True,
+                    )
+                else:
+                    online_metrics = agent.update(self._batch())
                 self.assertTrue(online_metrics)
 
     def test_rpex_uses_official_style_online_expansion_gaussian(self):

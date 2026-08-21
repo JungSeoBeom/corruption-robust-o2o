@@ -2,17 +2,19 @@
 
 This repository provides a custom-budget benchmark for corruption-robust
 offline-to-online RL under `clean`, `random`, and `adversarial` conditions. The
-default `research_benchmark` suite contains exactly three main baselines:
-`rpex`, `riql_naive`, and `wsrl`. It uses one common clean evaluation rule and
-one RPEX-inspired replay-transition-poisoning contract across those baselines.
+default `research_benchmark` suite contains exactly five main baselines:
+`rpex`, `riql_naive`, `wsrl`, `cal_ql`, and `pessimistic_q_ensemble`. It uses
+one common clean evaluation rule and one RPEX-inspired
+replay-transition-poisoning contract across those baselines.
 
-Cal-QL locomotion is available only as the explicit optional task adaptation
-`cal_ql_locomotion_adaptation`. The local PQE code is available only as
-`pqe_shared_actor_approx`. This implementation is a shared-actor approximation
-and is not the official independent-policy Pessimistic Q-Ensemble
-implementation. Neither optional method is included in the main result table.
-The retired name `pessimistic_q_ensemble` fails instead of silently selecting
-the approximation.
+Cal-QL is a frozen, source-aligned D4RL locomotion adaptation because the
+pinned public release has no official locomotion recipe. Pessimistic
+Q-Ensemble uses five independently pretrained actor/twin-critic members and
+moment-matches their pre-tanh Gaussian policies. It ports the public D4RL-v0
+method to the benchmark's shared D4RL-v2 datasets. Both are main-table methods;
+their task/version scope remains explicit in every manifest. Historical result
+names `cal_ql_locomotion_adaptation` and `pqe_shared_actor_approx` may be read,
+but cannot launch a new run.
 
 The default protocol is explicitly `rpex_d4rl_v2_legacy`: Gym 0.23.1, the full
 D4RL-v2 environment ID, `mujoco_py`, and D4RL commit
@@ -29,8 +31,8 @@ not establish numerical parity of a learner implementation.
 is empty. RPEX and RIQL-naive are handwritten `source_aligned_port`s with only
 partial fixed-batch evidence, so neither is strict-eligible. WSRL is an
 unverified cross-framework port and its source-primary reporting rule is also
-unverified; locomotion Cal-QL is an unsupported-task port; local PQE is an
-approximation. The existing v1 corruption fixtures are diagnostic evidence:
+unverified; locomotion Cal-QL is a task adaptation; and PQE is a D4RL-v2 port
+of the upstream v0 method. The existing v1 corruption fixtures are diagnostic evidence:
 they were produced under a runtime different from the strict pins, and the
 adversarial fixture covers only an optimizer core. Upstream-executed learner,
 constructor/evaluation RNG, condition, save/resume, and strict Linux receipts
@@ -97,7 +99,7 @@ the canonical diagnostic name.
 The generic `reference` profile has been removed. Every run records an
 `implementation_profile`, an `implementation_fidelity`, a `suite_profile`, an
 `implementation_type`, and a `benchmark_role`. The default research suite is
-the 3×5 `research_benchmark`; it is always labelled as a custom benchmark and
+the 5×5 `research_benchmark`; it is always labelled as a custom benchmark and
 never as paper reproduction. The separate `primary_research_benchmark` and
 `final_benchmark` paths retain the conservative strict registry and certificate
 gate. They currently select no eligible algorithm and fail before creating a
@@ -120,25 +122,25 @@ The CLI names and reference papers or configurations are listed below.
 | 3 | `riql_naive` | *Towards Robust Offline Reinforcement Learning under Diverse Data Corruption* | Applies the RIQL objective directly to online replay |
 | 4 | `uwmsg` | *Corruption-Robust Offline Reinforcement Learning with General Function Approximation* | Applies the UWMSG objective directly to online replay |
 | 5 | `pex` | *Policy Expansion for Bridging Offline-to-Online Reinforcement Learning* | IQL pretraining followed by PEX |
-| 6 | `cal_ql_locomotion_adaptation` | *Cal-QL: Calibrated Offline RL Pre-Training for Efficient Online Fine-Tuning* | Optional locomotion task adaptation; not an official locomotion recipe |
+| 6 | `cal_ql` (`calql`, `cal-ql`) | *Cal-QL: Calibrated Offline RL Pre-Training for Efficient Online Fine-Tuning* | Main frozen locomotion adaptation; calibrated CQL pretraining and online fine-tuning |
 | 7 | `wsrl` | *Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data* | CQL pretraining, frozen-policy warmup, and online-only SAC |
 | 8 | `ro2o` | *Towards Robust Offline-to-Online Reinforcement Learning via Uncertainty and Smoothness* | Q-ensemble/smoothness pretraining followed by replay-based online reduction |
-| 9 | `pqe_shared_actor_approx` | *Offline-to-Online Reinforcement Learning via Balanced Replay and Pessimistic Q-Ensemble* | Optional shared-actor approximation; not the official independent-policy method |
+| 9 | `pessimistic_q_ensemble` (`pqe`) | *Offline-to-Online Reinforcement Learning via Balanced Replay and Pessimistic Q-Ensemble* | Main five-member independent-policy/twin-critic ensemble with balanced priority replay |
 
-For `research_benchmark`, RPEX and RIQL-naive are recorded as
-`source_aligned_port`, WSRL as `framework_port`, Cal-QL locomotion as
-`task_adaptation`, and the shared-actor PQE as `approximation`. Their benchmark
-roles are respectively `main`, `main`, `main`, `optional_adapted`, and
-`optional_diagnostic`. None is labelled `exact_upstream_port`.
+For `research_benchmark`, all five methods have `benchmark_role=main`. RPEX and
+RIQL-naive are recorded as `source_aligned_port`, WSRL as `framework_port`,
+Cal-QL as `source_aligned_locomotion_adaptation`, and PQE as
+`source_aligned_d4rl_v2_port`. None is labelled `exact_upstream_port`.
 
 As requested, the online stages of `riql_naive` and `uwmsg` store newly collected
 transitions in a replay buffer and train on mini-batches using the same objective
 as their offline updates. Following the default comparison protocol in the RPEX
 code, the RIQL variants, UWMSG, WSRL, and RO2O use online replay only by default.
-PEX and the Cal-QL adaptation mix offline and online data at a 50:50 ratio. The
-shared-actor PQE approximation uses density-ratio priority over a combined
-offline/online priority mass; `--offline-ratio` sets its initial target mass. Use
-`--pqe-replay-mode uniform` for the explicit fixed-ratio ablation.
+PEX uses its fixed offline/online mixture. Cal-QL dynamically recomputes
+`|D_offline| / (|D_offline| + |D_online-completed|)` and only admits complete
+online trajectories with valid post-corruption return-to-go. PQE learns a
+density ratio and samples from combined offline/online priority mass; its
+source-derived initial online fraction is `0.75`, not a fixed batch split.
 
 ## 2. Reproducibility environment
 
@@ -381,11 +383,13 @@ lower bound is applied. Add `--force-regenerate-attack` to regenerate a cache.
   deterministic expansion branch. `method_faithful` preserves stochastic RPEX
   expansion, and `both` logs both. Evaluation saves/restores Python, NumPy,
   PyTorch CPU, and CUDA RNG state.
-- `--mc-return-source post_corruption` is the Cal-QL default. Reward corruption
-  recomputes return-to-go within trajectory boundaries. Reference benchmark
-  mode uses `--calibration-mask-mode all`, so it does not reveal corrupted row
-  indices to the learner. `oracle_exclude_corrupted` is explicitly labeled as
-  an oracle ablation; `disabled` turns calibration off.
+- `--mc-return-source post_corruption` is the Cal-QL main default. Reward
+  corruption recomputes return-to-go within trajectory boundaries. Online
+  transitions remain pending until terminal or timeout; only then are exact
+  MC returns written and trajectory-length × UTD updates performed. Main mode
+  uses `--calibration-mask-mode all`, so it does not reveal corrupted row
+  indices to the learner. Oracle masking, disabled calibration, nonzero BC
+  warmup, and fixed 50:50 mixing are rejected by the research profile.
   `legacy_pre_corruption` is an explicit reproduction mode.
 - `--backup-entropy` enables the entropy term in the Cal-QL Bellman backup. The
   default is disabled, matching the task configuration used by the reference.
@@ -590,10 +594,10 @@ to continue with the remaining algorithms if one run fails.
 
 ### Research benchmark suite
 
-`run_55_experiment.py` keeps its historical filename, but its default research
-matrix is now 3 algorithms × 5 conditions: the three main baselines, clean, and
-the four individual random-corruption targets. Hopper remains the default. Run
-the readiness check first, then launch explicit seeds and budgets:
+`run_55_experiment.py` keeps its historical filename. Its default research
+matrix is 5 algorithms × 5 conditions: the five main baselines, clean, and the
+four individual random-corruption targets. Hopper remains the default. Run the
+readiness check first, then launch explicit seeds and budgets:
 
 ```bash
 conda activate corruption
@@ -606,7 +610,7 @@ python scripts/check_research_readiness.py \
 python run_55_experiment.py \
   --run-purpose research_benchmark \
   --env-name hopper-medium-replay-v2 \
-  --algorithms rpex,riql_naive,wsrl \
+  --algorithms rpex,riql_naive,wsrl,cal_ql,pessimistic_q_ensemble \
   --corruption-suite random \
   --seeds 0,1,2,3,4 \
   --offline-steps 500000 \
@@ -615,15 +619,34 @@ python run_55_experiment.py \
   --allow-diagnostic-protocol
 ```
 
+Before training, the checker reports `CONFIG-READY / RUNTIME EVIDENCE PENDING`:
+this is expected because no completed online trajectories or member checkpoint
+files exist yet. After a smoke or full run, point it at the comparison or run
+directories to validate Cal-QL online MC-return evidence and PQE's five unique
+member checkpoints:
+
+```bash
+python scripts/check_research_readiness.py \
+  --env-name hopper-medium-replay-v2 \
+  --corruption-suite random \
+  --run-dir /absolute/path/to/comparison_directory
+```
+
+`stage=both` pretrains all five PQE members on the same corrupted artifact,
+writes five independent offline member checkpoints, and then starts balanced
+online fine-tuning automatically. A separate PQE pretraining command is not
+required. For an explicitly separated `stage=online` run, pass exactly five
+distinct files with `--pqe-member-checkpoints PATH0 PATH1 PATH2 PATH3 PATH4`.
+
 Use `--env-name halfcheetah-medium-replay-v2` for HalfCheetah. The local
 Gymnasium-v4 backend remains explicitly identified in every manifest and its
 scores must not be described as an official D4RL-v2 paper reproduction. Use
 `--dry-run` to inspect commands and `--keep-going` to record later failures
 instead of stopping the controller at the first one.
 
-Optional methods require a separate opt-in, for example
-`--optional-baselines cal_ql_locomotion_adaptation`. Their rows are written to
-role-specific summaries rather than `research_summary.csv`.
+All five algorithms are included in the same main research summary. Cal-QL's
+locomotion-adaptation metadata and PQE's v0-to-v2 port metadata remain attached
+to their rows; neither method is diverted to a separate summary.
 
 Select suites explicitly with `--corruption-suite clean`, `random`,
 `adversarial`, or `all`. In the custom research benchmark, `random` means clean
@@ -658,7 +681,7 @@ is empty. The random v1 fixture has a strict-runtime mismatch; the adversarial
 v1 fixture is optimizer-core-only; full online-constructor/evaluation RNG and
 save/resume receipts are absent; and the current Mac is not the pinned Linux
 runtime. WSRL also lacks numerical and reporting parity, Cal-QL locomotion is a
-task port, and PQE is an approximation. The strict runner must reject before
+task adaptation, and PQE is a v0-to-v2 task port. The strict runner must reject before
 output creation. No final benchmark command is published until the audit can
 validate all required clean-tree, source-bound executable receipts.
 
@@ -817,7 +840,7 @@ ELAPSED: 04:05:05 (14705.000 seconds)
   `primary_research_benchmark` uses the strict registry, which currently
   contains no eligible algorithm. RPEX/RIQL-naive are source-aligned but lack
   end-to-end learner certificates; WSRL lacks learner/reporting parity; Cal-QL
-  locomotion is a task port; and local PQE is an approximation. The primary and
+  locomotion is a task adaptation; and PQE is a D4RL-v2 port. The primary and
   final launch paths therefore fail closed. Never combine their diagnostic
   curves with future certified results.
 - `paper_reproduction` is a reserved run purpose and currently fails closed:
@@ -852,8 +875,12 @@ local learner is a thin wrapper or a numerically verified port.
 See `docs/reproduction_matrix.md` and
 `docs/baseline_fidelity_manifest.yaml` before interpreting any result. RPEX and
 RIQL-naive are source-aligned ports, WSRL is an unverified framework port,
-locomotion Cal-QL is a task port, and the current Pessimistic Q-Ensemble is an
-approximation.
+locomotion Cal-QL is a frozen source-aligned task adaptation, and Pessimistic
+Q-Ensemble ports the pinned public D4RL-v0 method to the common D4RL-v2
+benchmark. PQE uses five independent actor/twin-critic members, so its offline
+gradient compute is approximately 5× a single-agent baseline even though the
+interaction budget is shared. This benchmark is interaction-matched, not
+compute-matched.
 
 - RPEX: <https://github.com/felix-thu/RPEX>
 - Pinned D4RL environment registry, dataset conversion, and normalization:

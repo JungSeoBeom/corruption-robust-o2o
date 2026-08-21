@@ -861,7 +861,11 @@ def mc_returns_from_reward_deltas(
     episode_ids: np.ndarray,
     discount: float,
 ) -> np.ndarray:
-    """Adjust clean returns while retaining rewards from filtered timeout tails."""
+    """Backward-compatible delta form for already-converted trajectories.
+
+    New benchmark artifacts compute return-to-go directly from their retained,
+    post-corruption reward sequence via :func:`recompute_mc_returns`.
+    """
     clean_rewards = np.array(clean_rewards, dtype=np.float64, copy=True).reshape(-1)
     corrupted_rewards = np.array(
         corrupted_rewards, dtype=np.float64, copy=True
@@ -908,23 +912,15 @@ def _apply_mc_return_semantics(
             len(result["rewards"]), dtype=np.float32
         )
         return
-    reward_rows = target_indices.get("rewards", np.empty(0, dtype=np.int64))
-    if len(reward_rows):
-        if "episode_id" not in clean_dataset:
-            raise RuntimeError(
-                "post-corruption MC returns require episode_id trajectory metadata"
-            )
-        result["mc_returns"] = mc_returns_from_reward_deltas(
-            clean_rewards=clean_dataset["rewards"],
-            corrupted_rewards=result["rewards"],
-            clean_mc_returns=clean_dataset["mc_returns"],
-            episode_ids=clean_dataset["episode_id"],
-            discount=config.discount,
-        )
-    valid = np.ones(len(result["rewards"]), dtype=np.float32)
-    for target in ("observations", "actions", "dynamics"):
-        valid[target_indices.get(target, np.empty(0, dtype=np.int64))] = 0.0
-    result["mc_calibration_valid"] = valid
+    # Recompute on the exact replay artifact after corruption. In particular,
+    # reward corruption changes G_t, while observation/action/dynamics
+    # corruption leaves the reward sequence (and therefore G_t) unchanged.
+    result["mc_returns"] = recompute_mc_returns(result, config.discount)
+    # Cal-QL's bound does not receive oracle corruption labels. Every retained
+    # transition has a valid post-corruption trajectory return.
+    result["mc_calibration_valid"] = np.ones(
+        len(result["rewards"]), dtype=np.float32
+    )
 
 
 def _reward_diagnostics(clean: Dataset, corrupted: Dataset) -> Dict[str, float]:

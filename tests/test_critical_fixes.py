@@ -12,6 +12,7 @@ from robust_o2o.config import ExperimentConfig, LOCAL_PROTOCOL
 from robust_o2o.corruption import (
     _apply_mc_return_semantics,
     mc_returns_from_reward_deltas,
+    recompute_mc_returns,
 )
 from robust_o2o.device import seed_env_only, seed_everything
 from robust_o2o.environment import (
@@ -354,7 +355,7 @@ class CalQLReturnRegressionTest(unittest.TestCase):
         actual = self.adjusted([1, 2], [1, 2], returns, [0, 0])
         np.testing.assert_array_equal(actual, returns)
 
-    def test_state_action_and_next_state_corruption_invalidate_calibration(self):
+    def test_nonreward_corruption_keeps_returns_and_all_sample_calibration(self):
         clean = synthetic_dataset(4)
         clean_returns = np.asarray([4.0, 3.0, 2.0, 1.0], dtype=np.float32)
         clean["mc_returns"] = clean_returns.copy()
@@ -362,7 +363,7 @@ class CalQLReturnRegressionTest(unittest.TestCase):
             with self.subTest(target=target):
                 result = {key: value.copy() for key, value in clean.items()}
                 config = ExperimentConfig(
-                    "cal_ql_locomotion_adaptation",
+                    "cal_ql",
                     "hopper-medium-replay-v2",
                     corruption="random",
                     corruption_target=target,
@@ -373,10 +374,13 @@ class CalQLReturnRegressionTest(unittest.TestCase):
                     {target: np.asarray([1], dtype=np.int64)},
                     config,
                 )
-                np.testing.assert_array_equal(result["mc_returns"], clean_returns)
+                np.testing.assert_array_equal(result["rewards"], clean["rewards"])
+                np.testing.assert_allclose(
+                    result["mc_returns"], recompute_mc_returns(result, config.discount)
+                )
                 np.testing.assert_array_equal(
                     result["mc_calibration_valid"],
-                    np.asarray([1, 0, 1, 1], dtype=np.float32),
+                    np.ones(4, dtype=np.float32),
                 )
 
 
@@ -405,17 +409,19 @@ class PQEBatchRoutingRegressionTest(unittest.TestCase):
             prioritized_rl=prioritized,
         )
 
-    def test_density_sampling_is_uniform_and_rl_sampling_is_prioritized(self):
+    def test_density_sampling_is_uniform_and_rl_uses_priority_union(self):
         with patch.object(
             self.offline, "sample", wraps=self.offline.sample
         ) as offline_sample, patch.object(
             self.online, "sample", wraps=self.online.sample
         ) as online_sample:
-            self.sample(prioritized=True)
+            rl_batch, _, _ = self.sample(prioritized=True)
         self.assertFalse(offline_sample.call_args_list[0].kwargs["prioritized"])
         self.assertFalse(online_sample.call_args_list[0].kwargs["prioritized"])
-        self.assertTrue(offline_sample.call_args_list[1].kwargs["prioritized"])
-        self.assertTrue(online_sample.call_args_list[1].kwargs["prioritized"])
+        self.assertEqual(len(offline_sample.call_args_list), 1)
+        self.assertEqual(len(online_sample.call_args_list), 1)
+        self.assertEqual(len(rl_batch["_source"]), 16)
+        self.assertTrue(set(rl_batch["_source"].tolist()).issubset({0, 1}))
 
     def test_density_and_rl_batches_are_distinct(self):
         rl_batch, density_offline, density_online = self.sample()
@@ -429,13 +435,12 @@ class PQEBatchRoutingRegressionTest(unittest.TestCase):
     def test_density_updates_and_priorities_write_to_aligned_indices(self):
         seed_everything(9)
         config = ExperimentConfig(
-            "pqe_shared_actor_approx",
+            "pessimistic_q_ensemble",
             "hopper-medium-replay-v2",
             hidden_dim=16,
-            hidden_layers=2,
-            sac_num_critics=2,
             cql_n_actions=2,
             batch_size=16,
+            pqe_weight_batch_size=16,
         )
         agent = build_agent(config, 3, 2, 1.0, self.device)
         agent.begin_online()
@@ -462,20 +467,20 @@ class PQEBatchRoutingRegressionTest(unittest.TestCase):
         self.assertEqual(self.offline.priority_updates, len(offline_indices))
         self.assertEqual(self.online.priority_updates, len(online_indices))
         self.assertGreater(stats["number_of_priority_updates"], 0.0)
-        self.assertEqual(metrics["density_batches_prioritized"], 0.0)
         self.assertEqual(metrics["rl_batch_prioritized"], 1.0)
         self.assertEqual(metrics["density_offline_count"], 16.0)
         self.assertEqual(metrics["density_online_count"], 16.0)
 
-    def test_resolved_configuration_labels_shared_actor_approximation(self):
-        config = ExperimentConfig(
-            "pqe_shared_actor_approx", "hopper-medium-replay-v2"
+    def test_canonical_pqe_uses_independent_ensemble_and_old_name_is_retired(self):
+        config = ExperimentConfig("pqe", "hopper-medium-replay-v2")
+        self.assertEqual(config.algorithm, "pessimistic_q_ensemble")
+        resolved = config.to_dict()
+        self.assertEqual(
+            resolved["implementation_type"], "source_aligned_d4rl_v2_port"
         )
-        self.assertEqual(config.algorithm, "pqe_shared_actor_approx")
-        self.assertEqual(config.to_dict()["implementation_variant"], "pqe_shared_actor_approx")
-        with self.assertRaisesRegex(ValueError, "never silently aliased"):
+        with self.assertRaisesRegex(ValueError, "retired for new runs"):
             ExperimentConfig(
-                "pessimistic_q_ensemble", "hopper-medium-replay-v2"
+                "pqe_shared_actor_approx", "hopper-medium-replay-v2"
             )
 
 

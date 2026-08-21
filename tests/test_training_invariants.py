@@ -189,31 +189,39 @@ class TrainingInvariantTest(unittest.TestCase):
                 0.0,
                 priority=10.0,
             )
-        batch = balanced_priority_batch(
-            offline, online, 20, torch.device("cpu")
-        )
-        self.assertEqual(int((batch["_source"] == 0).sum()), 10)
-        self.assertEqual(int((batch["_source"] == 1).sum()), 10)
+        online_count = 0
+        sample_count = 0
+        for _ in range(200):
+            batch = balanced_priority_batch(
+                offline, online, 20, torch.device("cpu")
+            )
+            online_count += int((batch["_source"] == 1).sum())
+            sample_count += len(batch["_source"])
+        # Offline mass is 100*1 and online mass is 10*10, so proportional
+        # union sampling approaches an even source split without fixing the
+        # count in each individual minibatch.
+        self.assertAlmostEqual(online_count / sample_count, 0.5, delta=0.05)
 
     def test_uniform_pqe_replay_is_explicit_ablation(self):
         config = ExperimentConfig(
-            "pqe_shared_actor_approx",
+            "pessimistic_q_ensemble",
             "hopper-medium-replay-v2",
             pqe_replay_mode="uniform",
         )
         self.assertEqual(config.pqe_replay_mode, "uniform")
+        with self.assertRaisesRegex(ValueError, "uniform replay"):
+            build_agent(config, 3, 2, 1.0, torch.device("cpu"))
 
     def test_pqe_priorities_change_after_update(self):
         torch.manual_seed(4)
         device = torch.device("cpu")
         config = ExperimentConfig(
-            "pqe_shared_actor_approx",
+            "pessimistic_q_ensemble",
             "hopper-medium-replay-v2",
             hidden_dim=16,
-            hidden_layers=2,
-            sac_num_critics=2,
             cql_n_actions=2,
             batch_size=16,
+            pqe_weight_batch_size=16,
         )
         agent = build_agent(config, 3, 2, 1.0, device)
         agent.begin_online()
@@ -225,13 +233,14 @@ class TrainingInvariantTest(unittest.TestCase):
                 data["observations"][index], data["actions"][index],
                 float(data["rewards"][index]), data["next_observations"][index], 0.0
             )
-        batch = mixed_batch(offline, online, 16, 0.5, device)
+        batch = balanced_priority_batch(offline, online, 16, device)
         density_offline = offline.sample(16, device, prioritized=False)
         density_online = online.sample(16, device, prioritized=False)
         metrics = agent.update(
             rl_batch=batch,
             density_offline_batch=density_offline,
             density_online_batch=density_online,
+            rl_batch_prioritized=True,
         )
         priorities = agent.consume_priority_values()
         self.assertIsNotNone(priorities)
@@ -244,7 +253,7 @@ class TrainingInvariantTest(unittest.TestCase):
         dataset = synthetic_dataset(size=8)
         dataset["episode_id"] = np.array([0, 0, 0, 1, 1, 1, 1, 1], np.float32)
         config = ExperimentConfig(
-            "cal_ql_locomotion_adaptation",
+            "cal_ql",
             "hopper-medium-replay-v2",
             corruption="random",
             corruption_target="rewards",
@@ -255,18 +264,12 @@ class TrainingInvariantTest(unittest.TestCase):
             result, _ = corrupt_offline_dataset(
                 dataset, config, None, Path(directory)
             )
-        expected = mc_returns_from_reward_deltas(
-            dataset["rewards"],
-            result["rewards"],
-            dataset["mc_returns"],
-            dataset["episode_id"],
-            0.5,
-        )
+        expected = recompute_mc_returns(result, 0.5)
         np.testing.assert_allclose(result["mc_returns"], expected)
         np.testing.assert_array_equal(result["mc_calibration_valid"], 1.0)
 
         config = ExperimentConfig(
-            "cal_ql_locomotion_adaptation",
+            "cal_ql",
             "hopper-medium-replay-v2",
             corruption="random",
             corruption_target="actions",
@@ -276,7 +279,7 @@ class TrainingInvariantTest(unittest.TestCase):
             invalid, _ = corrupt_offline_dataset(
                 dataset, config, None, Path(directory)
             )
-        np.testing.assert_array_equal(invalid["mc_calibration_valid"], 0.0)
+        np.testing.assert_array_equal(invalid["mc_calibration_valid"], 1.0)
 
     def test_mc_returns_do_not_leak_across_episode_boundaries(self):
         dataset = synthetic_dataset(size=4)
@@ -292,7 +295,7 @@ class TrainingInvariantTest(unittest.TestCase):
         original = np.arange(8, dtype=np.float32)
         dataset["mc_returns"] = original.copy()
         config = ExperimentConfig(
-            "cal_ql_locomotion_adaptation",
+            "cal_ql",
             "hopper-medium-replay-v2",
             corruption="random",
             corruption_target="rewards",
@@ -329,7 +332,7 @@ class TrainingInvariantTest(unittest.TestCase):
         ):
             torch.manual_seed(3)
             config = ExperimentConfig(
-                "cal_ql_locomotion_adaptation",
+                "cal_ql",
                 "hopper-medium-replay-v2",
                 hidden_dim=16,
                 hidden_layers=2,

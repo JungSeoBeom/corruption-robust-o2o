@@ -76,19 +76,26 @@ def _assert_nested_equal(test: unittest.TestCase, first, second) -> None:
 
 
 class FidelityProfileTest(unittest.TestCase):
-    def test_primary_suite_keeps_ports_explicit_and_rejects_pqe(self):
-        calql = ExperimentConfig(
-            "cal_ql_locomotion_adaptation",
-            "hopper-medium-replay-v2",
-            implementation_profile="locomotion_port",
-        )
-        self.assertEqual(calql.implementation_profile, "locomotion_port")
-        self.assertEqual(calql.implementation_fidelity, "task_port")
-        with self.assertRaisesRegex(ValueError, "Cal-QL locomotion"):
+    def test_research_suite_includes_explicit_calql_and_pqe_ports(self):
+        for algorithm, implementation_type in (
+            ("cal_ql", "source_aligned_locomotion_adaptation"),
+            ("pessimistic_q_ensemble", "source_aligned_d4rl_v2_port"),
+        ):
+            with self.subTest(algorithm=algorithm):
+                config = ExperimentConfig(
+                    algorithm,
+                    "hopper-medium-replay-v2",
+                    suite_profile="research_benchmark",
+                    run_purpose="research_benchmark",
+                )
+                resolved = config.to_dict()
+                self.assertEqual(resolved["benchmark_role"], "main")
+                self.assertEqual(
+                    resolved["implementation_type"], implementation_type
+                )
+        with self.assertRaisesRegex(ValueError, "historical result name"):
             ExperimentConfig(
-                "cal_ql_locomotion_adaptation",
-                "hopper-medium-replay-v2",
-                suite_profile="primary_research_benchmark",
+                "cal_ql_locomotion_adaptation", "hopper-medium-replay-v2"
             )
         with self.assertRaisesRegex(ValueError, "source_aligned_port"):
             ExperimentConfig(
@@ -96,7 +103,7 @@ class FidelityProfileTest(unittest.TestCase):
                 "hopper-medium-replay-v2",
                 suite_profile="primary_research_benchmark",
             )
-        with self.assertRaisesRegex(ValueError, "shared_actor"):
+        with self.assertRaisesRegex(ValueError, "task_port"):
             ExperimentConfig(
                 "pessimistic_q_ensemble",
                 "hopper-medium-replay-v2",
@@ -448,9 +455,9 @@ class FidelityProfileTest(unittest.TestCase):
             self.assertTrue(torch.equal(expected, actual))
             for oracle in oracles:
                 oracle.close()
-        with self.assertRaisesRegex(ValueError, "pqe_shared_actor_approx"):
+        with self.assertRaisesRegex(ValueError, "retired for new runs"):
             ExperimentConfig(
-                "pessimistic_q_ensemble",
+                "pqe_shared_actor_approx",
                 "hopper-medium-replay-v2",
                 suite_profile="method_fidelity",
             )

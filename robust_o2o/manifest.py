@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
-from .fidelity import canonical_json_sha256
+from .fidelity import BASELINE_REPRODUCTION_REGISTRY, canonical_json_sha256
 
 
 UPSTREAM_REPOSITORIES = {
@@ -11,33 +11,23 @@ UPSTREAM_REPOSITORIES = {
     "riql_naive": "https://github.com/felix-thu/RPEX",
     "riql_pex": "https://github.com/felix-thu/RPEX",
     "wsrl": "https://github.com/zhouzypaul/wsrl",
-    "cal_ql_locomotion_adaptation": "https://github.com/nakamotoo/Cal-QL",
-    "pqe_shared_actor_approx": "https://github.com/shlee94/Off2OnRL",
+    "cal_ql": "https://github.com/nakamotoo/Cal-QL",
+    "pessimistic_q_ensemble": "https://github.com/shlee94/Off2OnRL",
 }
 
 
 def _benchmark_classification(
     algorithm: str, resolved: Mapping[str, Any]
 ) -> tuple[str, str]:
-    defaults = {
-        "rpex": ("source_aligned_port", "main"),
-        "riql_naive": ("source_aligned_port", "main"),
-        "wsrl": ("framework_port", "main"),
-        "cal_ql_locomotion_adaptation": (
-            "task_adaptation",
-            "optional_adapted",
-        ),
-        "pqe_shared_actor_approx": (
-            "approximation",
-            "optional_diagnostic",
-        ),
-    }
-    default_type, default_role = defaults.get(
-        algorithm, ("diagnostic_extension", "diagnostic")
-    )
+    record = BASELINE_REPRODUCTION_REGISTRY.get(algorithm)
+    if record is not None:
+        # Canonical registry fields are authoritative.  A stale caller must
+        # not relabel Cal-QL/PQE as optional or silently restore the retired
+        # shared-actor approximation metadata.
+        return record.implementation_type, record.benchmark_role
     return (
-        str(resolved.get("implementation_type") or default_type),
-        str(resolved.get("benchmark_role") or default_role),
+        str(resolved.get("implementation_type") or "diagnostic_extension"),
+        str(resolved.get("benchmark_role") or "diagnostic"),
     )
 
 
@@ -46,6 +36,37 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
     policy_distribution = str(resolved.get("action_distribution"))
     implementation_type, benchmark_role = _benchmark_classification(
         algorithm, resolved
+    )
+    reproduction_record = BASELINE_REPRODUCTION_REGISTRY.get(algorithm)
+    display_name = (
+        reproduction_record.display_name
+        if reproduction_record is not None
+        else str(resolved.get("display_name") or algorithm)
+    )
+    task_scope = (
+        reproduction_record.task_scope
+        if reproduction_record is not None
+        else str(resolved.get("task_scope") or "unspecified")
+    )
+    upstream_task_version = (
+        reproduction_record.upstream_task_version
+        if reproduction_record is not None
+        else resolved.get("upstream_task_version")
+    )
+    benchmark_task_version = (
+        reproduction_record.benchmark_task_version
+        if reproduction_record is not None
+        else resolved.get("benchmark_task_version")
+    )
+    resolved_compute_multiplier = resolved.get("offline_compute_multiplier")
+    offline_compute_multiplier = float(
+        resolved_compute_multiplier
+        if resolved_compute_multiplier is not None
+        else (
+            reproduction_record.offline_compute_multiplier
+            if reproduction_record is not None
+            else 1.0
+        )
     )
     uses_corruption_labels = bool(
         resolved.get(
@@ -126,6 +147,11 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "backup_entropy",
         "cql_max_target_backup",
         "calibration_mask_mode",
+        "enable_calql",
+        "cql_importance_sample",
+        "orthogonal_initialization",
+        "policy_log_std_multiplier",
+        "policy_log_std_offset",
         "wsrl_num_critics",
         "wsrl_target_critic_subsample_size",
         "wsrl_per_critic_batch_size",
@@ -136,8 +162,25 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "pqe_replay_mode",
         "balanced_replay_temperature",
         "priority_floor",
+        "priority_ceiling",
         "implementation_variant",
         "pqe_member_checkpoints",
+        "pqe_ensemble_size",
+        "pqe_member_offline_steps",
+        "pqe_init_online_fraction",
+        "pqe_first_epoch_multiplier",
+        "pqe_first_online_block_steps",
+        "pqe_online_buffer_size",
+        "pqe_weight_batch_size",
+        "pqe_priority_temperature",
+        "pqe_target_update_period",
+        "pqe_member_count",
+        "ensemble_size",
+        "offline_compute_multiplier",
+        "offline_updates_per_member",
+        "total_offline_gradient_updates",
+        "member_seeds",
+        "shared_actor",
         "ro2o_beta_policy",
         "ro2o_beta_ood",
         "ro2o_q_smooth_eps",
@@ -148,6 +191,7 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "ro2o_uncertainty_min",
         "ro2o_uncertainty_decay",
         "effective_offline_ratio",
+        "offline_ratio_rule",
         "offline_ratio",
         "offline_corruption_rate",
         "online_corruption_rate",
@@ -184,17 +228,30 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
             else "non_publication_run"
         ),
         "algorithm": algorithm,
+        "display_name": display_name,
         "implementation_type": implementation_type,
         "benchmark_role": benchmark_role,
+        "task_scope": task_scope,
+        "upstream_task_version": upstream_task_version,
+        "benchmark_task_version": benchmark_task_version,
+        "offline_compute_multiplier": offline_compute_multiplier,
         "main_table_eligible": bool(
             benchmark_role == "main" and not uses_corruption_labels
         ),
         "uses_corruption_labels": uses_corruption_labels,
-        "paper_title": resolved.get("paper_title"),
+        "paper_title": (
+            reproduction_record.paper_title
+            if reproduction_record is not None
+            else resolved.get("paper_title")
+        ),
         "implementation_profile": resolved.get("implementation_profile"),
         "algorithm_profile": resolved.get("resolved_algorithm_profile"),
         "implementation_fidelity": resolved.get("implementation_fidelity"),
-        "reproduction_status": resolved.get("implementation_fidelity"),
+        "reproduction_status": (
+            reproduction_record.reproduction_status
+            if reproduction_record is not None
+            else resolved.get("implementation_fidelity")
+        ),
         "condition_status": resolved.get("condition_status"),
         "corruption_protocol_source": resolved.get(
             "corruption_protocol_source"
@@ -203,8 +260,16 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "corruption_fixture_verified": resolved.get(
             "corruption_fixture_verified"
         ),
-        "upstream_repository": UPSTREAM_REPOSITORIES.get(algorithm),
-        "upstream_commit": resolved.get("upstream_commit"),
+        "upstream_repository": (
+            reproduction_record.upstream_repository
+            if reproduction_record is not None
+            else UPSTREAM_REPOSITORIES.get(algorithm)
+        ),
+        "upstream_commit": (
+            reproduction_record.upstream_commit
+            if reproduction_record is not None
+            else resolved.get("upstream_commit")
+        ),
         "suite_profile": resolved.get("suite_profile"),
         "run_purpose": resolved.get("run_purpose"),
         "budget_profile": resolved.get("budget_profile"),
@@ -241,7 +306,18 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
             "hidden_layers": resolved.get("hidden_layers"),
             "critic_count": resolved.get("num_critics")
             if algorithm in ("rpex", "riql_naive", "riql_pex")
-            else resolved.get("sac_num_critics"),
+            else (
+                resolved.get("pqe_ensemble_size")
+                if algorithm == "pessimistic_q_ensemble"
+                else resolved.get("sac_num_critics")
+            ),
+            "ensemble_size": (
+                resolved.get("pqe_ensemble_size")
+                if algorithm == "pessimistic_q_ensemble"
+                else resolved.get("sac_num_critics")
+                if algorithm == "wsrl"
+                else None
+            ),
             "wsrl_layer_norm": resolved.get("wsrl_layer_norm"),
             "wsrl_final_hidden_kernel_scale": (
                 1e-2 if algorithm == "wsrl" else None
@@ -415,6 +491,39 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "calibration_mask_mode": resolved.get("calibration_mask_mode"),
         "oracle_information": resolved.get("oracle_information"),
         "pqe_implementation_variant": resolved.get("implementation_variant"),
+        "pqe_member_count": (
+            resolved.get("pqe_member_count", resolved.get("pqe_ensemble_size"))
+            if algorithm == "pessimistic_q_ensemble"
+            else None
+        ),
+        "ensemble_size": (
+            resolved.get("ensemble_size", resolved.get("pqe_ensemble_size"))
+            if algorithm == "pessimistic_q_ensemble"
+            else None
+        ),
+        "member_seeds": (
+            resolved.get("member_seeds")
+            if algorithm == "pessimistic_q_ensemble"
+            else None
+        ),
+        "shared_actor": (
+            resolved.get("shared_actor", False)
+            if algorithm == "pessimistic_q_ensemble"
+            else None
+        ),
+        "offline_updates_per_member": (
+            resolved.get(
+                "offline_updates_per_member",
+                resolved.get("pqe_member_offline_steps"),
+            )
+            if algorithm == "pessimistic_q_ensemble"
+            else None
+        ),
+        "total_offline_gradient_updates": (
+            resolved.get("total_offline_gradient_updates")
+            if algorithm == "pessimistic_q_ensemble"
+            else None
+        ),
         "mixed_corruption_profile": resolved.get("mixed_corruption_profile"),
         "resolved_hyperparameters": {
             field: resolved.get(field) for field in hyperparameter_fields

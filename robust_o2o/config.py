@@ -31,7 +31,6 @@ from .fidelity import (
     COMMON_BENCHMARK_REPORTING_RULE,
     FinalBenchmarkValidationError,
     MAIN_BASELINES,
-    OPTIONAL_BASELINES,
     REPORTING_RULES,
     RPEX_GOLDEN_FIXTURE_CERTIFICATES,
     STRICT_FINAL_SEEDS,
@@ -48,10 +47,10 @@ ALGORITHMS = (
     "riql_naive",
     "uwmsg",
     "pex",
-    "cal_ql_locomotion_adaptation",
+    "cal_ql",
     "wsrl",
     "ro2o",
-    "pqe_shared_actor_approx",
+    "pessimistic_q_ensemble",
 )
 
 LEGACY_PROTOCOL = "rpex_d4rl_v2_legacy"
@@ -74,15 +73,10 @@ ALGORITHM_TITLES = {
     "riql_naive": "Towards Robust Offline Reinforcement Learning under Diverse Data Corruption",
     "uwmsg": "Corruption-Robust Offline Reinforcement Learning with General Function Approximation",
     "pex": "Policy Expansion for Bridging Offline-to-Online Reinforcement Learning",
-    "cal_ql_locomotion_adaptation": (
-        "Cal-QL locomotion task adaptation (not an official locomotion recipe)"
-    ),
+    "cal_ql": "Cal-QL (D4RL locomotion adaptation)",
     "wsrl": "Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data",
     "ro2o": "Towards Robust Offline-to-Online Reinforcement Learning via Uncertainty and Smoothness",
-    "pqe_shared_actor_approx": (
-        "Shared-actor approximation of Balanced Replay and Pessimistic "
-        "Q-Ensemble (not the official independent-policy implementation)"
-    ),
+    "pessimistic_q_ensemble": "Pessimistic Q-Ensemble (D4RL-v2 port)",
 }
 
 ALGORITHM_ALIASES = {
@@ -90,15 +84,17 @@ ALGORITHM_ALIASES = {
     "riql-pex": "riql_pex",
     "riql_naive": "riql_naive",
     "riql-naive": "riql_naive",
+    "calql": "cal_ql",
+    "cal-ql": "cal_ql",
+    "pqe": "pessimistic_q_ensemble",
+    "pessimistic-q-ensemble": "pessimistic_q_ensemble",
 }
 
 RETIRED_ALGORITHM_NAMES = {
-    "pessimistic_q_ensemble",
-    "pessimistic-q-ensemble",
-    "pqe",
+    "pqe_shared_actor_approx",
     "pqe_shared_actor",
 }
-RETIRED_CALQL_NAMES = {"cal_ql", "cal-ql", "calql"}
+RETIRED_CALQL_NAMES = {"cal_ql_locomotion_adaptation"}
 
 CORRUPTION_MODES = ("clean", "random", "adversarial")
 INDIVIDUAL_CORRUPTION_TARGETS = (
@@ -245,7 +241,7 @@ class ExperimentConfig:
 
     # CQL / Cal-QL
     cql_alpha: float = 5.0
-    cql_alpha_online: float = 1.0
+    cql_alpha_online: Optional[float] = None
     cql_n_actions: int = 10
     cql_temperature: float = 1.0
     bc_steps: Optional[int] = None
@@ -254,6 +250,11 @@ class ExperimentConfig:
     cql_max_target_backup: Optional[bool] = None
     calibration_mask_mode: str = "all"
     mc_return_source: str = "post_corruption"
+    enable_calql: Optional[bool] = None
+    cql_importance_sample: bool = True
+    orthogonal_initialization: Optional[bool] = None
+    policy_log_std_multiplier: float = 1.0
+    policy_log_std_offset: float = -1.0
 
     # WSRL / REDQ reference controls. ``updates_per_step`` remains a generic
     # legacy knob; the reference WSRL schedule is resolved independently.
@@ -269,8 +270,18 @@ class ExperimentConfig:
     pqe_replay_mode: str = "balanced_density"
     balanced_replay_temperature: float = 5.0
     priority_floor: float = 1e-3
+    priority_ceiling: float = 1e3
     implementation_variant: Optional[str] = None
     pqe_member_checkpoints: Tuple[str, ...] = ()
+    pqe_ensemble_size: int = 5
+    pqe_member_offline_steps: Optional[int] = None
+    pqe_init_online_fraction: float = 0.75
+    pqe_first_epoch_multiplier: int = 5
+    pqe_first_online_block_steps: int = 1_000
+    pqe_online_buffer_size: int = 250_000
+    pqe_weight_batch_size: int = 256
+    pqe_priority_temperature: float = 5.0
+    pqe_target_update_period: int = 1
 
     # RO2O
     ro2o_beta_policy: float = 1.0
@@ -303,16 +314,14 @@ class ExperimentConfig:
         requested_algorithm = self.algorithm.strip().lower()
         if requested_algorithm in RETIRED_ALGORITHM_NAMES:
             raise ValueError(
-                "Exact Pessimistic Q-Ensemble is not implemented. The local "
-                "shared-actor method is only an approximation; select "
-                "algorithm='pqe_shared_actor_approx' explicitly. The retired "
-                "name 'pessimistic_q_ensemble' is never silently aliased."
+                "pqe_shared_actor_approx is retired for new runs; select "
+                "algorithm='pessimistic_q_ensemble', which uses five independent "
+                "actor/twin-critic members"
             )
         if requested_algorithm in RETIRED_CALQL_NAMES:
             raise ValueError(
-                "The available locomotion implementation is a task adaptation, "
-                "not an official Cal-QL locomotion recipe; select "
-                "algorithm='cal_ql_locomotion_adaptation' explicitly."
+                "cal_ql_locomotion_adaptation is a historical result name; "
+                "select canonical algorithm='cal_ql' for new runs"
             )
         self.algorithm = ALGORITHM_ALIASES.get(requested_algorithm, requested_algorithm)
         self.env_name = normalize_env_name(self.env_name)
@@ -372,9 +381,13 @@ class ExperimentConfig:
         self.calibration_mask_mode = self.calibration_mask_mode.lower()
         self.pqe_replay_mode = self.pqe_replay_mode.lower()
         self.implementation_variant = (
-            "pqe_shared_actor_approx"
-            if self.algorithm == "pqe_shared_actor_approx"
-            else None
+            "source_aligned_d4rl_v2_port"
+            if self.algorithm == "pessimistic_q_ensemble"
+            else (
+                "source_aligned_locomotion_adaptation"
+                if self.algorithm == "cal_ql"
+                else None
+            )
         )
         self.pqe_member_checkpoints = tuple(self.pqe_member_checkpoints)
         self.benchmark_seed_set = tuple(int(value) for value in self.benchmark_seed_set)
@@ -447,11 +460,15 @@ class ExperimentConfig:
                 else "deterministic_diagnostic"
             )
         if self.run_purpose == "research_benchmark":
-            # A common clean deterministic evaluation protocol is part of the
-            # custom benchmark contract; method-specific stochastic reporting
-            # policies are intentionally not used here.
-            self.evaluation_mode = "deterministic_diagnostic"
-            self.evaluation_policy_profile = "deterministic_diagnostic"
+            # RPEX's reported policy is the upstream epsilon/Q policy-expansion
+            # rule.  Its deterministic argmax is kept as a secondary diagnostic.
+            # The remaining methods report their deterministic clean policy.
+            if self.algorithm == "rpex":
+                self.evaluation_mode = "both"
+                self.evaluation_policy_profile = "official_code_epsilon_switching"
+            else:
+                self.evaluation_mode = "deterministic_diagnostic"
+                self.evaluation_policy_profile = "deterministic_diagnostic"
 
         if not self.normalize_states:
             self.state_normalization = "none"
@@ -607,9 +624,19 @@ class ExperimentConfig:
                 "--initialize-from-checkpoint and --resume-run have different semantics "
                 "and are mutually exclusive"
             )
-        if self.stage == "online" and not self.initialize_from_checkpoint and not self.resume_run:
+        pqe_member_initialization = (
+            self.algorithm == "pessimistic_q_ensemble"
+            and len(self.pqe_member_checkpoints) == self.pqe_ensemble_size
+        )
+        if (
+            self.stage == "online"
+            and not self.initialize_from_checkpoint
+            and not self.resume_run
+            and not pqe_member_initialization
+        ):
             raise ValueError(
-                "--stage online requires --initialize-from-checkpoint or --resume-run"
+                "--stage online requires --initialize-from-checkpoint, --resume-run, "
+                "or exactly five --pqe-member-checkpoints for PQE"
             )
         for name in ("offline_corruption_rate", "online_corruption_rate"):
             value = getattr(self, name)
@@ -621,6 +648,31 @@ class ExperimentConfig:
             raise ValueError("balanced_replay_temperature must be positive")
         if self.priority_floor <= 0.0:
             raise ValueError("priority_floor must be positive")
+        if self.priority_ceiling < self.priority_floor:
+            raise ValueError("priority_ceiling must be >= priority_floor")
+        if not 0.0 < self.pqe_init_online_fraction < 1.0:
+            raise ValueError("pqe_init_online_fraction must be strictly between 0 and 1")
+        for name in (
+            "pqe_ensemble_size",
+            "pqe_first_epoch_multiplier",
+            "pqe_first_online_block_steps",
+            "pqe_online_buffer_size",
+            "pqe_weight_batch_size",
+            "pqe_target_update_period",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.pqe_member_offline_steps is not None and self.pqe_member_offline_steps < 0:
+            raise ValueError("pqe_member_offline_steps cannot be negative")
+        if self.pqe_priority_temperature <= 0.0:
+            raise ValueError("pqe_priority_temperature must be positive")
+        if self.algorithm == "pessimistic_q_ensemble" and self.pqe_member_checkpoints:
+            if len(self.pqe_member_checkpoints) != self.pqe_ensemble_size:
+                raise ValueError(
+                    "PQE requires exactly one checkpoint per independent member"
+                )
+            if len(set(self.pqe_member_checkpoints)) != len(self.pqe_member_checkpoints):
+                raise ValueError("PQE member checkpoint paths must be unique")
         if (
             self.attack_step_size < 0.0
             or self.online_attack_step_size < 0.0
@@ -702,11 +754,10 @@ class ExperimentConfig:
                 "run_purpose=research_benchmark requires "
                 "implementation_profile=research_benchmark"
             )
-        if self.algorithm not in (*MAIN_BASELINES, *OPTIONAL_BASELINES):
+        if self.algorithm not in MAIN_BASELINES:
             raise ValueError(
-                "research_benchmark supports main baselines "
-                f"{MAIN_BASELINES} and explicit optional baselines "
-                f"{OPTIONAL_BASELINES}; got {self.algorithm!r}"
+                "research_benchmark supports exactly the five main baselines "
+                f"{MAIN_BASELINES}; got {self.algorithm!r}"
             )
         if self.stage != "both":
             raise ValueError("research_benchmark requires stage='both'")
@@ -715,13 +766,21 @@ class ExperimentConfig:
                 "research_benchmark forbids oracle_exclude_corrupted: "
                 "corruption masks/labels must not be passed to the learner"
             )
-        if self.evaluation_mode != "deterministic_diagnostic":
+        expected_evaluation_mode = "both" if self.algorithm == "rpex" else "deterministic_diagnostic"
+        expected_evaluation_policy = (
+            "official_code_epsilon_switching"
+            if self.algorithm == "rpex"
+            else "deterministic_diagnostic"
+        )
+        if self.evaluation_mode != expected_evaluation_mode:
             raise ValueError(
-                "research_benchmark requires clean deterministic evaluation"
+                f"research_benchmark {self.algorithm} requires "
+                f"evaluation_mode={expected_evaluation_mode}"
             )
-        if self.evaluation_policy_profile != "deterministic_diagnostic":
+        if self.evaluation_policy_profile != expected_evaluation_policy:
             raise ValueError(
-                "research_benchmark requires a common deterministic evaluation policy"
+                f"research_benchmark {self.algorithm} requires "
+                f"evaluation_policy_profile={expected_evaluation_policy}"
             )
         if self.attack_timing != "official_code_post_transition_replay_poisoning":
             raise ValueError(
@@ -756,6 +815,93 @@ class ExperimentConfig:
                 "WSRL main results require offline_ratio=0 during online "
                 "training; a nonzero ratio must use a separately named adaptation"
             )
+        if self.algorithm == "cal_ql":
+            required = {
+                "hidden_dim": (self.hidden_dim, 256),
+                "hidden_layers": (self.hidden_layers, 2),
+                "batch_size": (self.batch_size, 256),
+                "calql_bc_warmup_steps": (self.calql_bc_warmup_steps, 0),
+                "cql_n_actions": (self.cql_n_actions, 10),
+                "cql_alpha": (self.cql_alpha, 5.0),
+                "cql_alpha_online": (self.cql_alpha_online, 5.0),
+                "backup_entropy": (self.backup_entropy, False),
+                "cql_max_target_backup": (self.cql_max_target_backup, True),
+                "calibration_mask_mode": (self.calibration_mask_mode, "all"),
+                "mc_return_source": (self.mc_return_source, "post_corruption"),
+                "enable_calql": (self.enable_calql, True),
+                "cql_importance_sample": (self.cql_importance_sample, True),
+                "orthogonal_initialization": (self.orthogonal_initialization, True),
+                "updates_per_step": (self.updates_per_step, 1),
+            }
+            mismatches = {
+                name: {"actual": actual, "required": expected}
+                for name, (actual, expected) in required.items()
+                if actual != expected
+            }
+            float_required = {
+                "actor_learning_rate": (self.actor_learning_rate, 1e-4),
+                "critic_learning_rate": (self.critic_learning_rate, 3e-4),
+                "temperature_learning_rate": (self.temperature_learning_rate, 1e-4),
+                "target_update_rate": (self.target_update_rate, 0.005),
+                "discount": (self.discount, 0.99),
+                "cql_temperature": (self.cql_temperature, 1.0),
+                "target_entropy": (
+                    self.target_entropy,
+                    -float(ACTION_DIMS[self.env_name.split("-", 1)[0]]),
+                ),
+                "policy_log_std_multiplier": (self.policy_log_std_multiplier, 1.0),
+                "policy_log_std_offset": (self.policy_log_std_offset, -1.0),
+            }
+            mismatches.update(
+                {
+                    name: {"actual": actual, "required": expected}
+                    for name, (actual, expected) in float_required.items()
+                    if actual is None or not math.isclose(float(actual), expected)
+                }
+            )
+            if self.offline_ratio is not None:
+                mismatches["offline_ratio"] = {
+                    "actual": self.offline_ratio,
+                    "required": "dynamic dataset-size rule (leave unset)",
+                }
+            if mismatches:
+                raise ValueError(f"Cal-QL main frozen config mismatch: {mismatches}")
+        if self.algorithm == "pessimistic_q_ensemble":
+            required = {
+                "pqe_ensemble_size": (self.pqe_ensemble_size, 5),
+                "pqe_replay_mode": (self.pqe_replay_mode, "balanced_density"),
+                "pqe_first_epoch_multiplier": (self.pqe_first_epoch_multiplier, 5),
+                "pqe_first_online_block_steps": (self.pqe_first_online_block_steps, 1_000),
+                "pqe_online_buffer_size": (self.pqe_online_buffer_size, 250_000),
+                "pqe_weight_batch_size": (self.pqe_weight_batch_size, 256),
+                "pqe_target_update_period": (self.pqe_target_update_period, 1),
+                "pqe_member_offline_steps": (
+                    self.pqe_member_offline_steps,
+                    self.offline_steps,
+                ),
+            }
+            mismatches = {
+                name: {"actual": actual, "required": expected}
+                for name, (actual, expected) in required.items()
+                if actual != expected
+            }
+            for name, actual, expected in (
+                ("pqe_init_online_fraction", self.pqe_init_online_fraction, 0.75),
+                ("pqe_priority_temperature", self.pqe_priority_temperature, 5.0),
+                ("target_update_rate", self.target_update_rate, 0.005),
+                ("target_entropy", self.target_entropy, -float(ACTION_DIMS[self.env_name.split("-", 1)[0]])),
+                ("actor_learning_rate", self.actor_learning_rate, 3e-4),
+                ("critic_learning_rate", self.critic_learning_rate, 3e-4),
+            ):
+                if actual is None or not math.isclose(float(actual), expected):
+                    mismatches[name] = {"actual": actual, "required": expected}
+            if self.offline_ratio is not None:
+                mismatches["offline_ratio"] = {
+                    "actual": self.offline_ratio,
+                    "required": "balanced priority replay (leave unset)",
+                }
+            if mismatches:
+                raise ValueError(f"PQE main frozen config mismatch: {mismatches}")
 
     def _validate_final_benchmark(self) -> None:
         """Fail before creating a run directory for any non-final setting."""
@@ -1199,7 +1345,7 @@ class ExperimentConfig:
             self.implementation_profile = self.algorithm_profile
 
         if research_suite:
-            if self.algorithm not in (*MAIN_BASELINES, *OPTIONAL_BASELINES):
+            if self.algorithm not in MAIN_BASELINES:
                 raise ValueError(
                     f"algorithm {self.algorithm!r} is not part of the "
                     "research_benchmark registry"
@@ -1212,29 +1358,6 @@ class ExperimentConfig:
                     "implementation_profile=research_benchmark"
                 )
         elif primary_suite:
-            if self.algorithm == "pqe_shared_actor_approx":
-                error_type = (
-                    FinalBenchmarkValidationError
-                    if self.run_purpose == "final_benchmark"
-                    else ValueError
-                )
-                raise error_type(
-                    "primary research fidelity is unavailable for Pessimistic Q-Ensemble: "
-                    "the local implementation is pqe_shared_actor_approx, not the "
-                    "official N=5 independently pretrained ensemble"
-                )
-            if self.algorithm == "cal_ql_locomotion_adaptation":
-                error_type = (
-                    FinalBenchmarkValidationError
-                    if self.run_purpose == "final_benchmark"
-                    else ValueError
-                )
-                raise error_type(
-                    "Cal-QL locomotion is unavailable in a research-facing suite: "
-                    "the official repository supports AntMaze/Adroit recipes only. "
-                    "Use run_purpose=diagnostic with common_budget_diagnostic and "
-                    "report task_port/non_publication_diagnostic."
-                )
             if self.suite_profile == "primary_research_benchmark":
                 record = BASELINE_REPRODUCTION_REGISTRY.get(self.algorithm)
                 if record is None or not baseline_record_is_strict_eligible(record):
@@ -1270,8 +1393,6 @@ class ExperimentConfig:
         else:
             if self.implementation_profile is None:
                 self.implementation_profile = "common_budget_robustness"
-            if self.algorithm == "pqe_shared_actor_approx":
-                self.implementation_profile = "experimental_approximation"
 
         official_status = BASELINE_REPRODUCTION_REGISTRY.get(
             self.algorithm
@@ -1288,10 +1409,10 @@ class ExperimentConfig:
         if common_budget_suite and fidelity not in ("approximation", "legacy_unknown"):
             fidelity = (
                 "task_port"
-                if self.algorithm == "cal_ql_locomotion_adaptation"
+                if self.algorithm == "cal_ql"
                 else "diagnostic_extension"
             )
-        if self.algorithm == "cal_ql_locomotion_adaptation" and fidelity in (
+        if self.algorithm == "cal_ql" and fidelity in (
             "exact_upstream_port",
             "source_aligned_port",
             "framework_port_verified",
@@ -1312,6 +1433,11 @@ class ExperimentConfig:
             self.action_execution_profile = "official_algorithm_behavior"
             if self.corruption == "adversarial":
                 self.adversarial_attack_profile = "rpex_official_adam"
+        elif (
+            self.implementation_profile == "research_benchmark"
+            and self.algorithm in ("rpex", "riql_naive", "riql_pex")
+        ):
+            self.action_execution_profile = "official_algorithm_behavior"
         elif self.implementation_profile == "paper_reference":
             if (
                 self.algorithm in ("rpex", "riql_naive", "riql_pex")
@@ -1333,8 +1459,10 @@ class ExperimentConfig:
             and self.implementation_profile not in ("legacy_current",)
         ):
             self.action_distribution = "official_unsquashed_gaussian"
-        if self.algorithm == "cal_ql_locomotion_adaptation":
-            self.task_profile = "d4rl_locomotion_port"
+        if self.algorithm == "cal_ql":
+            self.task_profile = "d4rl_locomotion_adaptation"
+        elif self.algorithm == "pessimistic_q_ensemble":
+            self.task_profile = "d4rl_v2_port"
         elif self.task_profile is None:
             self.task_profile = "official_supported_task"
         if self.policy_extraction is None:
@@ -1402,8 +1530,10 @@ class ExperimentConfig:
         )
         reference_actor_lr = (
             1e-4
-            if self.algorithm in ("cal_ql_locomotion_adaptation", "wsrl")
+            if self.algorithm in ("cal_ql", "wsrl")
             and reference
+            else 3e-4
+            if self.algorithm == "pessimistic_q_ensemble" and reference
             else self.learning_rate
         )
         self.actor_learning_rate = (
@@ -1417,7 +1547,11 @@ class ExperimentConfig:
             else self.critic_learning_rate
         )
         reference_temperature_lr = (
-            1e-4 if self.algorithm == "wsrl" and reference else self.entropy_lr
+            1e-4
+            if self.algorithm in ("cal_ql", "wsrl") and reference
+            else 3e-4
+            if self.algorithm == "pessimistic_q_ensemble" and reference
+            else self.entropy_lr
         )
         self.temperature_learning_rate = (
             reference_temperature_lr
@@ -1435,8 +1569,24 @@ class ExperimentConfig:
             else int(requested_warmup)
         )
         self.bc_steps = self.calql_bc_warmup_steps
+        if self.cql_alpha_online is None:
+            self.cql_alpha_online = 5.0 if self.algorithm == "cal_ql" else 1.0
         if self.cql_max_target_backup is None:
             self.cql_max_target_backup = bool(reference)
+        if self.enable_calql is None:
+            self.enable_calql = self.algorithm == "cal_ql"
+        if self.orthogonal_initialization is None:
+            self.orthogonal_initialization = bool(
+                self.algorithm == "cal_ql" and reference
+            )
+        if self.algorithm == "cal_ql" and reference:
+            # Frozen source-derived locomotion adaptation. Research validation
+            # below rejects attempts to mutate these values.
+            self.cql_alpha_online = 5.0
+        if self.algorithm == "pessimistic_q_ensemble":
+            if self.pqe_member_offline_steps is None:
+                self.pqe_member_offline_steps = self.offline_steps
+            self.balanced_replay_temperature = self.pqe_priority_temperature
         if self.algorithm == "wsrl":
             if self.wsrl_num_critics is None:
                 self.wsrl_num_critics = 10 if reference else self.sac_num_critics
@@ -1476,9 +1626,11 @@ class ExperimentConfig:
                 )
         if self.algorithm not in ("rpex", "riql_pex"):
             self.evaluation_policy_profile = "deterministic_diagnostic"
-        if self.algorithm in ("pex", "cal_ql_locomotion_adaptation"):
+        if self.algorithm == "pex":
             self.online_replay_profile = "fixed_offline_online_mixture"
-        elif self.algorithm == "pqe_shared_actor_approx":
+        elif self.algorithm == "cal_ql":
+            self.online_replay_profile = "dynamic_offline_online_mixture"
+        elif self.algorithm == "pessimistic_q_ensemble":
             self.online_replay_profile = (
                 "balanced_density_replay"
                 if self.pqe_replay_mode == "balanced_density"
@@ -1487,9 +1639,9 @@ class ExperimentConfig:
 
     @property
     def resolved_algorithm_profile(self) -> str:
-        if self.algorithm == "cal_ql_locomotion_adaptation":
+        if self.algorithm == "cal_ql":
             base = (
-                "calql_locomotion_port"
+                "calql_source_aligned_locomotion_adaptation"
                 if self.implementation_profile != "legacy_current"
                 else "calql_legacy_bc100k"
             )
@@ -1504,8 +1656,8 @@ class ExperimentConfig:
                 if self.implementation_profile != "legacy_current"
                 else "wsrl_legacy_min10"
             )
-        if self.algorithm == "pqe_shared_actor_approx":
-            return "pqe_shared_actor_approx"
+        if self.algorithm == "pessimistic_q_ensemble":
+            return "pqe_independent_5_member_d4rl_v2_port"
         return f"{self.algorithm}_{self.implementation_profile}"
 
     @property
@@ -1529,18 +1681,20 @@ class ExperimentConfig:
             and self.online_replay_profile == "paper_offline_online_mixture"
         ):
             return 0.5
-        # Mirrors RPEX: robust IQL variants reduce online replay as an offline
-        # problem; PEX and Cal-QL keep balanced offline samples.
+        # Cal-QL is dynamically recomputed from dataset sizes at every update;
+        # this value is its initial (empty-online-replay) fraction. PQE samples
+        # proportional to priorities, with 0.75 as its source initial online
+        # target fraction rather than a fixed batch split.
         return {
             "rpex": 0.0,
             "riql_pex": 0.0,
             "riql_naive": 0.0,
             "uwmsg": 0.0,
             "pex": 0.5,
-            "cal_ql_locomotion_adaptation": 0.5,
+            "cal_ql": 1.0,
             "wsrl": 0.0,
             "ro2o": 0.0,
-            "pqe_shared_actor_approx": 0.5,
+            "pessimistic_q_ensemble": 1.0 - self.pqe_init_online_fraction,
         }[self.algorithm]
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1553,6 +1707,13 @@ class ExperimentConfig:
             self._validate_research_benchmark()
         result = asdict(self)
         result["effective_offline_ratio"] = self.effective_offline_ratio
+        result["offline_ratio_rule"] = (
+            "offline_size/(offline_size+completed_online_size)"
+            if self.algorithm == "cal_ql" and self.offline_ratio is None
+            else "proportional_priority_sampling"
+            if self.algorithm == "pessimistic_q_ensemble" and self.offline_ratio is None
+            else "fixed"
+        )
         official_replay_sampling = (
             self.algorithm in ("rpex", "riql_naive", "riql_pex")
             and self.implementation_profile == "official_code_reference"
@@ -1578,9 +1739,14 @@ class ExperimentConfig:
             else "experiment_seed_plus_20003_unless_explicit"
         )
         result["replay_rng_parity_verified"] = official_replay_sampling
+        fresh_online_optimizer = (
+            self.algorithm in ("rpex", "riql_naive", "riql_pex")
+            and self.implementation_profile
+            in ("official_code_reference", "research_benchmark")
+        )
         result["online_optimizer_transition"] = (
             "fresh_adam_all_modules_no_scheduler"
-            if official_replay_sampling
+            if fresh_online_optimizer
             else "implementation_specific_continuation"
         )
         result["online_actor_initialization"] = (
@@ -1588,14 +1754,16 @@ class ExperimentConfig:
             if official_replay_sampling and self.algorithm == "rpex"
             else (
                 "offline_policy_weights_fresh_optimizer_constructor_rng_unverified"
-                if official_replay_sampling
+                if fresh_online_optimizer
                 else "implementation_specific"
             )
         )
         result["online_phase_rng_parity_verified"] = False
         result["evaluation_action_sampling"] = (
             "rpex_epsilon_greedy_sample_then_cpu_mask"
-            if official_replay_sampling and self.algorithm == "rpex"
+            if self.algorithm == "rpex"
+            and self.implementation_profile
+            in ("official_code_reference", "research_benchmark")
             else (
                 "deterministic_policy_mean"
                 if self.run_purpose == "research_benchmark"
@@ -1614,6 +1782,7 @@ class ExperimentConfig:
             "effective_online_checkpoint_period"
         ] = self.effective_online_checkpoint_period
         result["paper_title"] = ALGORITHM_TITLES[self.algorithm]
+        result["display_name"] = ALGORITHM_TITLES[self.algorithm]
         result["base_seed"] = self.seed
         result["resolved_algorithm_profile"] = self.resolved_algorithm_profile
         result["implementation_profile"] = self.implementation_profile
@@ -1626,6 +1795,8 @@ class ExperimentConfig:
             self.wsrl_utd_ratio if self.algorithm == "wsrl" else self.updates_per_step
         )
         record = BASELINE_REPRODUCTION_REGISTRY.get(self.algorithm)
+        if record is not None and record.display_name:
+            result["display_name"] = record.display_name
         reporting = (
             COMMON_BENCHMARK_REPORTING_RULE
             if self.run_purpose == "research_benchmark"
@@ -1645,6 +1816,9 @@ class ExperimentConfig:
             and self.calibration_mask_mode != "oracle_exclude_corrupted"
         )
         result["research_benchmark_eligible"] = result["main_table_eligible"]
+        result["task_scope"] = (
+            record.task_scope if record is not None else self.task_profile
+        )
         result["uses_corruption_labels"] = (
             self.calibration_mask_mode == "oracle_exclude_corrupted"
         )
@@ -1823,9 +1997,34 @@ class ExperimentConfig:
                     * self.wsrl_per_critic_batch_size,
                 }
             )
-        if self.algorithm == "cal_ql_locomotion_adaptation":
-            result["calql_actor_update_mode_at_start"] = (
-                "bc_warmup" if self.calql_bc_warmup_steps > 0 else "sac"
+        if self.algorithm == "cal_ql":
+            result.update(
+                {
+                    "calql_actor_update_mode_at_start": "sac",
+                    "calql_online_calibration_enabled": bool(self.enable_calql),
+                    "calql_online_cql_enabled": True,
+                    "calql_dynamic_replay_mixing": self.offline_ratio is None,
+                    "calql_mc_return_source": self.mc_return_source,
+                }
+            )
+        if self.algorithm == "pessimistic_q_ensemble":
+            result.update(
+                {
+                    "pqe_member_count": self.pqe_ensemble_size,
+                    "ensemble_size": self.pqe_ensemble_size,
+                    "offline_compute_multiplier": self.pqe_ensemble_size,
+                    "offline_updates_per_member": self.pqe_member_offline_steps,
+                    "total_offline_gradient_updates": (
+                        self.pqe_ensemble_size * int(self.pqe_member_offline_steps or 0)
+                    ),
+                    "member_seeds": [
+                        int(self.seed + 4 * index)
+                        for index in range(self.pqe_ensemble_size)
+                    ],
+                    "upstream_task_version": "v0",
+                    "benchmark_task_version": "v2",
+                    "shared_actor": False,
+                }
             )
         return result
 
@@ -1866,10 +2065,10 @@ class ExperimentConfig:
                 "optional_adapted": "research_optional_task_adaptation",
                 "optional_diagnostic": "research_optional_approximation",
             }[role]
-        if self.algorithm == "cal_ql_locomotion_adaptation":
-            return "non_publication_diagnostic"
-        if self.algorithm == "pqe_shared_actor_approx":
-            return "diagnostic_extension"
+        if self.algorithm == "cal_ql":
+            return "benchmark_task_adaptation"
+        if self.algorithm == "pessimistic_q_ensemble":
+            return "benchmark_version_port"
         if self.algorithm in ("rpex", "riql_naive", "riql_pex"):
             if (
                 self.corruption == "random"
@@ -2107,7 +2306,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--entropy-lr", type=float, default=3e-4)
 
     parser.add_argument("--cql-alpha", type=float, default=5.0)
-    parser.add_argument("--cql-alpha-online", type=float, default=1.0)
+    parser.add_argument("--cql-alpha-online", type=float)
     parser.add_argument("--cql-n-actions", type=int, default=10)
     parser.add_argument("--cql-temperature", type=float, default=1.0)
     parser.add_argument("--bc-steps", type=int, help="deprecated alias for Cal-QL BC warmup")
@@ -2119,6 +2318,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--calibration-mask-mode", choices=CALIBRATION_MASK_MODES, default="all"
     )
+    parser.add_argument("--enable-calql", action=argparse.BooleanOptionalAction)
+    parser.add_argument(
+        "--cql-importance-sample",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--orthogonal-initialization", action=argparse.BooleanOptionalAction
+    )
+    parser.add_argument("--policy-log-std-multiplier", type=float, default=1.0)
+    parser.add_argument("--policy-log-std-offset", type=float, default=-1.0)
     parser.add_argument("--wsrl-num-critics", type=int)
     parser.add_argument("--wsrl-target-critic-subsample-size", type=int)
     parser.add_argument("--wsrl-layer-norm", action=argparse.BooleanOptionalAction)
@@ -2142,7 +2352,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--balanced-replay-temperature", type=float, default=5.0)
     parser.add_argument("--priority-floor", type=float, default=1e-3)
+    parser.add_argument("--priority-ceiling", type=float, default=1e3)
     parser.add_argument("--pqe-member-checkpoints", nargs="*", default=())
+    parser.add_argument("--pqe-ensemble-size", type=int, default=5)
+    parser.add_argument("--pqe-member-offline-steps", type=int)
+    parser.add_argument("--pqe-init-online-fraction", type=float, default=0.75)
+    parser.add_argument("--pqe-first-epoch-multiplier", type=int, default=5)
+    parser.add_argument("--pqe-first-online-block-steps", type=int, default=1_000)
+    parser.add_argument("--pqe-online-buffer-size", type=int, default=250_000)
+    parser.add_argument("--pqe-weight-batch-size", type=int, default=256)
+    parser.add_argument("--pqe-priority-temperature", type=float, default=5.0)
+    parser.add_argument("--pqe-target-update-period", type=int, default=1)
 
     parser.add_argument("--ro2o-beta-policy", type=float, default=1.0)
     parser.add_argument("--ro2o-beta-ood", type=float, default=0.1)

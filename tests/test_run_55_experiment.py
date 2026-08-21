@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from robust_o2o.config import DEFAULT_PROTOCOL
-from robust_o2o.fidelity import MAIN_BASELINES, OPTIONAL_BASELINES
+from robust_o2o.fidelity import MAIN_BASELINES
 from run_55_experiment import (
     ADVERSARIAL_SETTINGS,
     ALGORITHMS,
@@ -18,6 +18,10 @@ from run_55_experiment import (
     commands,
     settings_for_suite,
 )
+from run_matrix import (
+    _validate_args as validate_matrix_args,
+    build_parser as build_matrix_parser,
+)
 
 
 class Run55ExperimentTest(unittest.TestCase):
@@ -28,7 +32,16 @@ class Run55ExperimentTest(unittest.TestCase):
         generated = list(commands(args, (), "test_suite"))
 
         self.assertEqual(ALGORITHMS, MAIN_BASELINES)
-        self.assertEqual(len(ALGORITHMS), 3)
+        self.assertEqual(
+            ALGORITHMS,
+            (
+                "rpex",
+                "riql_naive",
+                "wsrl",
+                "cal_ql",
+                "pessimistic_q_ensemble",
+            ),
+        )
         self.assertEqual(
             SETTINGS,
             (
@@ -66,6 +79,13 @@ class Run55ExperimentTest(unittest.TestCase):
             self.assertEqual(
                 command[command.index("--comparison-name") + 1], "test_suite"
             )
+            self.assertNotIn("cal_ql_locomotion_adaptation", command)
+            self.assertNotIn("pqe_shared_actor_approx", command)
+            # Algorithm-specific frozen defaults belong to ExperimentConfig;
+            # the common launcher must not silently override them.
+            self.assertNotIn("--pqe-member-offline-steps", command)
+            self.assertNotIn("--pqe-member-checkpoints", command)
+            self.assertNotIn("--cql-alpha-online", command)
 
     def test_halfcheetah_environment_override(self):
         parser = build_parser()
@@ -174,29 +194,56 @@ class Run55ExperimentTest(unittest.TestCase):
                 command[command.index("--corruption-target") + 1], target
             )
 
-    def test_optional_baselines_require_explicit_opt_in(self):
+    def test_comma_space_and_alias_algorithm_inputs_are_canonical(self):
         parser = build_parser()
         args = parser.parse_args(
             [
                 "--corruption-suite",
                 "clean",
-                "--optional-baselines",
-                "cal_ql_locomotion_adaptation,pqe_shared_actor_approx",
+                "--algorithms",
+                "rpex,riql_naive",
+                "wsrl",
+                "calql",
+                "pqe",
             ]
         )
         _validate_args(parser, args, ())
-        command = next(iter(commands(args, (), "optional_suite")))
+        command = next(iter(commands(args, (), "alias_suite")))
         self.assertEqual(
             command[command.index("--algorithms") + 1].split(","),
-            [*MAIN_BASELINES, *OPTIONAL_BASELINES],
+            list(MAIN_BASELINES),
         )
 
-    def test_retired_official_names_fail_instead_of_aliasing(self):
+    def test_retired_result_only_names_cannot_launch(self):
         parser = build_parser()
-        for name in ("pessimistic_q_ensemble", "cal_ql"):
-            args = parser.parse_args(["--optional-baselines", name])
+        for name in (
+            "cal_ql_locomotion_adaptation",
+            "pqe_shared_actor_approx",
+        ):
+            args = parser.parse_args(["--algorithms", name])
             with self.assertRaises(SystemExit):
                 _validate_args(parser, args, ())
+
+    def test_hidden_optional_flag_is_rejected(self):
+        parser = build_parser()
+        args = parser.parse_args(["--optional-baselines", "cal_ql"])
+        with self.assertRaises(SystemExit):
+            _validate_args(parser, args, ())
+
+    def test_matrix_defaults_to_main_five_and_normalizes_aliases(self):
+        parser = build_matrix_parser()
+        defaults = parser.parse_args([])
+        validate_matrix_args(parser, defaults, [])
+        self.assertEqual(tuple(defaults.algorithms), MAIN_BASELINES)
+
+        aliases = parser.parse_args(
+            ["--algorithms", "rpex", "calql,pessimistic-q-ensemble"]
+        )
+        validate_matrix_args(parser, aliases, [])
+        self.assertEqual(
+            aliases.algorithms,
+            ["rpex", "cal_ql", "pessimistic_q_ensemble"],
+        )
 
     def test_final_adversarial_suite_rejects_optimizer_core_fixture(self):
         parser = build_parser()

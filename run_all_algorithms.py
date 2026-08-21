@@ -23,6 +23,7 @@ from plot_results import (
     write_reproduction_summaries,
 )
 from robust_o2o.config import (
+    ALGORITHM_ALIASES,
     ALGORITHMS,
     BENCHMARK_ENVS,
     CORRUPTION_MODES,
@@ -37,7 +38,6 @@ from robust_o2o.fidelity import (
     IMPLEMENTATION_PROFILES,
     MAIN_BASELINES,
     ONLINE_CORRUPTION_SCALE_PROFILES,
-    OPTIONAL_BASELINES,
     RUN_PURPOSES,
     STRICT_FINAL_SEEDS,
     SUITE_PROFILES,
@@ -55,10 +55,10 @@ ALGORITHM_DISPLAY_NAMES = {
     "riql_naive": "RIQL naive",
     "uwmsg": "UWMSG",
     "pex": "PEX",
-    "cal_ql_locomotion_adaptation": "Cal-QL locomotion adaptation",
+    "cal_ql": "Cal-QL locomotion adaptation",
     "wsrl": "WSRL",
     "ro2o": "RO2O",
-    "pqe_shared_actor_approx": "PQE shared-actor approximation",
+    "pessimistic_q_ensemble": "Pessimistic Q-Ensemble (D4RL-v2 port)",
 }
 
 TIMING_FIELDS = (
@@ -92,8 +92,22 @@ RESERVED_PASSTHROUGH_OPTIONS = {
 }
 
 
-def _csv(value: str) -> list[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
+def _flatten_cli_values(values: Iterable[str]) -> list[str]:
+    """Accept comma-separated, space-separated, or mixed CLI lists."""
+
+    return [
+        item.strip()
+        for value in values
+        for item in value.split(",")
+        if item.strip()
+    ]
+
+
+def _canonical_algorithms(values: Iterable[str]) -> list[str]:
+    return [
+        ALGORITHM_ALIASES.get(value.strip().lower(), value.strip().lower())
+        for value in _flatten_cli_values(values)
+    ]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -115,8 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("OBS", "ACT", "REW", "DYN"),
         default=(0.25, 0.25, 0.25, 0.25),
     )
-    parser.add_argument("--algorithms", type=_csv)
-    parser.add_argument("--seeds", type=_csv, default=["0"])
+    parser.add_argument(
+        "--algorithms",
+        nargs="+",
+        help="algorithm names separated by commas, spaces, or both",
+    )
+    parser.add_argument("--seeds", nargs="+", default=["0"])
     parser.add_argument(
         "--benchmark-seed-set",
         type=int,
@@ -150,11 +168,10 @@ def _validate_args(
     passthrough: Iterable[str] = (),
 ) -> None:
     if args.algorithms is None:
-        args.algorithms = list(
-            MAIN_BASELINES
-            if args.run_purpose == "research_benchmark"
-            else ALGORITHMS
-        )
+        args.algorithms = list(MAIN_BASELINES)
+    else:
+        args.algorithms = _canonical_algorithms(args.algorithms)
+    args.seeds = _flatten_cli_values(args.seeds)
     if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
         args.protocol = LOCAL_PROTOCOL
     original_env_name = args.env_name
@@ -174,6 +191,10 @@ def _validate_args(
         parser.error(f"unknown algorithms: {', '.join(unknown_algorithms)}")
     if not args.algorithms:
         parser.error("--algorithms cannot be empty")
+    if len(args.algorithms) != len(set(args.algorithms)):
+        parser.error(
+            "algorithm selections cannot contain duplicates after alias normalization"
+        )
     if args.run_purpose == "research_benchmark":
         if args.suite_profile != "research_benchmark":
             parser.error(
@@ -188,13 +209,12 @@ def _validate_args(
                 "--implementation-profile research_benchmark"
             )
         unsupported_research = sorted(
-            set(args.algorithms) - set((*MAIN_BASELINES, *OPTIONAL_BASELINES))
+            set(args.algorithms) - set(MAIN_BASELINES)
         )
         if unsupported_research:
             parser.error(
-                "research_benchmark supports only main baselines "
-                f"{','.join(MAIN_BASELINES)} and explicit optional baselines "
-                f"{','.join(OPTIONAL_BASELINES)}; invalid: "
+                "research_benchmark supports only the five main baselines "
+                f"{','.join(MAIN_BASELINES)}; invalid: "
                 + ",".join(unsupported_research)
             )
     if not args.seeds:

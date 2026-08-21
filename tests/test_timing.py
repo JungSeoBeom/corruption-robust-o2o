@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from robust_o2o.fidelity import MAIN_BASELINES, OPTIONAL_BASELINES
+from robust_o2o.fidelity import MAIN_BASELINES
 from robust_o2o.logging_utils import format_duration, format_timestamp
 from run_all_algorithms import (
     _validate_args as validate_run_all_args,
@@ -23,7 +23,7 @@ from run_all_algorithms import (
 
 
 class TimingTest(unittest.TestCase):
-    def test_research_dry_run_defaults_to_main_three_without_side_effects(self):
+    def test_research_dry_run_defaults_to_main_five_without_side_effects(self):
         with tempfile.TemporaryDirectory() as directory:
             arguments = [
                 "run_all_algorithms.py",
@@ -68,13 +68,13 @@ class TimingTest(unittest.TestCase):
                 self.assertIn(
                     "--implementation-profile research_benchmark", line
                 )
-            for algorithm in OPTIONAL_BASELINES:
-                self.assertNotIn(f"--algorithm {algorithm}", output.getvalue())
+            self.assertNotIn("cal_ql_locomotion_adaptation", output.getvalue())
+            self.assertNotIn("pqe_shared_actor_approx", output.getvalue())
             self.assertEqual(list(Path(directory).iterdir()), [])
 
-    def test_research_optional_algorithms_publish_role_summary_paths(self):
+    def test_research_main_algorithms_publish_one_main_cohort(self):
         with tempfile.TemporaryDirectory() as directory:
-            algorithms = (*MAIN_BASELINES, *OPTIONAL_BASELINES)
+            algorithms = MAIN_BASELINES
             arguments = [
                 "run_all_algorithms.py",
                 "--env-name",
@@ -105,9 +105,6 @@ class TimingTest(unittest.TestCase):
             def role_outputs(_root, output_dir, *_args, **_kwargs):
                 return {
                     "research_summary": output_dir / "research_summary.csv",
-                    "adapted_baselines_summary": output_dir
-                    / "adapted_baselines_summary.csv",
-                    "diagnostic_summary": output_dir / "diagnostic_summary.csv",
                 }
 
             with (
@@ -143,12 +140,30 @@ class TimingTest(unittest.TestCase):
             self.assertEqual(manifest["algorithms"], list(algorithms))
             self.assertEqual(
                 set(manifest["artifacts"]["reporting_csvs"]),
-                {
-                    "research_summary",
-                    "adapted_baselines_summary",
-                    "diagnostic_summary",
-                },
+                {"research_summary"},
             )
+
+    def test_run_all_accepts_space_comma_mix_and_canonical_aliases(self):
+        parser = build_run_all_parser()
+        args = parser.parse_args(
+            [
+                "--env-name",
+                "hopper-medium-replay-v2",
+                "--corruption",
+                "clean",
+                "--run-purpose",
+                "research_benchmark",
+                "--suite-profile",
+                "research_benchmark",
+                "--algorithms",
+                "rpex,riql_naive",
+                "wsrl",
+                "cal-ql",
+                "pessimistic-q-ensemble",
+            ]
+        )
+        validate_run_all_args(parser, args, ())
+        self.assertEqual(tuple(args.algorithms), MAIN_BASELINES)
 
     def test_final_adversarial_controller_rejects_non_hopper_fixture(self):
         parser = build_run_all_parser()

@@ -50,8 +50,8 @@ EXPECTED_BASELINES = {
     "rpex",
     "riql_naive",
     "wsrl",
-    "cal_ql_locomotion_adaptation",
-    "pqe_shared_actor_approx",
+    "cal_ql",
+    "pessimistic_q_ensemble",
 }
 
 CERTIFIED_STRICT_CONDITIONS = (
@@ -87,10 +87,8 @@ SAVE_RESUME_REQUIRED_STATE = [
 ]
 RPEX_UPSTREAM = BASELINE_REPRODUCTION_REGISTRY["rpex"]
 WSRL_UPSTREAM = BASELINE_REPRODUCTION_REGISTRY["wsrl"]
-CALQL_UPSTREAM = BASELINE_REPRODUCTION_REGISTRY[
-    "cal_ql_locomotion_adaptation"
-]
-PQE_UPSTREAM = BASELINE_REPRODUCTION_REGISTRY["pqe_shared_actor_approx"]
+CALQL_UPSTREAM = BASELINE_REPRODUCTION_REGISTRY["cal_ql"]
+PQE_UPSTREAM = BASELINE_REPRODUCTION_REGISTRY["pessimistic_q_ensemble"]
 CERTIFICATE_SPECS: dict[str, CertificateSpec] = {
     "rpex_riql_learner_parity": CertificateSpec(
         "rpex_riql_learner_parity",
@@ -170,8 +168,8 @@ CERTIFICATE_SPECS: dict[str, CertificateSpec] = {
         CALQL_UPSTREAM.upstream_commit,
         ("tests/fixtures/calql_locomotion_end_to_end_v1.json",),
         required_claims={
-            "algorithm": "cal_ql_locomotion_adaptation",
-            "official_task_support": "d4rl_mujoco_locomotion",
+            "algorithm": "cal_ql",
+            "task_scope": "d4rl_locomotion_adaptation",
             "parity_status": "official_adapter_verified",
         },
     ),
@@ -182,7 +180,7 @@ CERTIFICATE_SPECS: dict[str, CertificateSpec] = {
         CALQL_UPSTREAM.upstream_commit,
         ("tests/fixtures/calql_reporting_v1.json",),
         required_claims={
-            "algorithm": "cal_ql_locomotion_adaptation",
+            "algorithm": "cal_ql",
             "scope": "upstream_reporting_end_to_end",
         },
     ),
@@ -193,7 +191,7 @@ CERTIFICATE_SPECS: dict[str, CertificateSpec] = {
         PQE_UPSTREAM.upstream_commit,
         ("tests/fixtures/pqe_independent_ensemble_end_to_end_v1.json",),
         required_claims={
-            "algorithm": "pqe_shared_actor_approx",
+            "algorithm": "pessimistic_q_ensemble",
             "ensemble_size": 5,
             "independent_actors_and_twin_critics": True,
             "parity_status": "end_to_end_verified",
@@ -206,7 +204,7 @@ CERTIFICATE_SPECS: dict[str, CertificateSpec] = {
         PQE_UPSTREAM.upstream_commit,
         ("tests/fixtures/pqe_reporting_v1.json",),
         required_claims={
-            "algorithm": "pqe_shared_actor_approx",
+            "algorithm": "pessimistic_q_ensemble",
             "scope": "upstream_reporting_end_to_end",
         },
     ),
@@ -830,23 +828,19 @@ def audit(*, static_only: bool) -> list[Check]:
     )
     checks.append(
         Check(
-            "calql_locomotion_excluded",
-            not BASELINE_REPRODUCTION_REGISTRY[
-                "cal_ql_locomotion_adaptation"
-            ].strict_final_eligible,
-            BASELINE_REPRODUCTION_REGISTRY[
-                "cal_ql_locomotion_adaptation"
-            ].reproduction_status,
+            "calql_locomotion_not_strict_reproduction",
+            not BASELINE_REPRODUCTION_REGISTRY["cal_ql"].strict_final_eligible,
+            BASELINE_REPRODUCTION_REGISTRY["cal_ql"].reproduction_status,
         )
     )
     checks.append(
         Check(
-            "pqe_shared_actor_excluded",
+            "pqe_d4rl_v2_port_not_strict_reproduction",
             not BASELINE_REPRODUCTION_REGISTRY[
-                "pqe_shared_actor_approx"
+                "pessimistic_q_ensemble"
             ].strict_final_eligible,
             BASELINE_REPRODUCTION_REGISTRY[
-                "pqe_shared_actor_approx"
+                "pessimistic_q_ensemble"
             ].reproduction_status,
         )
     )
