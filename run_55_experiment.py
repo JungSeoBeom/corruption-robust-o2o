@@ -20,6 +20,7 @@ from robust_o2o.config import (
     LEGACY_LOCAL_PROTOCOL_ALIAS,
     LOCAL_PROTOCOL,
     PROTOCOLS,
+    RESEARCH_BENCHMARK_PROTOCOL_ERROR,
 )
 from robust_o2o.corruption import SUPPORTED_ADVERSARIAL_TARGETS
 from robust_o2o.fidelity import (
@@ -32,7 +33,7 @@ from robust_o2o.fidelity import (
     SUITE_PROFILES,
     strict_final_algorithms,
 )
-ENV_NAME = "hopper-medium-replay-v2"
+ENV_NAME = "halfcheetah-medium-replay-v2"
 # Backward-compatible import name used by existing launcher callers.  New runs
 # always use the five canonical main-baseline names from fidelity.py.
 ALGORITHMS = MAIN_BASELINES
@@ -218,6 +219,8 @@ def _validate_args(
 ) -> None:
     if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
         args.protocol = LOCAL_PROTOCOL
+    if args.run_purpose == "research_benchmark" and args.protocol == LOCAL_PROTOCOL:
+        parser.error(RESEARCH_BENCHMARK_PROTOCOL_ERROR)
     args.algorithms = _canonical_algorithms(args.algorithms)
     args.seeds = _flatten_cli_values(args.seeds)
     if args.optional_baselines:

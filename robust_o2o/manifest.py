@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
+from .config import LEGACY_PROTOCOL, LEGACY_SCORE_SEMANTICS
 from .fidelity import BASELINE_REPRODUCTION_REGISTRY, canonical_json_sha256
 
 
@@ -33,6 +34,20 @@ def _benchmark_classification(
 
 def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
     algorithm = str(resolved["algorithm"])
+    protocol = resolved.get("protocol") or resolved.get("environment_protocol")
+    environment_protocol = resolved.get("environment_protocol") or protocol
+    score_semantics = resolved.get("score_semantics")
+    # Fail closed on contradictory or incomplete runtime metadata.  The
+    # manifest's benchmark_eligible value is derived here instead of trusting
+    # a caller-provided boolean, so local diagnostic results cannot be
+    # relabelled by a stale config dictionary.
+    benchmark_eligible = bool(
+        resolved.get("run_purpose")
+        in ("research_benchmark", "final_benchmark")
+        and protocol == LEGACY_PROTOCOL
+        and environment_protocol == LEGACY_PROTOCOL
+        and score_semantics == LEGACY_SCORE_SEMANTICS
+    )
     policy_distribution = str(resolved.get("action_distribution"))
     implementation_type, benchmark_role = _benchmark_classification(
         algorithm, resolved
@@ -272,10 +287,12 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "suite_profile": resolved.get("suite_profile"),
         "run_purpose": resolved.get("run_purpose"),
+        "protocol": protocol,
         "budget_profile": resolved.get("budget_profile"),
         "not_paper_reproduction": resolved.get("not_paper_reproduction"),
-        "environment_protocol": resolved.get("environment_protocol"),
-        "score_semantics": resolved.get("score_semantics"),
+        "environment_protocol": environment_protocol,
+        "score_semantics": score_semantics,
+        "benchmark_eligible": benchmark_eligible,
         "dataset_id": resolved.get("dataset_id"),
         "dataset_name": resolved.get("dataset_id"),
         "evaluation_env_id": resolved.get("evaluation_env_id"),

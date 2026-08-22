@@ -32,6 +32,8 @@ from robust_o2o.config import (
     LOCAL_PROTOCOL,
     LEGACY_LOCAL_PROTOCOL_ALIAS,
     PROTOCOLS,
+    RESEARCH_BENCHMARK_PROTOCOL_ERROR,
+    is_inflight_pre_gate_run55_descendant,
     normalize_env_name,
 )
 from robust_o2o.fidelity import (
@@ -90,7 +92,6 @@ RESERVED_PASSTHROUGH_OPTIONS = {
     "--stage",
     "--suite-profile",
 }
-
 
 def _flatten_cli_values(values: Iterable[str]) -> list[str]:
     """Accept comma-separated, space-separated, or mixed CLI lists."""
@@ -365,6 +366,12 @@ def _validate_args(
                 "--comparison-name may contain only letters, digits, '.', '_', "
                 "and '-', and must start with a letter or digit"
             )
+    if (
+        args.run_purpose == "research_benchmark"
+        and args.protocol == LOCAL_PROTOCOL
+        and not is_inflight_pre_gate_run55_descendant()
+    ):
+        parser.error(RESEARCH_BENCHMARK_PROTOCOL_ERROR)
     if args.protocol in (LOCAL_PROTOCOL, "local_gymnasium_v4") and not args.allow_diagnostic_protocol:
         parser.error(
             "the local Gymnasium protocol is diagnostic-only; pass "

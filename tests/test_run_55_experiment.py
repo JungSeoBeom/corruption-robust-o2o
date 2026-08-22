@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import io
 import unittest
+from contextlib import redirect_stderr
 from unittest.mock import patch
 
-from robust_o2o.config import DEFAULT_PROTOCOL
+from robust_o2o.config import (
+    DEFAULT_PROTOCOL,
+    LEGACY_LOCAL_PROTOCOL_ALIAS,
+    LOCAL_PROTOCOL,
+)
 from robust_o2o.fidelity import MAIN_BASELINES
 from run_55_experiment import (
     ADVERSARIAL_SETTINGS,
@@ -101,6 +107,51 @@ class Run55ExperimentTest(unittest.TestCase):
                 command[command.index("--env-name") + 1],
                 "halfcheetah-medium-replay-v2",
             )
+
+    def test_research_benchmark_rejects_diagnostic_protocol_and_alias(self):
+        parser = build_parser()
+        for protocol in (LOCAL_PROTOCOL, LEGACY_LOCAL_PROTOCOL_ALIAS):
+            with self.subTest(protocol=protocol):
+                args = parser.parse_args(
+                    [
+                        "--run-purpose",
+                        "research_benchmark",
+                        "--protocol",
+                        protocol,
+                        "--allow-diagnostic-protocol",
+                    ]
+                )
+                stderr = io.StringIO()
+                with redirect_stderr(stderr), self.assertRaises(SystemExit):
+                    _validate_args(parser, args, ())
+                message = stderr.getvalue()
+                self.assertIn("ResearchBenchmarkProtocolError", message)
+                self.assertIn(
+                    "research_benchmark requires the legacy D4RL-v2 "
+                    "evaluation protocol",
+                    message,
+                )
+
+    def test_diagnostic_run_allows_diagnostic_protocol(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--run-purpose",
+                "diagnostic",
+                "--suite-profile",
+                "common_budget_diagnostic",
+                "--protocol",
+                LOCAL_PROTOCOL,
+                "--allow-diagnostic-protocol",
+            ]
+        )
+        _validate_args(parser, args, ())
+        self.assertEqual(args.protocol, LOCAL_PROTOCOL)
+        command = next(iter(commands(args, (), "diagnostic_suite")))
+        self.assertEqual(
+            command[command.index("--run-purpose") + 1], "diagnostic"
+        )
+        self.assertEqual(command[command.index("--protocol") + 1], LOCAL_PROTOCOL)
 
     def test_primary_suite_has_no_runs_when_registry_has_no_eligible_algorithm(self):
         parser = build_parser()

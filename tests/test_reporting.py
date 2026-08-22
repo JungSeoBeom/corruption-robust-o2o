@@ -13,11 +13,14 @@ from robust_o2o.fidelity import (
 )
 from robust_o2o.reporting import (
     CALQL_ONLINE_BUDGET_SEMANTICS,
+    D4RL_SCORE_SEMANTICS,
+    LEGACY_RESEARCH_PROTOCOL,
     PER_SEED_COLUMNS,
     RESEARCH_SUMMARY_COLUMNS,
     SUMMARY_COLUMNS,
     ReportingValidationError,
     aggregate_seed_scores,
+    classify_score_semantics,
     validate_calql_completion_accounting,
     write_reporting_outputs,
 )
@@ -55,6 +58,9 @@ def evaluation_frame(
                 "condition_certificate_verified": True,
                 "condition_status": "paper_reproduction_condition",
                 "run_purpose": "final_benchmark",
+                "protocol": LEGACY_RESEARCH_PROTOCOL,
+                "score_semantics": D4RL_SCORE_SEMANTICS,
+                "benchmark_eligible": True,
                 "planned_online_steps": 40_000,
                 "planned_offline_steps": 2_000_000,
                 "actual_online_steps": 40_001,
@@ -90,6 +96,9 @@ def evaluation_frame(
                     "condition_certificate_verified": True,
                     "condition_status": "paper_reproduction_condition",
                     "run_purpose": "final_benchmark",
+                    "protocol": LEGACY_RESEARCH_PROTOCOL,
+                    "score_semantics": D4RL_SCORE_SEMANTICS,
+                    "benchmark_eligible": True,
                     "planned_online_steps": 40_000,
                     "planned_offline_steps": 2_000_000,
                     "actual_online_steps": 40_001,
@@ -107,6 +116,51 @@ def evaluation_frame(
 
 
 class ReportingRuleTest(unittest.TestCase):
+    def test_score_semantics_classification_is_protocol_based_and_fail_closed(self):
+        self.assertEqual(
+            classify_score_semantics(
+                {
+                    "protocol": LEGACY_RESEARCH_PROTOCOL,
+                    "score_semantics": D4RL_SCORE_SEMANTICS,
+                    "benchmark_eligible": True,
+                    "run_purpose": "research_benchmark",
+                }
+            ),
+            (D4RL_SCORE_SEMANTICS, True),
+        )
+        diagnostic = classify_score_semantics(
+            {
+                "protocol": "local_gymnasium_v4_diagnostic",
+                "score_semantics": D4RL_SCORE_SEMANTICS,
+                "benchmark_eligible": True,
+                "run_purpose": "research_benchmark",
+            }
+        )
+        self.assertEqual(
+            diagnostic,
+            ("diagnostic_d4rl_reference_scaled_return", False),
+        )
+        self.assertEqual(
+            classify_score_semantics(
+                {
+                    "protocol": LEGACY_RESEARCH_PROTOCOL,
+                    "run_purpose": "research_benchmark",
+                }
+            ),
+            ("unknown_legacy_score", False),
+        )
+        self.assertEqual(
+            classify_score_semantics(
+                {
+                    "protocol": "unknown_legacy_protocol",
+                    "score_semantics": D4RL_SCORE_SEMANTICS,
+                    "benchmark_eligible": True,
+                    "run_purpose": "research_benchmark",
+                }
+            ),
+            ("unknown_legacy_score", False),
+        )
+
     def test_calql_completion_accounting_contract(self):
         valid = {
             "requested_online_steps": 500,
@@ -304,6 +358,125 @@ class ReportingRuleTest(unittest.TestCase):
         ].to_dict()
         self.assertEqual(windows, {"rpex": 3, "wsrl": 1})
 
+    def test_calql_common_score_excludes_post_requested_budget_evaluation(self):
+        frame = evaluation_frame(
+            seeds=(0,), online_scores=(48.0, 49.0, 50.0, 999.0)
+        )
+        frame["algorithm"] = "cal_ql"
+        frame["run_dir"] = "/tmp/calql_budget_cap_seed_0"
+        frame["run_purpose"] = "research_benchmark"
+        frame["benchmark_role"] = "main"
+        frame["implementation_type"] = (
+            "source_aligned_locomotion_adaptation"
+        )
+        frame["evaluation_corruption"] = "clean"
+        frame["uses_corruption_labels"] = False
+        frame["final_window_size"] = 3
+        frame["planned_online_steps"] = 500_000
+        frame["requested_online_steps"] = 500_000
+        frame["actual_online_steps"] = 500_137
+        frame["episode_boundary_overshoot"] = 137
+        frame["online_budget_semantics"] = CALQL_ONLINE_BUDGET_SEMANTICS
+        frame["completed_online_transitions"] = 500_137
+        frame["pending_episode_length"] = 0
+        frame["effective_calql_training_transitions"] = 500_137
+        online = frame["phase"] == "online"
+        frame.loc[online, "env_steps"] = [480_000, 490_000, 500_000, 500_137]
+        frame.loc[online, "step"] = [480_000, 490_000, 500_000, 500_137]
+
+        with tempfile.TemporaryDirectory() as directory:
+            outputs = write_reporting_outputs(
+                frame,
+                Path(directory),
+                strict=False,
+                expected_seeds=[0],
+            )
+            scores = pd.read_csv(
+                outputs["research_per_seed_final_scores"]
+            )
+        self.assertEqual(
+            scores.iloc[0]["selected_evaluation_steps"],
+            "480000;490000;500000",
+        )
+        self.assertEqual(float(scores.iloc[0]["seed_score"]), 49.0)
+        self.assertIn(500_137, frame.loc[online, "env_steps"].tolist())
+
+    def test_research_and_diagnostic_score_semantics_are_separated(self):
+        research = evaluation_frame(seeds=(0,))
+        research["run_purpose"] = "research_benchmark"
+        research["benchmark_role"] = "main"
+        research["implementation_type"] = "source_aligned_port"
+        research["evaluation_corruption"] = "clean"
+        research["uses_corruption_labels"] = False
+        research["final_window_size"] = 3
+
+        diagnostic = research.copy()
+        diagnostic["run_dir"] = "/tmp/rpex_diagnostic_seed_0"
+        diagnostic["run_purpose"] = "diagnostic"
+        diagnostic["benchmark_role"] = "diagnostic"
+        diagnostic["protocol"] = "local_gymnasium_v4_diagnostic"
+        diagnostic["score_semantics"] = (
+            "diagnostic_d4rl_reference_scaled_return"
+        )
+        diagnostic["benchmark_eligible"] = False
+        diagnostic[
+            "diagnostic_d4rl_reference_scaled_return_mean"
+        ] = diagnostic["normalized_return_mean"] + 100.0
+        diagnostic["normalized_return_mean"] = float("nan")
+
+        with tempfile.TemporaryDirectory() as directory:
+            outputs = write_reporting_outputs(
+                pd.concat([research, diagnostic], ignore_index=True),
+                Path(directory),
+                strict=False,
+                expected_seeds=[0],
+            )
+            research_summary = pd.read_csv(outputs["research_summary"])
+            diagnostic_summary = pd.read_csv(outputs["diagnostic_summary"])
+            common_summary = pd.read_csv(
+                outputs["common_benchmark_summary"]
+            )
+
+        self.assertEqual(research_summary["seed_score"].tolist(), [3.0])
+        self.assertEqual(
+            research_summary["score_semantics"].tolist(),
+            [D4RL_SCORE_SEMANTICS],
+        )
+        self.assertEqual(diagnostic_summary["mean"].tolist(), [103.0])
+        self.assertEqual(
+            diagnostic_summary["score_semantics"].tolist(),
+            ["diagnostic_d4rl_reference_scaled_return"],
+        )
+        self.assertEqual(len(common_summary), 2)
+        self.assertEqual(
+            set(common_summary["score_semantics"]),
+            {
+                D4RL_SCORE_SEMANTICS,
+                "diagnostic_d4rl_reference_scaled_return",
+            },
+        )
+
+    def test_missing_score_contract_is_fail_closed_from_research_summary(self):
+        frame = evaluation_frame(seeds=(0,))
+        frame["run_purpose"] = "research_benchmark"
+        frame["benchmark_role"] = "main"
+        frame["evaluation_corruption"] = "clean"
+        frame = frame.drop(
+            columns=["protocol", "score_semantics", "benchmark_eligible"]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            outputs = write_reporting_outputs(
+                frame,
+                Path(directory),
+                strict=False,
+                expected_seeds=[0],
+            )
+            research = pd.read_csv(outputs["research_summary"])
+            diagnostic = pd.read_csv(outputs["diagnostic_summary"])
+        self.assertTrue(research.empty)
+        self.assertEqual(len(diagnostic), 1)
+        self.assertFalse(bool(diagnostic.iloc[0]["benchmark_eligible"]))
+
     def test_offline_outputs_skip_online_paper_rule_and_write_common_summary(self):
         frame = evaluation_frame(seeds=(0,))
         frame = frame[frame["phase"] == "offline"]
@@ -491,13 +664,23 @@ class ReportingRuleTest(unittest.TestCase):
         adapted["benchmark_role"] = "optional_adapted"
         adapted["implementation_type"] = "task_adaptation"
 
+        local_adapted = adapted.copy()
+        local_adapted["run_dir"] = "/tmp/calql_local_adapted_seed_0"
+        local_adapted["protocol"] = "local_gymnasium_v4_diagnostic"
+        local_adapted["score_semantics"] = (
+            "diagnostic_d4rl_reference_scaled_return"
+        )
+        local_adapted["benchmark_eligible"] = False
+
         diagnostic = main.copy()
         diagnostic["algorithm"] = "pqe_shared_actor_approx"
         diagnostic["run_dir"] = "/tmp/pqe_approx_seed_0"
         diagnostic["benchmark_role"] = "optional_diagnostic"
         diagnostic["implementation_type"] = "approximation"
 
-        frame = pd.concat([main, adapted, diagnostic], ignore_index=True)
+        frame = pd.concat(
+            [main, adapted, local_adapted, diagnostic], ignore_index=True
+        )
         with tempfile.TemporaryDirectory() as directory:
             outputs = write_reporting_outputs(
                 frame,
@@ -516,8 +699,8 @@ class ReportingRuleTest(unittest.TestCase):
             ["cal_ql"],
         )
         self.assertEqual(
-            diagnostic_result["algorithm"].tolist(),
-            ["pessimistic_q_ensemble"],
+            set(diagnostic_result["algorithm"]),
+            {"cal_ql", "pessimistic_q_ensemble"},
         )
 
     def test_research_summary_is_seed_explicit_five_baseline_main_table(self):
@@ -639,15 +822,10 @@ class ReportingRuleTest(unittest.TestCase):
             )
             research = pd.read_csv(outputs["research_summary"])
 
-        self.assertEqual(set(research["seed"]), {0, 1})
-        self.assertEqual(
-            set(research["status"]), {"cohort_incomplete", "failed"}
-        )
+        self.assertEqual(set(research["seed"]), {0})
+        self.assertEqual(set(research["status"]), {"cohort_incomplete"})
         self.assertTrue(research["mean"].isna().all())
         self.assertTrue(research["std"].isna().all())
-        self.assertTrue(
-            research.loc[research["seed"] == 1, "seed_score"].isna().all()
-        )
 
     def test_research_summary_requires_common_interval_and_clean_evaluation(self):
         frame = evaluation_frame(seeds=(0,))

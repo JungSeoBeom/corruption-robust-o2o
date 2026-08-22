@@ -28,6 +28,89 @@ def _imports():
     return plt, pd
 
 
+def _concat_nonempty_frames(frames):
+    """Concatenate usable frames without pandas' empty/all-NA ambiguity."""
+    _, pd = _imports()
+    valid_frames = []
+    column_order = []
+
+    for frame in frames:
+        if frame is None or frame.empty:
+            continue
+
+        for column in frame.columns:
+            if column not in column_order:
+                column_order.append(column)
+
+        reduced = frame.dropna(axis=1, how="all")
+        if reduced.empty or reduced.dropna(how="all").empty:
+            continue
+        valid_frames.append(reduced)
+
+    if not valid_frames:
+        return pd.DataFrame(columns=column_order)
+
+    combined = pd.concat(valid_frames, ignore_index=True, sort=False)
+    return combined.reindex(columns=column_order)
+
+
+def _score_plot_labels(metadata):
+    """Return labels from declared protocol metadata, never numeric values."""
+
+    from robust_o2o.reporting import (
+        D4RL_SCORE_SEMANTICS,
+        DIAGNOSTIC_SCORE_SEMANTICS,
+        classify_score_semantics,
+    )
+
+    semantics, _ = classify_score_semantics(metadata)
+    if semantics == D4RL_SCORE_SEMANTICS:
+        return "D4RL normalized return", None
+    if semantics in DIAGNOSTIC_SCORE_SEMANTICS:
+        return (
+            "Diagnostic D4RL-reference-scaled return "
+            "(not benchmark normalized return)",
+            "Diagnostic Gymnasium-v4 evaluation\n"
+            "Not comparable to legacy D4RL-v2 scores",
+        )
+    return (
+        "Unclassified score (not benchmark eligible)",
+        "Unclassified score semantics\nExcluded from research benchmark plots",
+    )
+
+
+def _with_score_columns(frame, metadata):
+    """Attach semantic score columns without relabeling persisted metrics."""
+
+    _, pd = _imports()
+    from robust_o2o.reporting import (
+        DIAGNOSTIC_SCORE_SEMANTICS,
+        classify_score_semantics,
+    )
+
+    result = frame.copy()
+
+    def numeric(column):
+        if column not in result:
+            return pd.Series(float("nan"), index=result.index, dtype=float)
+        return pd.to_numeric(result[column], errors="coerce")
+
+    semantics, _ = classify_score_semantics(metadata)
+    legacy_mean = numeric("normalized_return_mean")
+    legacy_std = numeric("normalized_return_std")
+    if semantics in DIAGNOSTIC_SCORE_SEMANTICS:
+        result["score_mean"] = numeric(
+            "diagnostic_d4rl_reference_scaled_return_mean"
+        ).combine_first(legacy_mean)
+        result["score_std"] = numeric(
+            "diagnostic_d4rl_reference_scaled_return_std"
+        ).combine_first(legacy_std)
+    else:
+        result["score_mean"] = legacy_mean
+        result["score_std"] = legacy_std
+    return result
+
+
 def plot_single_run(run_dir: Path) -> Optional[Path]:
     plt, pd = _imports()
     metrics_path = run_dir / "metrics.csv"
@@ -43,11 +126,18 @@ def plot_single_run(run_dir: Path) -> Optional[Path]:
         if config_path.exists()
         else {}
     )
+    manifest_path = run_dir / "experiment_manifest.json"
+    manifest = (
+        json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_path.exists()
+        else {}
+    )
+    frame = _with_score_columns(frame, {**config, **manifest})
     figure, axis = plt.subplots(figsize=(8, 5))
     for phase, phase_frame in frame.groupby("phase"):
         axis.plot(
             phase_frame["global_step"],
-            phase_frame["normalized_return_mean"],
+            phase_frame["score_mean"],
             marker="o",
             markersize=2,
             label=(
@@ -58,10 +148,8 @@ def plot_single_run(run_dir: Path) -> Optional[Path]:
         )
         axis.fill_between(
             phase_frame["global_step"],
-            phase_frame["normalized_return_mean"]
-            - phase_frame["normalized_return_std"],
-            phase_frame["normalized_return_mean"]
-            + phase_frame["normalized_return_std"],
+            phase_frame["score_mean"] - phase_frame["score_std"],
+            phase_frame["score_mean"] + phase_frame["score_std"],
             alpha=0.15,
         )
     completed_offline = int(
@@ -77,15 +165,10 @@ def plot_single_run(run_dir: Path) -> Optional[Path]:
         label="offline → online",
     )
     axis.set_xlabel("Completed offline updates + online environment steps")
-    if config.get("score_semantics") == "d4rl_normalized_return":
-        axis.set_ylabel("D4RL normalized return")
-    else:
-        axis.set_ylabel(
-            "Diagnostic D4RL-reference-scaled return (not benchmark normalized return)"
-        )
-        axis.set_title(
-            "DIAGNOSTIC: Gymnasium-v4 evaluation, not comparable to D4RL-v2"
-        )
+    ylabel, title = _score_plot_labels({**config, **manifest})
+    axis.set_ylabel(ylabel)
+    if title is not None:
+        axis.set_title(title)
     axis.grid(alpha=0.25)
     axis.legend()
     figure.tight_layout()
@@ -113,6 +196,8 @@ def add_global_plot_steps(frame):
 
 def _load_runs(root: Path):
     _, pd = _imports()
+    from robust_o2o.reporting import classify_score_semantics
+
     frames = []
     for metrics_path in root.rglob("metrics.csv"):
         config_path = metrics_path.parent / "config.json"
@@ -380,10 +465,14 @@ def _load_runs(root: Path):
             "corruption_target", config.get("corruption_target")
         )
         frame["seed"] = int(manifest.get("learner_seed", config.get("seed", 0)))
-        frame["protocol"] = manifest.get(
-            "environment_protocol",
-            config.get("protocol", "unknown_legacy_protocol"),
+        protocol = manifest.get(
+            "protocol",
+            manifest.get(
+                "environment_protocol",
+                config.get("protocol", "unknown_legacy_protocol"),
+            ),
         )
+        frame["protocol"] = protocol
         frame["algorithm_profile"] = manifest.get(
             "implementation_profile", "legacy_current"
         )
@@ -455,10 +544,13 @@ def _load_runs(root: Path):
             "algorithm_profile",
             config.get("resolved_algorithm_profile", "unknown_legacy_profile"),
         )
-        frame["score_semantics"] = manifest.get(
-            "score_semantics",
-            config.get("score_semantics", "unknown_legacy_score"),
+        classification_metadata = {**config, **manifest, "protocol": protocol}
+        score_semantics, benchmark_eligible = classify_score_semantics(
+            classification_metadata
         )
+        frame["score_semantics"] = score_semantics
+        frame["benchmark_eligible"] = benchmark_eligible
+        frame = _with_score_columns(frame, classification_metadata)
         frame["dataset_id"] = manifest.get(
             "dataset_id", config.get("dataset_id", "unknown_legacy_dataset")
         )
@@ -681,7 +773,7 @@ def _load_runs(root: Path):
             or 0
         )
         frames.append(frame)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return _concat_nonempty_frames(frames)
 
 
 def load_runs(root: Path):
@@ -702,6 +794,20 @@ def _validate_aggregation_signatures(frame, context: str) -> None:
             f"Manifest mismatch within {context}: "
             + ", ".join(mixed_algorithms.index.tolist())
         )
+
+
+def _validate_score_contract(frame, context: str) -> None:
+    """Reject score scales that would otherwise share one mean or plot."""
+
+    if frame.empty:
+        return
+    for column in ("protocol", "score_semantics", "benchmark_eligible"):
+        values = frame[column].drop_duplicates().tolist()
+        if len(values) > 1:
+            raise RuntimeError(
+                f"Mixed {column} values cannot be aggregated in {context}: "
+                f"{values!r}"
+            )
 
 
 def write_final_score_summary(
@@ -732,6 +838,7 @@ def write_final_score_summary(
         raise RuntimeError("No runs match the requested summary filters")
     completed = frame[frame["run_status"] == "completed"]
     _validate_aggregation_signatures(completed, "final-score groups")
+    _validate_score_contract(completed, "final-score groups")
 
     common_rule = common_reporting_rule(phase)
     rules = {
@@ -763,13 +870,22 @@ def write_final_score_summary(
         how="left",
     )
     result["runs"] = result["num_seeds"]
-    result["final_normalized_return_mean"] = result["mean"]
-    result["final_normalized_return_std"] = result["std"]
+    legacy_scores = result["score_semantics"] == "d4rl_normalized_return"
+    result["final_normalized_return_mean"] = result["mean"].where(
+        legacy_scores
+    )
+    result["final_normalized_return_std"] = result["std"].where(
+        legacy_scores
+    )
+    result["final_diagnostic_scaled_return_mean"] = result["mean"].where(
+        ~legacy_scores
+    )
+    result["final_diagnostic_scaled_return_std"] = result["std"].where(
+        ~legacy_scores
+    )
     result["final_raw_return_mean"] = float("nan")
     result["final_raw_return_std"] = float("nan")
-    result = result.sort_values(
-        "final_normalized_return_mean", ascending=False, ignore_index=True
-    )
+    result = result.sort_values("mean", ascending=False, ignore_index=True)
     output.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output, index=False)
     return output
@@ -833,6 +949,7 @@ def plot_aggregate(
     allowed_statuses = ("completed", "running", "unknown") if include_running else ("completed",)
     frame = frame[frame["run_status"].isin(allowed_statuses)]
     _validate_aggregation_signatures(frame, "algorithm curves")
+    _validate_score_contract(frame, "algorithm curves")
     identity_columns = [
         "algorithm",
         "algorithm_profile",
@@ -848,7 +965,7 @@ def plot_aggregate(
             "select an explicit comparison directory instead of silently "
             "choosing the latest run"
         )
-    for column in ("protocol", "dataset_id", "evaluation_env_id"):
+    for column in ("dataset_id", "evaluation_env_id"):
         if frame[column].nunique(dropna=False) > 1:
             raise RuntimeError(
                 f"Mixed {column} values cannot be aggregated without an explicit "
@@ -883,7 +1000,7 @@ def plot_aggregate(
         )
     if not frame.empty:
         plotted_scores = pd.to_numeric(
-            frame["normalized_return_mean"], errors="raise"
+            frame["score_mean"], errors="raise"
         ).to_numpy(dtype=np.float64)
         if not np.isfinite(plotted_scores).all():
             invalid_runs = sorted(
@@ -911,14 +1028,16 @@ def plot_aggregate(
         "corruption_target",
         "offline_corruption_rate",
         "online_corruption_rate",
+        "score_semantics",
+        "benchmark_eligible",
     )
     for group, group_frame in frame.groupby(list(group_keys)):
         summary = (
             group_frame.groupby(x_column)
             .agg(
-                mean=("normalized_return_mean", "mean"),
+                mean=("score_mean", "mean"),
                 seed_std=(
-                    "normalized_return_mean",
+                    "score_mean",
                     lambda values: values.std(ddof=0),
                 ),
                 count=("seed", "nunique"),
@@ -999,17 +1118,17 @@ def plot_aggregate(
             label="offline → online",
         )
     axis.set_xlabel(x_label)
-    score_semantics = set(frame.get("score_semantics", []))
-    ylabel = (
-        "D4RL normalized return"
-        if score_semantics == {"d4rl_normalized_return"}
-        else "Diagnostic D4RL-reference-scaled return (not benchmark normalized return)"
+    plot_metadata = (
+        frame.iloc[0][
+            ["protocol", "score_semantics", "benchmark_eligible", "run_purpose"]
+        ].to_dict()
+        if not frame.empty
+        else {}
     )
+    ylabel, title = _score_plot_labels(plot_metadata)
     axis.set_ylabel(ylabel)
-    if score_semantics != {"d4rl_normalized_return"}:
-        axis.set_title(
-            "DIAGNOSTIC: Gymnasium-v4 evaluation, not comparable to D4RL-v2"
-        )
+    if title is not None:
+        axis.set_title(title)
     axis.grid(alpha=0.25)
     if summary_frames:
         axis.legend(fontsize=8, ncol=2)
@@ -1022,7 +1141,7 @@ def plot_aggregate(
     csv_output = output.with_suffix(".csv")
     temporary_csv = csv_output.with_name(f".{csv_output.stem}.tmp.csv")
     if summary_frames:
-        summary_frame = pd.concat(summary_frames, ignore_index=True)
+        summary_frame = _concat_nonempty_frames(summary_frames)
     else:
         summary_frame = pd.DataFrame(
             columns=[x_column, "mean", "std", "count", *group_keys]

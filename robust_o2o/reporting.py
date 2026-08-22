@@ -24,6 +24,9 @@ PER_SEED_COLUMNS = (
     "algorithm",
     "environment",
     "condition",
+    "protocol",
+    "score_semantics",
+    "benchmark_eligible",
     "seed",
     "aggregation_rule",
     "num_final_evaluations",
@@ -65,6 +68,9 @@ SUMMARY_COLUMNS = (
     "algorithm",
     "environment",
     "condition",
+    "protocol",
+    "score_semantics",
+    "benchmark_eligible",
     "aggregation_rule",
     "num_seeds",
     "expected_seeds",
@@ -105,6 +111,9 @@ SEED_STATUS_COLUMNS = (
     "algorithm",
     "environment",
     "condition",
+    "protocol",
+    "score_semantics",
+    "benchmark_eligible",
     "seed",
     "run_status",
     "error_message",
@@ -121,6 +130,9 @@ RESEARCH_SUMMARY_COLUMNS = (
     "implementation_type",
     "task_scope",
     "environment",
+    "protocol",
+    "score_semantics",
+    "benchmark_eligible",
     "corruption",
     "corruption_target",
     "seed",
@@ -153,6 +165,16 @@ APPROXIMATION_BASELINES: frozenset[str] = frozenset()
 CALQL_ONLINE_BUDGET_SEMANTICS = (
     "calql_complete_current_episode_at_or_after_requested"
 )
+LEGACY_RESEARCH_PROTOCOL = "rpex_d4rl_v2_legacy"
+D4RL_SCORE_SEMANTICS = "d4rl_normalized_return"
+DIAGNOSTIC_SCORE_SEMANTICS = frozenset(
+    {
+        # Canonical repository spelling.
+        "diagnostic_d4rl_reference_scaled_return",
+        # Accepted only as a diagnostic label for older/external result rows.
+        "diagnostic_scaled",
+    }
+)
 CALQL_FAIRNESS_FIELDS = (
     "requested_online_steps",
     "actual_online_steps",
@@ -161,6 +183,47 @@ CALQL_FAIRNESS_FIELDS = (
     "pending_episode_length",
     "effective_calql_training_transitions",
 )
+
+
+def classify_score_semantics(
+    metadata: Mapping[str, object],
+) -> tuple[str, bool]:
+    """Return the declared score meaning and fail-closed benchmark eligibility.
+
+    A numeric score is never inspected.  Local Gymnasium runs are diagnostic
+    regardless of their requested purpose, while a research score requires all
+    three explicit pieces of provenance: legacy protocol, D4RL semantics, and
+    an affirmative eligibility flag for a research or audited-final run.
+    """
+
+    protocol = str(
+        metadata.get(
+            "protocol",
+            metadata.get("environment_protocol", "unknown_legacy_protocol"),
+        )
+    )
+    declared = metadata.get("score_semantics")
+    if protocol != LEGACY_RESEARCH_PROTOCOL:
+        if declared in DIAGNOSTIC_SCORE_SEMANTICS:
+            return str(declared), False
+        # The local protocol itself is sufficient to label the scale as
+        # diagnostic, but never to make it benchmark eligible.
+        if "gymnasium" in protocol or protocol == "gymnasium_v4_diagnostic":
+            return "diagnostic_d4rl_reference_scaled_return", False
+        return "unknown_legacy_score", False
+
+    if declared != D4RL_SCORE_SEMANTICS:
+        return str(declared or "unknown_legacy_score"), False
+    declared_eligible = metadata.get("benchmark_eligible")
+    explicitly_eligible = isinstance(
+        declared_eligible, (bool, np.bool_)
+    ) and bool(declared_eligible)
+    eligible = bool(
+        explicitly_eligible
+        and metadata.get("run_purpose")
+        in ("research_benchmark", "final_benchmark")
+    )
+    return D4RL_SCORE_SEMANTICS, eligible
 
 
 def validate_calql_completion_accounting(
@@ -273,6 +336,8 @@ def _infer_benchmark_role(algorithm: str, run_purpose: str) -> str:
 
 
 def _ensure_classification_columns(frame):
+    import pandas as pd
+
     result = frame.copy()
     if result.empty:
         for column in (
@@ -281,6 +346,10 @@ def _ensure_classification_columns(frame):
             "implementation_type",
             "uses_corruption_labels",
             "error_message",
+            "run_status",
+            "protocol",
+            "score_semantics",
+            "benchmark_eligible",
         ):
             if column not in result:
                 result[column] = []
@@ -306,6 +375,33 @@ def _ensure_classification_columns(frame):
         result["uses_corruption_labels"] = False
     if "error_message" not in result:
         result["error_message"] = ""
+    # Eligibility is deliberately fail-closed.  In particular, do not infer a
+    # D4RL benchmark score from its numeric value or promote a legacy row whose
+    # manifest omitted the score contract.
+    if "protocol" not in result:
+        result["protocol"] = "unknown_legacy_protocol"
+    if "score_semantics" not in result:
+        result["score_semantics"] = "unknown_legacy_score"
+    if "benchmark_eligible" not in result:
+        result["benchmark_eligible"] = False
+    if "score_mean" not in result:
+        if "normalized_return_mean" in result:
+            result["score_mean"] = pd.to_numeric(
+                result["normalized_return_mean"], errors="coerce"
+            )
+        else:
+            result["score_mean"] = np.nan
+        diagnostic_column = "diagnostic_d4rl_reference_scaled_return_mean"
+        if diagnostic_column in result:
+            diagnostic_values = pd.to_numeric(
+                result[diagnostic_column], errors="coerce"
+            )
+            diagnostic_rows = result["score_semantics"].isin(
+                DIAGNOSTIC_SCORE_SEMANTICS
+            )
+            result.loc[diagnostic_rows, "score_mean"] = diagnostic_values.loc[
+                diagnostic_rows
+            ].combine_first(result.loc[diagnostic_rows, "score_mean"])
     if "display_name" not in result:
         result["display_name"] = [
             _registry_value(str(algorithm), "display_name", str(algorithm))
@@ -354,8 +450,21 @@ def _ensure_classification_columns(frame):
         "pending_episode_length": np.nan,
         "effective_calql_training_transitions": np.nan,
     }
-    if "requested_online_steps" not in result and "planned_online_steps" in result:
+    if (
+        "requested_online_steps" not in result
+        and "planned_online_steps" in result
+    ):
         result["requested_online_steps"] = result["planned_online_steps"]
+    elif (
+        "requested_online_steps" in result
+        and "planned_online_steps" in result
+    ):
+        result["requested_online_steps"] = result[
+            "requested_online_steps"
+        ].where(
+            result["requested_online_steps"].notna(),
+            result["planned_online_steps"],
+        )
     for column, value in optional_defaults.items():
         if column not in result:
             result[column] = value
@@ -377,6 +486,13 @@ def seed_run_statuses(frame):
                 "algorithm": str(_single_value(run, "algorithm", run_dir)),
                 "environment": str(_single_value(run, "env_name", run_dir)),
                 "condition": _condition(run),
+                "protocol": str(_single_value(run, "protocol", run_dir)),
+                "score_semantics": str(
+                    _single_value(run, "score_semantics", run_dir)
+                ),
+                "benchmark_eligible": bool(
+                    _single_value(run, "benchmark_eligible", run_dir)
+                ),
                 "seed": int(_single_value(run, "seed", run_dir)),
                 "run_status": str(_single_value(run, "run_status", run_dir)),
                 "error_message": str(
@@ -402,6 +518,9 @@ def seed_run_statuses(frame):
         "algorithm",
         "environment",
         "condition",
+        "protocol",
+        "score_semantics",
+        "benchmark_eligible",
         "seed",
         "benchmark_role",
         "run_purpose",
@@ -504,7 +623,7 @@ def aggregate_seed_scores(
         "phase",
         "step",
         "env_steps",
-        "normalized_return_mean",
+        "score_mean",
         "run_status",
         "eval_episodes",
         "implementation_fidelity",
@@ -526,6 +645,10 @@ def aggregate_seed_scores(
         "implementation_type",
         "benchmark_role",
         "uses_corruption_labels",
+        "protocol",
+        "score_semantics",
+        "benchmark_eligible",
+        "requested_online_steps",
     }
     missing = sorted(required - set(frame.columns))
     if missing:
@@ -566,6 +689,27 @@ def aggregate_seed_scores(
                 f"run {run_dir} has duplicate {rule.phase} evaluation steps: {duplicates}"
             )
         phase_rows = phase_rows.sort_values(step_column)
+        if rule.phase == "online":
+            # Episode-boundary algorithms may emit one final evaluation after
+            # the requested common budget.  Keep that row in the loaded curve,
+            # but never let it improve or degrade the comparable seed scalar.
+            requested_budget = int(
+                _single_value(run, "requested_online_steps", run_dir)
+            )
+            if requested_budget <= 0 and strict:
+                raise ReportingValidationError(
+                    f"run {run_dir} has invalid requested online budget "
+                    f"{requested_budget}"
+                )
+            if requested_budget > 0:
+                phase_rows = phase_rows[
+                    phase_rows[step_column] <= requested_budget
+                ].copy()
+                if phase_rows.empty:
+                    raise ReportingValidationError(
+                        f"run {run_dir} has no online evaluations at or below "
+                        f"requested_online_steps={requested_budget}"
+                    )
         available = len(phase_rows)
         if strict and available < rule.final_evaluations:
             raise ReportingValidationError(
@@ -602,7 +746,7 @@ def aggregate_seed_scores(
                         f"run {run_dir} has no recorded actual online budget"
                     )
                 planned_budget = int(
-                    _single_value(run, "planned_online_steps", run_dir)
+                    _single_value(run, "requested_online_steps", run_dir)
                 )
                 budget_semantics = str(
                     _single_value(run, "online_budget_semantics", run_dir)
@@ -661,13 +805,31 @@ def aggregate_seed_scores(
                             f"requested={planned_budget}, actual={actual_budget}, "
                             f"recorded_overshoot={reported_overshoot}"
                         )
+                elif budget_semantics == CALQL_ONLINE_BUDGET_SEMANTICS:
+                    accounting = {
+                        field: _single_value(run, field, run_dir)
+                        for field in CALQL_FAIRNESS_FIELDS
+                    }
+                    accounting["online_budget_semantics"] = budget_semantics
+                    validate_calql_completion_accounting(
+                        accounting, context=f"run {run_dir}"
+                    )
+                    if (
+                        environment_horizon <= 0
+                        or reported_overshoot >= environment_horizon
+                    ):
+                        raise ReportingValidationError(
+                            f"run {run_dir} has invalid Cal-QL boundary "
+                            f"overshoot={reported_overshoot} for "
+                            f"horizon={environment_horizon}"
+                        )
                 else:
                     raise ReportingValidationError(
                         f"run {run_dir} has unsupported online budget semantics: "
                         f"{budget_semantics!r}"
                     )
                 expected_last_step = (
-                    actual_budget // eval_period
+                    planned_budget // eval_period
                 ) * eval_period
             else:
                 planned_budget = int(
@@ -700,7 +862,7 @@ def aggregate_seed_scores(
                     f"expected={expected_window}"
                 )
         scores = pd.to_numeric(
-            selected["normalized_return_mean"], errors="raise"
+            selected["score_mean"], errors="raise"
         ).to_numpy(dtype=np.float64)
         if not np.isfinite(scores).all():
             raise ReportingValidationError(
@@ -711,6 +873,13 @@ def aggregate_seed_scores(
                 "algorithm": algorithm,
                 "environment": str(_single_value(run, "env_name", run_dir)),
                 "condition": _condition(run),
+                "protocol": str(_single_value(run, "protocol", run_dir)),
+                "score_semantics": str(
+                    _single_value(run, "score_semantics", run_dir)
+                ),
+                "benchmark_eligible": bool(
+                    _single_value(run, "benchmark_eligible", run_dir)
+                ),
                 "seed": int(_single_value(run, "seed", run_dir)),
                 "aggregation_rule": applied_rule_id,
                 "num_final_evaluations": int(take),
@@ -811,6 +980,9 @@ def aggregate_seed_scores(
         "algorithm",
         "environment",
         "condition",
+        "protocol",
+        "score_semantics",
+        "benchmark_eligible",
         "aggregation_rule",
         "seed",
     ]
@@ -829,6 +1001,9 @@ def aggregate_seed_scores(
         "algorithm",
         "environment",
         "condition",
+        "protocol",
+        "score_semantics",
+        "benchmark_eligible",
         "implementation_type",
         "benchmark_role",
         "uses_corruption_labels",
@@ -861,7 +1036,12 @@ def aggregate_seed_scores(
         for column, value in identity_values.items():
             scored = scored[scored[column] == value]
 
-        identity = f"{keys[0]}/{keys[1]}/{keys[2]}"
+        identity = (
+            f"{identity_values['algorithm']}/"
+            f"{identity_values['environment']}/"
+            f"{identity_values['condition']}/"
+            f"{identity_values['score_semantics']}"
+        )
         if not scored.empty:
             metadata = {
                 column: _one_group_value(scored, column, identity)
@@ -871,7 +1051,7 @@ def aggregate_seed_scores(
             # A failed seed may have no evaluation row.  Keep an explicit NaN
             # summary row using immutable run metadata instead of silently
             # dropping the condition from the result table.
-            algorithm = str(keys[0])
+            algorithm = str(identity_values["algorithm"])
             rule = rule_by_algorithm.get(algorithm)
             if rule is None:
                 raise ReportingValidationError(
@@ -965,7 +1145,7 @@ def aggregate_seed_scores(
             not scored.empty
             and scored["aggregation_rule"].astype(str).str.contains("__partial_").any()
         )
-        uses_labels = bool(keys[5])
+        uses_labels = bool(identity_values["uses_corruption_labels"])
         summary_complete = bool(
             completed_seeds
             and not failed_seeds
@@ -977,7 +1157,9 @@ def aggregate_seed_scores(
         )
         if strict and completed_seeds != expected_for_group:
             raise ReportingValidationError(
-                f"seed set mismatch for {keys[0]}/{keys[2]}: "
+                "seed set mismatch for "
+                f"{identity_values['algorithm']}/"
+                f"{identity_values['condition']}: "
                 f"actual={completed_seeds}, expected={expected_for_group}; "
                 f"failed={failed_seeds}, partial={partial_seeds}, "
                 f"missing={missing_seeds}"
@@ -993,9 +1175,14 @@ def aggregate_seed_scores(
         scores = scored["seed_score"].to_numpy(dtype=np.float64)
         summaries.append(
             {
-                "algorithm": keys[0],
-                "environment": keys[1],
-                "condition": keys[2],
+                "algorithm": identity_values["algorithm"],
+                "environment": identity_values["environment"],
+                "condition": identity_values["condition"],
+                "protocol": identity_values["protocol"],
+                "score_semantics": identity_values["score_semantics"],
+                "benchmark_eligible": identity_values[
+                    "benchmark_eligible"
+                ],
                 "aggregation_rule": metadata["aggregation_rule"],
                 "num_seeds": len(scores),
                 "expected_seeds": _joined_seeds(expected_for_group),
@@ -1040,9 +1227,11 @@ def aggregate_seed_scores(
                     "condition_certificate_verified"
                 ],
                 "condition_status": metadata["condition_status"],
-                "run_purpose": keys[6],
-                "implementation_type": keys[3],
-                "benchmark_role": keys[4],
+                "run_purpose": identity_values["run_purpose"],
+                "implementation_type": identity_values[
+                    "implementation_type"
+                ],
+                "benchmark_role": identity_values["benchmark_role"],
                 "uses_corruption_labels": uses_labels,
                 "completed_seeds": _joined_seeds(completed_seeds),
                 "failed_seeds": _joined_seeds(failed_seeds),
@@ -1075,10 +1264,9 @@ def _research_summary_table(
 ):
     """Build the canonical seed-explicit five-baseline main table.
 
-    Aggregate mean/std are published only for a complete cohort.  A failed,
-    missing, running, partial-window, or otherwise incomplete seed therefore
-    remains visible without making the successful subset look like a valid
-    benchmark result.
+    Only completed, score-eligible runs appear here.  Aggregate mean/std are
+    still withheld for an incomplete expected cohort; failures and missing
+    seeds remain visible in seed_run_status.csv and the aggregate status CSVs.
     """
 
     import pandas as pd
@@ -1086,11 +1274,6 @@ def _research_summary_table(
     if research_frame.empty:
         return pd.DataFrame(columns=RESEARCH_SUMMARY_COLUMNS)
 
-    expected = (
-        None
-        if expected_seeds is None
-        else sorted(set(int(seed) for seed in expected_seeds))
-    )
     rows: list[dict] = []
     group_columns = (
         "algorithm",
@@ -1137,7 +1320,6 @@ def _research_summary_table(
             else float("nan")
         )
         run_groups = list(group.groupby("run_dir", sort=True))
-        observed_seeds: set[int] = set()
 
         def base_row(run, run_label: str) -> dict:
             offline_steps = int(
@@ -1167,6 +1349,15 @@ def _research_summary_table(
                 "implementation_type": str(implementation_type),
                 "task_scope": str(task_scope),
                 "environment": str(environment),
+                "protocol": str(
+                    _single_value(run, "protocol", run_label)
+                ),
+                "score_semantics": str(
+                    _single_value(run, "score_semantics", run_label)
+                ),
+                "benchmark_eligible": bool(
+                    _single_value(run, "benchmark_eligible", run_label)
+                ),
                 "corruption": str(corruption),
                 "corruption_target": str(corruption_target),
                 "offline_steps": offline_steps,
@@ -1231,13 +1422,16 @@ def _research_summary_table(
                 "std": cohort_std,
             }
 
-        template_run = run_groups[0][1]
         for run_dir, run in run_groups:
             seed = int(_single_value(run, "seed", str(run_dir)))
-            observed_seeds.add(seed)
             raw_status = str(
                 _single_value(run, "run_status", str(run_dir))
             ).lower()
+            if raw_status != "completed":
+                raise ReportingValidationError(
+                    "research summary received a non-completed run after "
+                    f"eligibility filtering: {run_dir} ({raw_status})"
+                )
             if algorithm == "cal_ql" and raw_status == "completed":
                 accounting = {
                     field: _single_value(run, field, str(run_dir))
@@ -1266,35 +1460,16 @@ def _research_summary_table(
             if raw_status == "completed" and partial_window:
                 status = "partial"
                 seed_score = float("nan")
-            elif raw_status == "completed" and not cohort_complete:
+            elif not cohort_complete:
                 status = "cohort_incomplete"
-            elif raw_status == "completed":
-                status = "completed"
-            elif raw_status == "failed":
-                status = "failed"
-            elif raw_status in ("running", "partial"):
-                status = raw_status
             else:
-                status = "partial"
+                status = "completed"
             rows.append(
                 {
                     **base_row(run, str(run_dir)),
                     "seed": seed,
                     "seed_score": seed_score,
                     "status": status,
-                }
-            )
-
-        expected_for_group = expected if expected is not None else sorted(observed_seeds)
-        for seed in sorted(set(expected_for_group) - observed_seeds):
-            rows.append(
-                {
-                    **base_row(template_run, str(run_groups[0][0])),
-                    "seed": int(seed),
-                    "seed_score": float("nan"),
-                    "mean": float("nan"),
-                    "std": float("nan"),
-                    "status": "missing",
                 }
             )
 
@@ -1316,8 +1491,17 @@ def write_reporting_outputs(
     """Write source, common, and role-separated research artifacts."""
 
     frame = _ensure_classification_columns(frame)
+    benchmark_score_contract = (
+        (frame["protocol"] == LEGACY_RESEARCH_PROTOCOL)
+        & (frame["score_semantics"] == D4RL_SCORE_SEMANTICS)
+        & frame["benchmark_eligible"].fillna(False).astype(bool)
+    )
     research_rows = (
-        frame[frame["run_purpose"] == "research_benchmark"]
+        frame[
+            (frame["run_purpose"] == "research_benchmark")
+            & (frame["run_status"] == "completed")
+            & benchmark_score_contract
+        ]
         if not frame.empty
         else frame
     )
@@ -1380,6 +1564,7 @@ def write_reporting_outputs(
             frame["algorithm"].isin(source_rules)
             & frame["publication_eligible"].astype(bool)
             & frame["reporting_rule_verified"].astype(bool)
+            & benchmark_score_contract
         ]
         if {
             "algorithm",
@@ -1467,12 +1652,23 @@ def write_reporting_outputs(
             frame["algorithm"].isin(MAIN_BASELINES)
             & (frame["benchmark_role"] == "main")
             & (frame["run_purpose"] == "research_benchmark")
+            & (frame["run_status"] == "completed")
+            & benchmark_score_contract
             & no_labels
         )
     adapted_mask = (
-        (frame["benchmark_role"] == "optional_adapted") & no_labels
+        (frame["benchmark_role"] == "optional_adapted")
+        & (frame["run_status"] == "completed")
+        & benchmark_score_contract
+        & no_labels
     )
-    diagnostic_mask = ~(research_mask | adapted_mask)
+    explicit_diagnostic = (
+        (frame["run_purpose"] == "diagnostic")
+        | (~frame["benchmark_role"].isin(("main", "optional_adapted")))
+        | frame["score_semantics"].isin(DIAGNOSTIC_SCORE_SEMANTICS)
+        | ~benchmark_score_contract
+    )
+    diagnostic_mask = ~(research_mask | adapted_mask) & explicit_diagnostic
 
     research_frame = frame[research_mask]
     adapted_frame = frame[adapted_mask]

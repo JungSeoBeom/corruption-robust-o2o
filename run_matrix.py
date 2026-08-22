@@ -20,6 +20,7 @@ from robust_o2o.config import (
     LOCAL_PROTOCOL,
     LEGACY_LOCAL_PROTOCOL_ALIAS,
     PROTOCOLS,
+    RESEARCH_BENCHMARK_PROTOCOL_ERROR,
     normalize_env_name,
 )
 from robust_o2o.fidelity import (
@@ -57,7 +58,6 @@ RESERVED_PASSTHROUGH_OPTIONS = {
     "--stage",
     "--suite-profile",
 }
-
 
 def _csv(value: str):
     return [item.strip() for item in value.split(",") if item.strip()]
@@ -188,6 +188,8 @@ def _validate_args(
 ) -> None:
     if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
         args.protocol = LOCAL_PROTOCOL
+    if args.run_purpose == "research_benchmark" and args.protocol == LOCAL_PROTOCOL:
+        parser.error(RESEARCH_BENCHMARK_PROTOCOL_ERROR)
 
     args.algorithms = _canonical_algorithms(args.algorithms)
 

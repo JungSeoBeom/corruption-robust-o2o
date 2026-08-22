@@ -1,11 +1,49 @@
 from __future__ import annotations
 
+import io
 import unittest
+from contextlib import redirect_stderr
 
+from robust_o2o.config import LOCAL_PROTOCOL
 from run_matrix import _validate_args, build_parser, commands
 
 
 class RunMatrixTest(unittest.TestCase):
+    def test_research_matrix_rejects_local_protocol(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--run-purpose",
+                "research_benchmark",
+                "--suite-profile",
+                "research_benchmark",
+                "--protocol",
+                LOCAL_PROTOCOL,
+                "--allow-diagnostic-protocol",
+            ]
+        )
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            _validate_args(parser, args, [])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("ResearchBenchmarkProtocolError", stderr.getvalue())
+
+    def test_diagnostic_matrix_allows_local_protocol(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--run-purpose",
+                "diagnostic",
+                "--suite-profile",
+                "common_budget_diagnostic",
+                "--protocol",
+                LOCAL_PROTOCOL,
+                "--allow-diagnostic-protocol",
+            ]
+        )
+        _validate_args(parser, args, [])
+        self.assertEqual(args.protocol, LOCAL_PROTOCOL)
+
     def test_non_clean_matrix_rejects_empty_corruption_ranges(self):
         parser = build_parser()
         args = parser.parse_args(

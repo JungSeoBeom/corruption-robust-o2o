@@ -4,9 +4,15 @@ import csv
 import json
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
+import pandas as pd
+
 from plot_results import (
+    _concat_nonempty_frames,
+    _score_plot_labels,
+    _validate_score_contract,
     load_runs,
     plot_aggregate,
     update_comparison_plots,
@@ -19,6 +25,107 @@ from robust_o2o.fidelity import canonical_json_sha256
 from robust_o2o.logging_utils import METRIC_FIELDS
 from robust_o2o.manifest import build_experiment_manifest
 from robust_o2o.reporting import ReportingValidationError
+
+
+class ConcatNonemptyFramesTest(unittest.TestCase):
+    def _concat_without_future_warnings(self, frames):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", FutureWarning)
+            result = _concat_nonempty_frames(frames)
+        self.assertEqual(
+            [warning for warning in caught if warning.category is FutureWarning],
+            [],
+        )
+        return result
+
+    def test_empty_frame_between_valid_frames_preserves_valid_rows(self):
+        result = self._concat_without_future_warnings(
+            [
+                pd.DataFrame({"score": [1.0]}),
+                pd.DataFrame(),
+                pd.DataFrame({"score": [2.0]}),
+            ]
+        )
+
+        self.assertEqual(result["score"].tolist(), [1.0, 2.0])
+
+    def test_all_na_column_is_removed_per_frame_but_union_schema_is_kept(self):
+        result = self._concat_without_future_warnings(
+            [
+                pd.DataFrame(
+                    {"score": [1.0], "optional_metadata": [pd.NA]}
+                ),
+                pd.DataFrame(
+                    {"score": [2.0], "optional_metadata": [4.0]}
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            list(result.columns), ["score", "optional_metadata"]
+        )
+        self.assertEqual(result["score"].tolist(), [1.0, 2.0])
+        self.assertTrue(pd.isna(result.loc[0, "optional_metadata"]))
+        self.assertEqual(result.loc[1, "optional_metadata"], 4.0)
+        self.assertTrue(pd.api.types.is_numeric_dtype(result["score"]))
+
+    def test_all_cell_na_frame_contributes_no_rows(self):
+        result = self._concat_without_future_warnings(
+            [
+                pd.DataFrame({"score": [1.0]}),
+                pd.DataFrame({"unused_metadata": [pd.NA]}),
+                pd.DataFrame({"score": [2.0]}),
+            ]
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result["score"].tolist(), [1.0, 2.0])
+        self.assertIn("unused_metadata", result.columns)
+        self.assertTrue(result["unused_metadata"].isna().all())
+
+    def test_all_inputs_empty_returns_empty_frame_without_warning(self):
+        result = self._concat_without_future_warnings(
+            [None, pd.DataFrame(), pd.DataFrame(columns=["score"])]
+        )
+
+        self.assertTrue(result.empty)
+
+    def test_mixed_score_semantics_are_rejected_before_aggregation(self):
+        frame = pd.DataFrame(
+            {
+                "protocol": ["rpex_d4rl_v2_legacy"] * 2,
+                "score_semantics": [
+                    "d4rl_normalized_return",
+                    "diagnostic_d4rl_reference_scaled_return",
+                ],
+                "benchmark_eligible": [True, False],
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "Mixed score_semantics"):
+            _validate_score_contract(frame, "test plot")
+
+    def test_local_protocol_cannot_receive_d4rl_plot_label(self):
+        ylabel, title = _score_plot_labels(
+            {
+                "protocol": "local_gymnasium_v4_diagnostic",
+                "score_semantics": "d4rl_normalized_return",
+                "benchmark_eligible": True,
+                "run_purpose": "research_benchmark",
+            }
+        )
+        self.assertIn("Diagnostic", ylabel)
+        self.assertIn("Not comparable to legacy D4RL-v2 scores", title)
+
+        unknown_ylabel, unknown_title = _score_plot_labels(
+            {
+                "protocol": "unknown_legacy_protocol",
+                "score_semantics": "d4rl_normalized_return",
+                "benchmark_eligible": True,
+                "run_purpose": "research_benchmark",
+            }
+        )
+        self.assertIn("Unclassified", unknown_ylabel)
+        self.assertIn("Excluded from research benchmark plots", unknown_title)
 
 
 class AggregateResultsTest(unittest.TestCase):
@@ -39,6 +146,11 @@ class AggregateResultsTest(unittest.TestCase):
             "corruption": "random",
             "corruption_target": "mixed",
             "seed": seed,
+            "offline_steps": 200,
+            "online_steps": 200,
+            "eval_period": 100,
+            "eval_episodes": 10,
+            "final_window_size": 3,
         }
         (run_dir / "config.json").write_text(
             json.dumps(config), encoding="utf-8"
@@ -193,6 +305,10 @@ class AggregateResultsTest(unittest.TestCase):
                 rows = list(csv.DictReader(stream))
             self.assertEqual([row["algorithm"] for row in rows], ["rpex", "uwmsg"])
             self.assertEqual(float(rows[0]["elapsed_seconds_mean"]), 12.0)
+            self.assertEqual(rows[0]["final_normalized_return_mean"], "")
+            self.assertEqual(
+                float(rows[0]["final_diagnostic_scaled_return_mean"]), 79.5
+            )
             self.assertEqual(
                 rows[0]["aggregation_rule"],
                 "common_mean_last_3_online_evaluations_per_seed_then_population_mean_std__partial_2_of_3",
@@ -212,6 +328,52 @@ class AggregateResultsTest(unittest.TestCase):
             set(frame["algorithm"]),
             {"cal_ql", "pessimistic_q_ensemble"},
         )
+
+    def test_diagnostic_only_metric_columns_load_without_normalized_relabeling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._make_run(root, "rpex", 0, 80.0, 2.0)
+            run_dir = root / "rpex" / "seed_0"
+            config_path = run_dir / "config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config.update(
+                protocol="local_gymnasium_v4_diagnostic",
+                score_semantics="diagnostic_d4rl_reference_scaled_return",
+                benchmark_eligible=False,
+                run_purpose="diagnostic",
+            )
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+
+            metrics_path = run_dir / "metrics.csv"
+            with metrics_path.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                fieldnames = reader.fieldnames
+                rows = list(reader)
+            for row in rows:
+                row[
+                    "diagnostic_d4rl_reference_scaled_return_mean"
+                ] = row["normalized_return_mean"]
+                row[
+                    "diagnostic_d4rl_reference_scaled_return_std"
+                ] = row["normalized_return_std"]
+                row["normalized_return_mean"] = ""
+                row["normalized_return_std"] = ""
+            with metrics_path.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+            persisted_before_load = metrics_path.read_text(encoding="utf-8")
+            frame = load_runs(root)
+            persisted_after_load = metrics_path.read_text(encoding="utf-8")
+
+        self.assertTrue(frame["normalized_return_mean"].isna().all())
+        self.assertEqual(frame["score_mean"].tolist(), [79.0, 80.0])
+        self.assertEqual(
+            set(frame["score_semantics"]),
+            {"diagnostic_d4rl_reference_scaled_return"},
+        )
+        self.assertEqual(persisted_before_load, persisted_after_load)
 
     def test_completed_nan_curve_fails_instead_of_being_silently_dropped(self):
         with tempfile.TemporaryDirectory() as directory:

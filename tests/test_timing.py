@@ -6,11 +6,12 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from robust_o2o.config import LOCAL_PROTOCOL
 from robust_o2o.fidelity import MAIN_BASELINES
 from robust_o2o.logging_utils import format_duration, format_timestamp
 from run_all_algorithms import (
@@ -23,6 +24,106 @@ from run_all_algorithms import (
 
 
 class TimingTest(unittest.TestCase):
+    def test_run_all_rejects_fresh_research_local_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            existing_runs = (
+                Path(directory)
+                / "comparisons"
+                / LOCAL_PROTOCOL
+                / "old_profile"
+                / "hopper-medium-replay-v2"
+                / "clean"
+                / "none"
+                / "fresh_research_local"
+                / "runs"
+            )
+            existing_runs.mkdir(parents=True)
+            parser = build_run_all_parser()
+            args = parser.parse_args(
+                [
+                    "--env-name",
+                    "hopper-medium-replay-v2",
+                    "--corruption",
+                    "clean",
+                    "--run-purpose",
+                    "research_benchmark",
+                    "--suite-profile",
+                    "research_benchmark",
+                    "--protocol",
+                    LOCAL_PROTOCOL,
+                    "--allow-diagnostic-protocol",
+                    "--output-root",
+                    directory,
+                    "--comparison-name",
+                    "fresh_research_local",
+                ]
+            )
+            stderr = io.StringIO()
+            with patch(
+                "run_all_algorithms.is_inflight_pre_gate_run55_descendant",
+                return_value=False,
+            ), redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                validate_run_all_args(parser, args, ())
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("ResearchBenchmarkProtocolError", stderr.getvalue())
+
+    def test_run_all_allows_only_pre_gate_run55_process_continuation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            comparison_name = "existing_run55_cohort"
+            parser = build_run_all_parser()
+            args = parser.parse_args(
+                [
+                    "--env-name",
+                    "halfcheetah-medium-replay-v2",
+                    "--corruption",
+                    "random",
+                    "--corruption-target",
+                    "observations",
+                    "--run-purpose",
+                    "research_benchmark",
+                    "--suite-profile",
+                    "research_benchmark",
+                    "--protocol",
+                    LOCAL_PROTOCOL,
+                    "--allow-diagnostic-protocol",
+                    "--output-root",
+                    directory,
+                    "--comparison-name",
+                    comparison_name,
+                ]
+            )
+            with patch(
+                "run_all_algorithms.is_inflight_pre_gate_run55_descendant",
+                return_value=True,
+            ):
+                validate_run_all_args(parser, args, ())
+            self.assertEqual(args.protocol, LOCAL_PROTOCOL)
+
+    def test_run_all_allows_diagnostic_local_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parser = build_run_all_parser()
+            args = parser.parse_args(
+                [
+                    "--env-name",
+                    "hopper-medium-replay-v2",
+                    "--corruption",
+                    "clean",
+                    "--run-purpose",
+                    "diagnostic",
+                    "--suite-profile",
+                    "common_budget_diagnostic",
+                    "--protocol",
+                    LOCAL_PROTOCOL,
+                    "--allow-diagnostic-protocol",
+                    "--output-root",
+                    directory,
+                    "--comparison-name",
+                    "fresh_diagnostic_local",
+                ]
+            )
+            validate_run_all_args(parser, args, ())
+            self.assertEqual(args.protocol, LOCAL_PROTOCOL)
+
     def test_research_dry_run_defaults_to_main_five_without_side_effects(self):
         with tempfile.TemporaryDirectory() as directory:
             arguments = [

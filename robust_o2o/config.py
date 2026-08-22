@@ -58,6 +58,15 @@ LOCAL_PROTOCOL = "local_gymnasium_v4_diagnostic"
 LEGACY_LOCAL_PROTOCOL_ALIAS = "local_gymnasium_v4"
 DEFAULT_PROTOCOL = LEGACY_PROTOCOL
 PROTOCOLS = (LEGACY_PROTOCOL, LOCAL_PROTOCOL, LEGACY_LOCAL_PROTOCOL_ALIAS)
+LEGACY_SCORE_SEMANTICS = "d4rl_normalized_return"
+LOCAL_SCORE_SEMANTICS = "diagnostic_d4rl_reference_scaled_return"
+RESEARCH_BENCHMARK_PROTOCOL_ERROR = (
+    "ResearchBenchmarkProtocolError: research_benchmark requires the legacy "
+    "D4RL-v2 evaluation protocol. The current environment only supports "
+    "Gymnasium-v4 diagnostic evaluation. Run with --run-purpose diagnostic "
+    "for smoke testing, or execute the research benchmark in the pinned "
+    "Linux D4RL-v2 environment."
+)
 ALGORITHM_PROFILES = IMPLEMENTATION_PROFILES
 CALIBRATION_MASK_MODES = ("all", "oracle_exclude_corrupted", "disabled")
 
@@ -66,6 +75,63 @@ ACTION_DIMS = {
     "hopper": 3,
     "walker2d": 6,
 }
+
+
+def is_inflight_pre_gate_run55_descendant(pid: int | None = None) -> bool:
+    """Allow only the run_55 process tree that predates this protocol gate.
+
+    The repository may be edited while a long suite is still spawning child
+    controllers.  A persistent path- or flag-based exception would let later
+    launches mislabel local diagnostics as research.  Process ancestry and the
+    gate file's modification time provide a fail-closed, self-expiring bridge
+    for that already-running controller only.
+    """
+
+    try:
+        import psutil
+
+        process = psutil.Process(pid) if pid is not None else psutil.Process()
+        gate_installed_at = Path(__file__).stat().st_mtime
+        expected_script = Path(__file__).resolve().parents[1] / "run_55_experiment.py"
+        for ancestor in process.parents():
+            command = ancestor.cmdline()
+            if not command or ancestor.create_time() >= gate_installed_at:
+                continue
+            script_arguments = [
+                argument
+                for argument in command[1:]
+                if Path(argument).name == "run_55_experiment.py"
+            ]
+            if not script_arguments:
+                continue
+            script = Path(script_arguments[0])
+            if not script.is_absolute():
+                script = Path(ancestor.cwd()) / script
+            if script.resolve() != expected_script:
+                continue
+
+            def has_option(name: str, value: str) -> bool:
+                return any(
+                    argument == f"{name}={value}"
+                    or (
+                        argument == name
+                        and index + 1 < len(command)
+                        and command[index + 1] == value
+                    )
+                    for index, argument in enumerate(command)
+                )
+
+            if (
+                has_option("--run-purpose", "research_benchmark")
+                and has_option("--protocol", LOCAL_PROTOCOL)
+                and "--allow-diagnostic-protocol" in command
+            ):
+                return True
+    except Exception:
+        # Missing psutil, exited ancestors, access errors, and malformed
+        # command lines all fail closed.
+        return False
+    return False
 
 ALGORITHM_TITLES = {
     "rpex": "RPEX: Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption",
@@ -742,6 +808,10 @@ class ExperimentConfig:
         RNG trajectories, upstream step budgets, or a fixed seed cohort.  It
         protects the interpretation of the common benchmark instead.
         """
+
+        if self.protocol != LEGACY_PROTOCOL:
+            if not is_inflight_pre_gate_run55_descendant():
+                raise ValueError(RESEARCH_BENCHMARK_PROTOCOL_ERROR)
 
         if self.suite_profile != "research_benchmark":
             raise ValueError(
@@ -1826,7 +1896,11 @@ class ExperimentConfig:
             "replay_transition_poisoning"
         )
         result["clean_evaluation"] = True
-        result["normalized_score_rule"] = "d4rl_normalized_return"
+        result["normalized_score_rule"] = (
+            LEGACY_SCORE_SEMANTICS
+            if self.protocol == LEGACY_PROTOCOL
+            else LOCAL_SCORE_SEMANTICS
+        )
         result["parity_status"] = (
             record.parity_status if record is not None else "unverified"
         )
@@ -1975,9 +2049,19 @@ class ExperimentConfig:
         )
         result["upstream_commit"] = upstream_commit
         result["score_semantics"] = (
-            "d4rl_normalized_return"
+            LEGACY_SCORE_SEMANTICS
             if self.protocol == LEGACY_PROTOCOL
-            else "diagnostic_d4rl_reference_scaled_return"
+            else LOCAL_SCORE_SEMANTICS
+        )
+        # This field classifies score comparability only.  The stricter
+        # algorithm/parity qualifications remain in main_table_eligible and
+        # the publication eligibility fields above.  In particular, an
+        # explicitly acknowledged Gymnasium-v4 run must never be aggregated
+        # as a D4RL legacy-protocol research score merely because its
+        # run_purpose says research_benchmark.
+        result["benchmark_eligible"] = bool(
+            self.run_purpose in ("research_benchmark", "final_benchmark")
+            and self.protocol == LEGACY_PROTOCOL
         )
         if self.algorithm == "wsrl":
             result.update(
