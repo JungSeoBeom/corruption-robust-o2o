@@ -150,8 +150,8 @@ def _settings_for_suite(suite: str) -> tuple[tuple[str, str], ...]:
             for target in SUPPORTED_ADVERSARIAL_TARGETS
         )
         return (
-            *clean,
             *adversarial,
+            *clean,
             *random,
         )
     raise ValueError(f"unknown corruption suite {suite!r}")

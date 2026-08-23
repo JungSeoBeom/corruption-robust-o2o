@@ -235,9 +235,49 @@ class TimingTest(unittest.TestCase):
             }
 
             def role_outputs(_root, output_dir, *_args, **_kwargs):
+                research_summary = output_dir / "research_summary.csv"
+                with research_summary.open(
+                    "w", newline="", encoding="utf-8"
+                ) as stream:
+                    writer = csv.DictWriter(
+                        stream,
+                        fieldnames=("algorithm", "seed", "status", "mean", "std"),
+                    )
+                    writer.writeheader()
+                    for algorithm in algorithms:
+                        writer.writerow(
+                            {
+                                "algorithm": algorithm,
+                                "seed": 0,
+                                "status": "completed",
+                                "mean": 1.0,
+                                "std": 0.0,
+                            }
+                        )
+                per_seed = output_dir / "research_per_seed_final_scores.csv"
+                per_seed.write_text("algorithm,seed\n", encoding="utf-8")
                 return {
-                    "research_summary": output_dir / "research_summary.csv",
+                    "research_summary": research_summary,
+                    "research_per_seed_final_scores": per_seed,
                 }
+
+            def plot_outputs(
+                output_dir, *_args, include_running
+            ):
+                self.assertFalse(include_running)
+                outputs = {}
+                for phase in ("offline_online", "offline", "online"):
+                    path = output_dir / f"comparison_{phase}.png"
+                    path.write_text("completed", encoding="utf-8")
+                    path.with_suffix(".csv").write_text(
+                        "algorithm,mean\nrpex,1.0\n", encoding="utf-8"
+                    )
+                    outputs[phase] = path
+                return outputs
+
+            def final_scores(_root, path, *_args):
+                path.write_text("algorithm,mean\nrpex,1.0\n", encoding="utf-8")
+                return path
 
             with (
                 patch.object(sys, "argv", arguments),
@@ -249,10 +289,13 @@ class TimingTest(unittest.TestCase):
                     "run_all_algorithms.preflight_runtime",
                     return_value=preflight,
                 ),
-                patch("run_all_algorithms.update_comparison_plots", return_value={}),
+                patch(
+                    "run_all_algorithms.update_comparison_plots",
+                    side_effect=plot_outputs,
+                ) as plots,
                 patch(
                     "run_all_algorithms.write_final_score_summary",
-                    side_effect=lambda _root, path, *_args: path,
+                    side_effect=final_scores,
                 ),
                 patch(
                     "run_all_algorithms.write_reproduction_summaries",
@@ -266,13 +309,131 @@ class TimingTest(unittest.TestCase):
             self.assertEqual(run.call_count, len(algorithms))
             reports.assert_called_once()
             self.assertFalse(reports.call_args.kwargs["strict"])
+            self.assertEqual(reports.call_args.kwargs["expected_seeds"], [0])
             self.assertEqual(reports.call_args.kwargs["phase"], "online")
+            self.assertFalse(plots.call_args.kwargs["include_running"])
             manifest_path = next(Path(directory).rglob("manifest.json"))
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["algorithms"], list(algorithms))
             self.assertEqual(
                 set(manifest["artifacts"]["reporting_csvs"]),
-                {"research_summary"},
+                {
+                    "research_summary",
+                    "research_per_seed_final_scores",
+                },
+            )
+            for phase in ("offline_online", "offline", "online"):
+                plot_path = manifest_path.parent / f"comparison_{phase}.png"
+                self.assertTrue(plot_path.is_file())
+                self.assertTrue(plot_path.with_suffix(".csv").is_file())
+            self.assertTrue(
+                (manifest_path.parent / "research_summary.csv").is_file()
+            )
+            self.assertTrue(
+                (
+                    manifest_path.parent
+                    / "research_per_seed_final_scores.csv"
+                ).is_file()
+            )
+            self.assertTrue(
+                (manifest_path.parent / "final_scores.csv").is_file()
+            )
+
+    def test_missing_research_seed_fails_before_canonical_plot_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            arguments = [
+                "run_all_algorithms.py",
+                "--env-name",
+                "hopper-medium-replay-v2",
+                "--corruption",
+                "clean",
+                "--run-purpose",
+                "research_benchmark",
+                "--suite-profile",
+                "research_benchmark",
+                "--algorithms",
+                "rpex",
+                "--seeds",
+                "0,1,2,3,4",
+                "--output-root",
+                directory,
+                "--comparison-name",
+                "missing_seed",
+            ]
+            preflight = {
+                "protocol": "rpex_d4rl_v2_legacy",
+                "d4rl_env_id": "hopper-medium-replay-v2",
+                "environment_backend": "gym-0.23.1+d4rl-v2+mujoco_py",
+                "dataset_backend": "d4rl.qlearning_dataset(terminate_on_end=False)",
+                "dataset_path": str(Path(directory) / "dataset.hdf5"),
+            }
+
+            def incomplete_outputs(_root, output_dir, *_args, **_kwargs):
+                research_summary = output_dir / "research_summary.csv"
+                with research_summary.open(
+                    "w", newline="", encoding="utf-8"
+                ) as stream:
+                    writer = csv.DictWriter(
+                        stream,
+                        fieldnames=("algorithm", "seed", "status", "mean", "std"),
+                    )
+                    writer.writeheader()
+                    for seed in range(4):
+                        writer.writerow(
+                            {
+                                "algorithm": "rpex",
+                                "seed": seed,
+                                "status": "cohort_incomplete",
+                                "mean": "",
+                                "std": "",
+                            }
+                        )
+                per_seed = output_dir / "research_per_seed_final_scores.csv"
+                per_seed.write_text("algorithm,seed\n", encoding="utf-8")
+                return {
+                    "research_summary": research_summary,
+                    "research_per_seed_final_scores": per_seed,
+                }
+
+            with (
+                patch.object(sys, "argv", arguments),
+                patch(
+                    "run_all_algorithms.subprocess.run",
+                    return_value=Mock(returncode=0),
+                ),
+                patch(
+                    "run_all_algorithms.preflight_runtime",
+                    return_value=preflight,
+                ),
+                patch("run_all_algorithms.update_comparison_plots") as plots,
+                patch("run_all_algorithms.write_final_score_summary") as scores,
+                patch(
+                    "run_all_algorithms.write_reproduction_summaries",
+                    side_effect=incomplete_outputs,
+                ) as reports,
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                returncode = main()
+
+            self.assertEqual(returncode, 1)
+            self.assertEqual(
+                reports.call_args.kwargs["expected_seeds"], [0, 1, 2, 3, 4]
+            )
+            plots.assert_not_called()
+            scores.assert_not_called()
+            manifest_path = next(Path(directory).rglob("manifest.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertFalse(manifest["benchmark_valid"])
+            self.assertIn("rpex:4", manifest["aggregation_error"])
+            self.assertFalse(
+                (manifest_path.parent / "research_summary.csv").exists()
+            )
+            self.assertFalse(
+                (
+                    manifest_path.parent
+                    / "research_per_seed_final_scores.csv"
+                ).exists()
             )
 
     def test_run_all_accepts_space_comma_mix_and_canonical_aliases(self):
@@ -447,7 +608,7 @@ class TimingTest(unittest.TestCase):
                 "gym-0.23.1+d4rl-v2+mujoco_py",
             )
 
-    def test_failed_suite_removes_summaries_but_keeps_progress_plots(self):
+    def test_failed_suite_removes_canonical_outputs_but_keeps_run_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             arguments = [
                 "run_all_algorithms.py",
@@ -474,22 +635,41 @@ class TimingTest(unittest.TestCase):
             summary_names = (
                 "final_scores.csv",
                 "research_summary.csv",
-                "adapted_baselines_summary.csv",
-                "diagnostic_summary.csv",
+                "research_per_seed_final_scores.csv",
             )
-            progress_names = (
+            canonical_names = (
+                "comparison_offline_online.png",
+                "comparison_offline_online.csv",
+                "comparison_offline.png",
+                "comparison_offline.csv",
                 "comparison_online.png",
                 "comparison_online.csv",
             )
+            retained_paths = []
 
             def failed_run(command, check):
                 self.assertFalse(check)
                 runs_dir = Path(command[command.index("--output-dir") + 1])
                 comparison_dir = runs_dir.parent
-                for name in (*summary_names, *progress_names):
+                for name in (*summary_names, *canonical_names):
                     (comparison_dir / name).write_text(
                         "partial", encoding="utf-8"
                     )
+                run_dir = runs_dir / "rpex" / "seed_0" / "failed_run"
+                run_dir.mkdir(parents=True)
+                for name in (
+                    "config.json",
+                    "experiment_manifest.json",
+                    "metrics.csv",
+                    "train_metrics.jsonl",
+                    "result.log",
+                    "summary.json",
+                    "checkpoint_1.pt",
+                    "performance.png",
+                ):
+                    path = run_dir / name
+                    path.write_text("diagnostic", encoding="utf-8")
+                    retained_paths.append(path)
                 return Mock(returncode=1)
 
             with (
@@ -519,11 +699,12 @@ class TimingTest(unittest.TestCase):
             self.assertIn("suite is incomplete", manifest["aggregation_error"])
             for name in summary_names:
                 self.assertFalse((manifest_path.parent / name).exists())
-            for name in progress_names:
-                self.assertEqual(
-                    (manifest_path.parent / name).read_text(encoding="utf-8"),
-                    "partial",
-                )
+            for name in canonical_names:
+                self.assertFalse((manifest_path.parent / name).exists())
+            self.assertTrue((manifest_path.parent / "timing.csv").is_file())
+            self.assertTrue((manifest_path.parent / "runs").is_dir())
+            for path in retained_paths:
+                self.assertTrue(path.is_file())
 
 
 if __name__ == "__main__":

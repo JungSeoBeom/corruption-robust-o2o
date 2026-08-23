@@ -230,8 +230,8 @@ class Run55ExperimentTest(unittest.TestCase):
         all_suite = parser.parse_args(["--corruption-suite", "all"])
         all_commands = list(commands(all_suite, (), "all_suite"))
         expected_all = (
-            *CLEAN_SETTINGS,
             *ADVERSARIAL_SETTINGS,
+            *CLEAN_SETTINGS,
             *STRICT_RANDOM_SETTINGS,
         )
         self.assertEqual(len(commands_only), 4)

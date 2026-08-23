@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -446,9 +447,15 @@ def _print_algorithm_summary(summary: dict, prefix: str) -> None:
 
 
 def _remove_invalid_summary_artifacts(comparison_dir: Path) -> None:
-    """Remove final summaries while preserving useful in-progress curves."""
+    """Remove canonical outputs from a failed or incomplete controller."""
 
     names = {
+        "comparison_offline_online.png",
+        "comparison_offline_online.csv",
+        "comparison_offline.png",
+        "comparison_offline.csv",
+        "comparison_online.png",
+        "comparison_online.csv",
         "final_scores.csv",
         "per_seed_final_scores.csv",
         "paper_reproduction_summary.csv",
@@ -464,6 +471,65 @@ def _remove_invalid_summary_artifacts(comparison_dir: Path) -> None:
     }
     for name in names:
         (comparison_dir / name).unlink(missing_ok=True)
+
+
+def _validate_research_seed_cohort(
+    research_summary: Path,
+    algorithms: Iterable[str],
+    expected_seeds: Iterable[int],
+) -> None:
+    """Fail closed before publishing plots for an incomplete research cohort."""
+
+    if not research_summary.is_file():
+        raise RuntimeError(
+            f"research seed cohort validation missing {research_summary.name}"
+        )
+    with research_summary.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+
+    expected_seed_values = tuple(int(seed) for seed in expected_seeds)
+    expected = {
+        (str(algorithm), int(seed))
+        for algorithm in algorithms
+        for seed in expected_seed_values
+    }
+    observed: list[tuple[str, int]] = []
+    incomplete: list[str] = []
+    for row in rows:
+        try:
+            pair = (str(row["algorithm"]), int(row["seed"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "research seed cohort summary has an invalid algorithm/seed row"
+            ) from exc
+        observed.append(pair)
+        try:
+            finite_scores = all(
+                math.isfinite(float(row[field])) for field in ("mean", "std")
+            )
+        except (KeyError, TypeError, ValueError):
+            finite_scores = False
+        if row.get("status") != "completed" or not finite_scores:
+            incomplete.append(f"{pair[0]}:{pair[1]}")
+
+    observed_set = set(observed)
+    missing = sorted(expected - observed_set)
+    unexpected = sorted(observed_set - expected)
+    duplicates = sorted(
+        pair for pair in observed_set if observed.count(pair) != 1
+    )
+
+    def format_pairs(pairs: Iterable[tuple[str, int]]) -> list[str]:
+        return [f"{algorithm}:{seed}" for algorithm, seed in pairs]
+
+    if missing or unexpected or duplicates or incomplete:
+        raise RuntimeError(
+            "research seed cohort incomplete: "
+            f"missing={format_pairs(missing)}, "
+            f"unexpected={format_pairs(unexpected)}, "
+            f"duplicates={format_pairs(duplicates)}, "
+            f"incomplete={sorted(incomplete)}"
+        )
 
 
 def main() -> int:
@@ -611,6 +677,12 @@ def main() -> int:
             # Validate reporting first. In strict mode this catches missing or
             # duplicate seeds/evaluations before canonical plots or the common
             # final_scores alias are published.
+            expected_seeds = (
+                [int(seed) for seed in args.seeds]
+                if args.run_purpose
+                in ("research_benchmark", "final_benchmark")
+                else None
+            )
             reporting_paths = write_reproduction_summaries(
                 runs_dir,
                 comparison_dir,
@@ -618,18 +690,24 @@ def main() -> int:
                 args.corruption,
                 args.corruption_target,
                 strict=args.run_purpose == "final_benchmark",
-                expected_seeds=(
-                    [int(seed) for seed in args.seeds]
-                    if args.run_purpose == "final_benchmark"
-                    else None
-                ),
+                expected_seeds=expected_seeds,
                 phase=phase,
             )
+            if (
+                args.run_purpose == "research_benchmark"
+                and args.protocol == DEFAULT_PROTOCOL
+            ):
+                _validate_research_seed_cohort(
+                    Path(reporting_paths["research_summary"]),
+                    args.algorithms,
+                    expected_seeds or (),
+                )
             plot_paths = update_comparison_plots(
                 comparison_dir,
                 args.env_name,
                 args.corruption,
                 args.corruption_target,
+                include_running=False,
             )
             final_scores_path = write_final_score_summary(
                 runs_dir,

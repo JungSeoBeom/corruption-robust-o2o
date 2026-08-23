@@ -165,9 +165,10 @@ class ScoreProtocolMetadataTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("plot_results.update_comparison_plots"):
+            with patch("plot_results.update_comparison_plots") as plots:
                 legacy_config = _research_config(output_dir=str(root / "legacy"))
                 legacy_logger = RunLogger(legacy_config)
+                legacy_comparison_dir = legacy_logger.comparison_dir
                 legacy_logger.write_config(_runtime_config(legacy_config))
                 legacy_logger.log_evaluation("offline", 1, 0, 1, metrics)
                 legacy_log_path = legacy_logger.run_dir / "result.log"
@@ -182,6 +183,7 @@ class ScoreProtocolMetadataTest(unittest.TestCase):
                     output_dir=str(root / "local"),
                 )
                 local_logger = RunLogger(local_config)
+                local_comparison_dir = local_logger.comparison_dir
                 local_resolved = _runtime_config(local_config)
                 local_logger.write_config(local_resolved)
                 # Rewriting the resolved config must not duplicate the banner.
@@ -190,6 +192,22 @@ class ScoreProtocolMetadataTest(unittest.TestCase):
                 local_log_path = local_logger.run_dir / "result.log"
                 local_metrics_path = local_logger.metrics_path
                 local_logger.close()
+
+            plots.assert_not_called()
+            canonical_names = (
+                "comparison_offline_online.png",
+                "comparison_offline_online.csv",
+                "comparison_offline.png",
+                "comparison_offline.csv",
+                "comparison_online.png",
+                "comparison_online.csv",
+            )
+            for comparison_dir in (
+                legacy_comparison_dir,
+                local_comparison_dir,
+            ):
+                for name in canonical_names:
+                    self.assertFalse((comparison_dir / name).exists())
 
             legacy_log = legacy_log_path.read_text(encoding="utf-8")
             self.assertIn("normalized=2.0±0.2 benchmark_eligible=true", legacy_log)

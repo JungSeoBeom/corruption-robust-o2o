@@ -444,16 +444,29 @@ class AggregateResultsTest(unittest.TestCase):
                 self.assertTrue(output.exists())
                 self.assertTrue(output.with_suffix(".csv").exists())
 
-    def test_live_refresh_uses_standard_comparison_plot_names(self):
+    def test_default_comparison_refresh_excludes_running_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             comparison_dir = Path(directory)
             self._make_run(comparison_dir / "runs", "rpex", 0, 80.0, 12.0)
+            self._make_run(
+                comparison_dir / "runs", "cal_ql", 0, 70.0, 8.0
+            )
+            running_summary = (
+                comparison_dir
+                / "runs"
+                / "cal_ql"
+                / "seed_0"
+                / "summary.json"
+            )
+            running_summary.write_text(
+                json.dumps({"status": "running", "elapsed_seconds": 8.0}),
+                encoding="utf-8",
+            )
             outputs = update_comparison_plots(
                 comparison_dir,
                 "hopper-medium-replay-v2",
                 "random",
                 "mixed",
-                include_running=True,
             )
             self.assertEqual(
                 {output.name for output in outputs.values()},
@@ -465,9 +478,10 @@ class AggregateResultsTest(unittest.TestCase):
             )
             for output in outputs.values():
                 self.assertTrue(output.exists())
-            self.assertFalse(
-                any(comparison_dir.glob("diagnostic_running_*.png"))
+            online_curve = pd.read_csv(
+                outputs["online"].with_suffix(".csv")
             )
+            self.assertEqual(set(online_curve["algorithm"]), {"rpex"})
 
     def test_verified_completion_is_source_for_actual_online_steps(self):
         with tempfile.TemporaryDirectory() as directory:

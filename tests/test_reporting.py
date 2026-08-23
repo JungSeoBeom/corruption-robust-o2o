@@ -826,6 +826,52 @@ class ReportingRuleTest(unittest.TestCase):
         self.assertTrue(research["mean"].isna().all())
         self.assertTrue(research["std"].isna().all())
 
+    def test_absent_requested_seed_is_identified_and_withholds_research_mean(self):
+        frame = evaluation_frame(seeds=(0, 1, 2, 3))
+        frame["run_purpose"] = "research_benchmark"
+        frame["benchmark_role"] = "main"
+        frame["implementation_type"] = "source_aligned_port"
+        frame["uses_corruption_labels"] = False
+        frame["final_window_size"] = 3
+        frame["evaluation_corruption"] = "clean"
+        with tempfile.TemporaryDirectory() as directory:
+            outputs = write_reporting_outputs(
+                frame,
+                Path(directory),
+                strict=False,
+                expected_seeds=[0, 1, 2, 3, 4],
+            )
+            research = pd.read_csv(outputs["research_summary"])
+            common = pd.read_csv(outputs["common_benchmark_summary"])
+
+        self.assertEqual(set(research["seed"]), {0, 1, 2, 3})
+        self.assertEqual(set(research["status"]), {"cohort_incomplete"})
+        self.assertTrue(research["mean"].isna().all())
+        self.assertTrue(research["std"].isna().all())
+        self.assertEqual(str(common.iloc[0]["missing_seeds"]), "4")
+
+    def test_complete_requested_seed_cohort_publishes_research_mean(self):
+        frame = evaluation_frame(seeds=(0, 1, 2, 3, 4))
+        frame["run_purpose"] = "research_benchmark"
+        frame["benchmark_role"] = "main"
+        frame["implementation_type"] = "source_aligned_port"
+        frame["uses_corruption_labels"] = False
+        frame["final_window_size"] = 3
+        frame["evaluation_corruption"] = "clean"
+        with tempfile.TemporaryDirectory() as directory:
+            outputs = write_reporting_outputs(
+                frame,
+                Path(directory),
+                strict=False,
+                expected_seeds=[0, 1, 2, 3, 4],
+            )
+            research = pd.read_csv(outputs["research_summary"])
+
+        self.assertEqual(set(research["seed"]), {0, 1, 2, 3, 4})
+        self.assertEqual(set(research["status"]), {"completed"})
+        self.assertTrue(research["mean"].notna().all())
+        self.assertTrue(research["std"].notna().all())
+
     def test_research_summary_requires_common_interval_and_clean_evaluation(self):
         frame = evaluation_frame(seeds=(0,))
         frame["run_purpose"] = "research_benchmark"

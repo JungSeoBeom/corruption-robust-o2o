@@ -205,12 +205,16 @@ class ResearchBenchmarkConfigTest(unittest.TestCase):
 
 
 class ResearchReadinessTest(unittest.TestCase):
-    def test_all_suite_readiness_order_is_clean_adversarial_random(self):
+    def test_all_suite_readiness_order_is_adversarial_clean_random(self):
         settings = _settings_for_suite("all")
         modes = [mode for mode, _target in settings]
-        self.assertEqual(modes[0], "clean")
+        first_clean = modes.index("clean")
         first_random = modes.index("random")
-        self.assertTrue(all(mode == "adversarial" for mode in modes[1:first_random]))
+        self.assertTrue(
+            all(mode == "adversarial" for mode in modes[:first_clean])
+        )
+        self.assertEqual(modes[first_clean], "clean")
+        self.assertEqual(first_random, first_clean + 1)
         self.assertTrue(all(mode == "random" for mode in modes[first_random:]))
 
     def test_latest_completed_uses_completion_manifest_mtime(self):

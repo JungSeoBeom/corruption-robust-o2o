@@ -304,20 +304,6 @@ class RunLogger:
                 LOCAL_SCORE_SEMANTICS,
             )
 
-    def _refresh_comparison_plots(self) -> None:
-        try:
-            from plot_results import update_comparison_plots
-
-            update_comparison_plots(
-                self.comparison_dir,
-                self.config.env_name,
-                self.config.corruption,
-                self.config.corruption_target,
-                include_running=True,
-            )
-        except Exception as exc:
-            self.logger.warning("comparison plot refresh skipped: %s", exc)
-
     def write_completion_manifest(self, outcomes: Dict[str, Any]) -> Path:
         """Write immutable launch provenance plus measured run outcomes.
 
@@ -429,7 +415,6 @@ class RunLogger:
             score_std,
             str(self._score_benchmark_eligible).lower(),
         )
-        self._refresh_comparison_plots()
 
     def finish(
         self, status: str, error: Optional[str] = None
@@ -453,8 +438,6 @@ class RunLogger:
         }
         with (self.run_dir / "summary.json").open("w", encoding="utf-8") as stream:
             json.dump(summary, stream, indent=2, ensure_ascii=False)
-        if status == "completed":
-            self._refresh_comparison_plots()
         self.logger.info("status=%s run_dir=%s", status, self.run_dir)
         # Keep these as the final three normal output lines, per the benchmark
         # requirement. The CLI prints tracebacks before calling finish().

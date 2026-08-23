@@ -568,9 +568,10 @@ results/comparisons/<env>/<corruption>/<target>/<comparison_id>/
 ```
 
 - The three `comparison_*.png` files show the combined, offline-only, and
-  online-only curves. They are refreshed after every evaluation and may include
-  the currently running algorithm; a successfully completed suite republishes
-  them using completed runs only.
+  online-only curves. They and their matching CSV files are published only
+  after the entire controller suite completes successfully. During or after an
+  incomplete run, inspect each run's `metrics.csv` and `performance.png`
+  instead.
 - The matching CSV files contain mean/std/count at every evaluation step.
 - `final_scores.csv`: backward-compatible common last-three metric; it is not a
   paper metric
@@ -656,7 +657,7 @@ condition. Applying an RPEX corruption condition to another baseline is
 recorded as `benchmark_transfer`.
 
 `run_55_experiment.py --corruption-suite all` executes the nine conditions in
-this order: clean, the four adversarial targets, then the four random targets.
+this order: the four adversarial targets, clean, then the four random targets.
 PQE collects a full 1,000-transition block before updating: 5,000 updates for
 the first block and 1,000 for each later full block. A final partial block is
 saved but is not trained early.
