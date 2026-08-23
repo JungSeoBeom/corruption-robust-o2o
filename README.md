@@ -595,12 +595,13 @@ every completed algorithm followed by the overall start, end, and elapsed time.
 Use `--comparison-name NAME` to set the final directory name and `--keep-going`
 to continue with the remaining algorithms if one run fails.
 
-### 5×5 suite
+### Fixed 5×9 suite
 
 `run_55_experiment.py` keeps its historical filename. Its default research
-matrix is 5 algorithms × 5 conditions: the five main baselines, clean, and the
-four individual random-corruption targets. HalfCheetah is the default and both
-offline and online budgets default to 500,000 steps.
+matrix is fixed to 5 algorithms × 9 conditions: four adversarial targets,
+clean, and four random-corruption targets. HalfCheetah is the default and both
+offline and online budgets default to 500,000 steps. The launcher has no
+`--corruption-suite` selector.
 
 On macOS, the Gymnasium-v4 backend is diagnostic-only, so declare that purpose
 explicitly:
@@ -609,7 +610,6 @@ explicitly:
 conda activate corruption
 python run_55_experiment.py \
   --env-name halfcheetah-medium-replay-v2 \
-  --corruption-suite random \
   --seeds 0 \
   --run-purpose diagnostic \
   --suite-profile common_budget_diagnostic \
@@ -626,7 +626,7 @@ directories to validate that evidence:
 ```bash
 python scripts/check_research_readiness.py \
   --env-name halfcheetah-medium-replay-v2 \
-  --corruption-suite random \
+  --corruption-suite all \
   --run-dir /absolute/path/to/comparison_directory
 ```
 
@@ -646,18 +646,12 @@ All five algorithms are included in the same main research summary. Cal-QL's
 locomotion-adaptation metadata and PQE's v0-to-v2 port metadata remain attached
 to their rows; neither method is diverted to a separate summary.
 
-Select suites explicitly with `--corruption-suite clean`, `random`,
-`adversarial`, or `all`. In the custom research benchmark, `random` means clean
-plus the four random targets. In the separate strict contract, it means only the four
-actual random targets and excludes clean. Clean is a benchmark transfer and is
-never auto-certified. A diagnostic adversarial suite may contain all four
-single targets, but the strict adversarial setting is empty: the existing
-Hopper observation fixture is optimizer-core-only and authorizes no end-to-end
-condition. Applying an RPEX corruption condition to another baseline is
-recorded as `benchmark_transfer`.
-
-`run_55_experiment.py --corruption-suite all` executes the nine conditions in
-this order: the four adversarial targets, clean, then the four random targets.
+`run_55_experiment.py` always executes the nine conditions in this order: the
+four adversarial targets, clean, then the four random targets. Clean and the
+adversarial conditions are custom benchmark transfers; the existing
+adversarial fixture is optimizer-core-only and does not certify an official
+paper reproduction. Applying an RPEX corruption condition to another baseline
+is recorded as `benchmark_transfer`.
 PQE collects a full 1,000-transition block before updating: 5,000 updates for
 the first block and 1,000 for each later full block. A final partial block is
 saved but is not trained early.
@@ -695,7 +689,6 @@ For a local Mac smoke/debug run only:
 conda activate corruption
 python run_55_experiment.py \
   --env-name halfcheetah-medium-replay-v2 \
-  --corruption-suite random \
   --suite-profile common_budget_diagnostic \
   --run-purpose diagnostic \
   --protocol local_gymnasium_v4_diagnostic \

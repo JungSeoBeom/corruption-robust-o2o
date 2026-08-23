@@ -3,7 +3,6 @@ from __future__ import annotations
 import io
 import unittest
 from contextlib import redirect_stderr
-from unittest.mock import patch
 
 from robust_o2o.config import (
     DEFAULT_PROTOCOL,
@@ -14,15 +13,13 @@ from robust_o2o.fidelity import MAIN_BASELINES
 from run_55_experiment import (
     ADVERSARIAL_SETTINGS,
     CLEAN_SETTINGS,
-    DIAGNOSTIC_RANDOM_SETTINGS,
     ENV_NAME,
-    STRICT_ADVERSARIAL_SETTINGS,
-    STRICT_RANDOM_SETTINGS,
+    FIXED_SETTINGS,
+    RANDOM_SETTINGS,
     _default_experiment_name,
     _validate_args,
     build_parser,
     commands,
-    settings_for_suite,
 )
 from run_matrix import (
     _validate_args as validate_matrix_args,
@@ -55,8 +52,12 @@ class Run55ExperimentTest(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            DIAGNOSTIC_RANDOM_SETTINGS,
+            FIXED_SETTINGS,
             (
+                ("adversarial", "observations"),
+                ("adversarial", "actions"),
+                ("adversarial", "rewards"),
+                ("adversarial", "dynamics"),
                 ("clean", "none"),
                 ("random", "observations"),
                 ("random", "actions"),
@@ -64,7 +65,7 @@ class Run55ExperimentTest(unittest.TestCase):
                 ("random", "dynamics"),
             ),
         )
-        self.assertEqual(len(generated), 5)
+        self.assertEqual(len(generated), 9)
         self.assertEqual(args.offline_steps, 500_000)
         self.assertEqual(args.online_steps, 500_000)
         self.assertEqual(args.protocol, DEFAULT_PROTOCOL)
@@ -76,7 +77,7 @@ class Run55ExperimentTest(unittest.TestCase):
         self.assertEqual(args.final_window_size, 3)
 
         for command, (corruption, target) in zip(
-            generated, DIAGNOSTIC_RANDOM_SETTINGS
+            generated, FIXED_SETTINGS
         ):
             self.assertEqual(command[command.index("--env-name") + 1], ENV_NAME)
             self.assertEqual(command[command.index("--corruption") + 1], corruption)
@@ -109,7 +110,7 @@ class Run55ExperimentTest(unittest.TestCase):
         )
         _validate_args(parser, args, ())
         generated = list(commands(args, (), "halfcheetah_suite"))
-        self.assertEqual(len(generated), 5)
+        self.assertEqual(len(generated), 9)
         for command in generated:
             self.assertEqual(
                 command[command.index("--env-name") + 1],
@@ -161,123 +162,56 @@ class Run55ExperimentTest(unittest.TestCase):
         )
         self.assertEqual(command[command.index("--protocol") + 1], LOCAL_PROTOCOL)
 
-    def test_primary_suite_has_no_runs_when_registry_has_no_eligible_algorithm(self):
+    def test_fixed_suite_rejects_strict_publication_profiles(self):
         parser = build_parser()
-        args = parser.parse_args(
+        for arguments in (
             [
                 "--suite-profile",
                 "primary_research_benchmark",
-                "--seeds",
-                "0,1,2,3,4",
                 "--run-purpose",
                 "final_benchmark",
-            ]
-        )
-        with patch(
-            "run_55_experiment.strict_final_algorithms", return_value=()
-        ), self.assertRaises(SystemExit):
-            _validate_args(parser, args, ())
-
-    def test_hypothetical_certified_primary_suite_uses_only_strict_random(self):
-        parser = build_parser()
-        args = parser.parse_args(
+            ],
             [
                 "--suite-profile",
-                "primary_research_benchmark",
-                "--seeds",
-                "0,1,2,3,4",
+                "common_budget_diagnostic",
                 "--run-purpose",
-                "final_benchmark",
-            ]
-        )
-        with patch(
-            "run_55_experiment.strict_final_algorithms",
-            return_value=("rpex", "riql_naive"),
-        ), patch(
-            "robust_o2o.final_gate.strict_final_algorithms",
-            return_value=("rpex", "riql_naive"),
+                "paper_reproduction",
+            ],
         ):
-            _validate_args(parser, args, ())
-            generated = list(commands(args, (), "primary_suite"))
-        self.assertEqual(len(generated), len(STRICT_RANDOM_SETTINGS))
-        for command in generated:
-            algorithms = command[command.index("--algorithms") + 1].split(",")
-            self.assertNotIn("pqe_shared_actor_approx", algorithms)
-            self.assertEqual(algorithms, ["rpex", "riql_naive"])
-            self.assertEqual(
-                command[command.index("--online-corruption-scale-profile") + 1],
-                "rpex_official_code",
-            )
-            self.assertNotIn("--offline-steps", command)
-            self.assertNotIn("--online-steps", command)
+            with self.subTest(arguments=arguments):
+                args = parser.parse_args(arguments)
+                with self.assertRaises(SystemExit):
+                    _validate_args(parser, args, ())
 
-        invalid = parser.parse_args(
-            ["--run-purpose", "final_benchmark", "--seeds", "0"]
-        )
-        with patch(
-            "run_55_experiment.strict_final_algorithms",
-            return_value=("rpex", "riql_naive"),
-        ), patch(
-            "robust_o2o.final_gate.strict_final_algorithms",
-            return_value=("rpex", "riql_naive"),
-        ), self.assertRaises(SystemExit):
-            _validate_args(parser, invalid, ())
-
-    def test_adversarial_and_all_suites_are_explicit(self):
-        parser = build_parser()
-        adversarial = parser.parse_args(["--corruption-suite", "adversarial"])
-        commands_only = list(commands(adversarial, (), "adv_suite"))
-        all_suite = parser.parse_args(["--corruption-suite", "all"])
-        all_commands = list(commands(all_suite, (), "all_suite"))
-        expected_all = (
-            *ADVERSARIAL_SETTINGS,
-            *CLEAN_SETTINGS,
-            *STRICT_RANDOM_SETTINGS,
-        )
-        self.assertEqual(len(commands_only), 4)
-        self.assertEqual(settings_for_suite("adversarial"), ADVERSARIAL_SETTINGS)
+    def test_fixed_settings_order_and_removed_suite_option(self):
         self.assertEqual(
-            settings_for_suite("random"), DIAGNOSTIC_RANDOM_SETTINGS
+            FIXED_SETTINGS,
+            (*ADVERSARIAL_SETTINGS, *CLEAN_SETTINGS, *RANDOM_SETTINGS),
         )
-        self.assertEqual(settings_for_suite("all"), expected_all)
-        self.assertEqual(len(all_commands), len(expected_all))
+        parser = build_parser()
+        args = parser.parse_args([])
+        _validate_args(parser, args, ())
+        generated = list(commands(args, (), "fixed_suite"))
         self.assertEqual(
             tuple(
                 (
                     command[command.index("--corruption") + 1],
                     command[command.index("--corruption-target") + 1],
                 )
-                for command in all_commands
+                for command in generated
             ),
-            expected_all,
+            FIXED_SETTINGS,
         )
-        self.assertEqual(
-            settings_for_suite("adversarial", strict=True),
-            STRICT_ADVERSARIAL_SETTINGS,
+        parsed, passthrough = parser.parse_known_args(
+            ["--corruption-suite", "random"]
         )
-        self.assertEqual(STRICT_ADVERSARIAL_SETTINGS, ())
-        self.assertEqual(
-            settings_for_suite("random", strict=True), STRICT_RANDOM_SETTINGS
-        )
-        self.assertNotIn(
-            ("clean", "none"), settings_for_suite("random", strict=True)
-        )
-        self.assertEqual(settings_for_suite("clean", strict=True), ())
-        self.assertEqual(
-            settings_for_suite("all", strict=True), STRICT_RANDOM_SETTINGS
-        )
-        for command, (mode, target) in zip(commands_only, ADVERSARIAL_SETTINGS):
-            self.assertEqual(command[command.index("--corruption") + 1], mode)
-            self.assertEqual(
-                command[command.index("--corruption-target") + 1], target
-            )
+        with self.assertRaises(SystemExit):
+            _validate_args(parser, parsed, passthrough)
 
     def test_comma_space_and_alias_algorithm_inputs_are_canonical(self):
         parser = build_parser()
         args = parser.parse_args(
             [
-                "--corruption-suite",
-                "clean",
                 "--algorithms",
                 "rpex,riql_naive",
                 "wsrl",
@@ -324,42 +258,6 @@ class Run55ExperimentTest(unittest.TestCase):
             aliases.algorithms,
             ["rpex", "cal_ql", "pessimistic_q_ensemble"],
         )
-
-    def test_final_adversarial_suite_rejects_optimizer_core_fixture(self):
-        parser = build_parser()
-        args = parser.parse_args(
-            [
-                "--env-name",
-                "hopper-medium-replay-v2",
-                "--corruption-suite",
-                "adversarial",
-                "--suite-profile",
-                "primary_research_benchmark",
-                "--run-purpose",
-                "final_benchmark",
-                "--seeds",
-                "0,1,2,3,4",
-            ]
-        )
-        with self.assertRaises(SystemExit):
-            _validate_args(parser, args, ())
-
-    def test_final_all_suite_rejects_uncertified_adversarial_conditions(self):
-        parser = build_parser()
-        args = parser.parse_args(
-            [
-                "--corruption-suite",
-                "all",
-                "--suite-profile",
-                "primary_research_benchmark",
-                "--run-purpose",
-                "final_benchmark",
-                "--seeds",
-                "0,1,2,3,4",
-            ]
-        )
-        with self.assertRaises(SystemExit):
-            _validate_args(parser, args, ())
 
 
 if __name__ == "__main__":
