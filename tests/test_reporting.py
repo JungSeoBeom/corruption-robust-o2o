@@ -11,10 +11,9 @@ from robust_o2o.fidelity import (
     MAIN_BASELINES,
     REPORTING_RULES,
 )
+from robust_o2o.config import LEGACY_PROTOCOL, LEGACY_SCORE_SEMANTICS
 from robust_o2o.reporting import (
     CALQL_ONLINE_BUDGET_SEMANTICS,
-    D4RL_SCORE_SEMANTICS,
-    LEGACY_RESEARCH_PROTOCOL,
     PER_SEED_COLUMNS,
     RESEARCH_SUMMARY_COLUMNS,
     SUMMARY_COLUMNS,
@@ -58,8 +57,8 @@ def evaluation_frame(
                 "condition_certificate_verified": True,
                 "condition_status": "paper_reproduction_condition",
                 "run_purpose": "final_benchmark",
-                "protocol": LEGACY_RESEARCH_PROTOCOL,
-                "score_semantics": D4RL_SCORE_SEMANTICS,
+                "protocol": LEGACY_PROTOCOL,
+                "score_semantics": LEGACY_SCORE_SEMANTICS,
                 "benchmark_eligible": True,
                 "planned_online_steps": 40_000,
                 "planned_offline_steps": 2_000_000,
@@ -96,8 +95,8 @@ def evaluation_frame(
                     "condition_certificate_verified": True,
                     "condition_status": "paper_reproduction_condition",
                     "run_purpose": "final_benchmark",
-                    "protocol": LEGACY_RESEARCH_PROTOCOL,
-                    "score_semantics": D4RL_SCORE_SEMANTICS,
+                    "protocol": LEGACY_PROTOCOL,
+                    "score_semantics": LEGACY_SCORE_SEMANTICS,
                     "benchmark_eligible": True,
                     "planned_online_steps": 40_000,
                     "planned_offline_steps": 2_000_000,
@@ -120,18 +119,18 @@ class ReportingRuleTest(unittest.TestCase):
         self.assertEqual(
             classify_score_semantics(
                 {
-                    "protocol": LEGACY_RESEARCH_PROTOCOL,
-                    "score_semantics": D4RL_SCORE_SEMANTICS,
+                    "protocol": LEGACY_PROTOCOL,
+                    "score_semantics": LEGACY_SCORE_SEMANTICS,
                     "benchmark_eligible": True,
                     "run_purpose": "research_benchmark",
                 }
             ),
-            (D4RL_SCORE_SEMANTICS, True),
+            (LEGACY_SCORE_SEMANTICS, True),
         )
         diagnostic = classify_score_semantics(
             {
                 "protocol": "local_gymnasium_v4_diagnostic",
-                "score_semantics": D4RL_SCORE_SEMANTICS,
+                "score_semantics": LEGACY_SCORE_SEMANTICS,
                 "benchmark_eligible": True,
                 "run_purpose": "research_benchmark",
             }
@@ -143,7 +142,7 @@ class ReportingRuleTest(unittest.TestCase):
         self.assertEqual(
             classify_score_semantics(
                 {
-                    "protocol": LEGACY_RESEARCH_PROTOCOL,
+                    "protocol": LEGACY_PROTOCOL,
                     "run_purpose": "research_benchmark",
                 }
             ),
@@ -153,7 +152,7 @@ class ReportingRuleTest(unittest.TestCase):
             classify_score_semantics(
                 {
                     "protocol": "unknown_legacy_protocol",
-                    "score_semantics": D4RL_SCORE_SEMANTICS,
+                    "score_semantics": LEGACY_SCORE_SEMANTICS,
                     "benchmark_eligible": True,
                     "run_purpose": "research_benchmark",
                 }
@@ -440,7 +439,7 @@ class ReportingRuleTest(unittest.TestCase):
         self.assertEqual(research_summary["seed_score"].tolist(), [3.0])
         self.assertEqual(
             research_summary["score_semantics"].tolist(),
-            [D4RL_SCORE_SEMANTICS],
+            [LEGACY_SCORE_SEMANTICS],
         )
         self.assertEqual(diagnostic_summary["mean"].tolist(), [103.0])
         self.assertEqual(
@@ -451,7 +450,7 @@ class ReportingRuleTest(unittest.TestCase):
         self.assertEqual(
             set(common_summary["score_semantics"]),
             {
-                D4RL_SCORE_SEMANTICS,
+                LEGACY_SCORE_SEMANTICS,
                 "diagnostic_d4rl_reference_scaled_return",
             },
         )

@@ -11,12 +11,12 @@ import pandas as pd
 
 from plot_results import (
     _concat_nonempty_frames,
+    _plot_algorithm_label,
     _score_plot_labels,
     _validate_score_contract,
     load_runs,
     plot_aggregate,
     update_comparison_plots,
-    update_live_comparison_plots,
     write_final_score_summary,
     write_reproduction_summaries,
 )
@@ -25,6 +25,28 @@ from robust_o2o.fidelity import canonical_json_sha256
 from robust_o2o.logging_utils import METRIC_FIELDS
 from robust_o2o.manifest import build_experiment_manifest
 from robust_o2o.reporting import ReportingValidationError
+
+
+class PlotAlgorithmLabelTest(unittest.TestCase):
+    def test_main_baseline_labels_are_concise(self):
+        expected = {
+            "rpex": "RPEX",
+            "riql_naive": "RIQL-naive",
+            "wsrl": "WSRL",
+            "cal_ql": "Cal-QL",
+            "pessimistic_q_ensemble": "Pessimistic Q-Ensemble",
+        }
+
+        for algorithm, label in expected.items():
+            with self.subTest(algorithm=algorithm):
+                self.assertEqual(_plot_algorithm_label(algorithm), label)
+                self.assertNotIn("[", label)
+                self.assertNotIn("|", label)
+
+    def test_unknown_algorithm_keeps_its_identifier(self):
+        self.assertEqual(
+            _plot_algorithm_label("custom_agent"), "custom_agent"
+        )
 
 
 class ConcatNonemptyFramesTest(unittest.TestCase):
@@ -314,6 +336,25 @@ class AggregateResultsTest(unittest.TestCase):
                 "common_mean_last_3_online_evaluations_per_seed_then_population_mean_std__partial_2_of_3",
             )
 
+    def test_plot_legend_uses_concise_calql_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._make_run(root, "cal_ql", 0, 70.0, 8.0)
+            output = plot_aggregate(
+                root,
+                root / "comparison.svg",
+                env_name="hopper-medium-replay-v2",
+                corruption="random",
+                target="mixed",
+            )
+
+            svg = output.read_text(encoding="utf-8")
+            self.assertIn("Cal-QL", svg)
+            self.assertNotIn("D4RL locomotion adaptation", svg)
+            self.assertNotIn("calql_source_aligned", svg)
+            self.assertNotIn("post-replay", svg)
+            self.assertNotIn("unit-scale", svg)
+
     def test_historical_result_algorithm_names_load_as_canonical(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -403,20 +444,30 @@ class AggregateResultsTest(unittest.TestCase):
                 self.assertTrue(output.exists())
                 self.assertTrue(output.with_suffix(".csv").exists())
 
-    def test_live_refresh_never_publishes_canonical_plot_names(self):
+    def test_live_refresh_uses_standard_comparison_plot_names(self):
         with tempfile.TemporaryDirectory() as directory:
             comparison_dir = Path(directory)
             self._make_run(comparison_dir / "runs", "rpex", 0, 80.0, 12.0)
-            outputs = update_live_comparison_plots(
+            outputs = update_comparison_plots(
                 comparison_dir,
                 "hopper-medium-replay-v2",
                 "random",
                 "mixed",
+                include_running=True,
+            )
+            self.assertEqual(
+                {output.name for output in outputs.values()},
+                {
+                    "comparison_offline_online.png",
+                    "comparison_offline.png",
+                    "comparison_online.png",
+                },
             )
             for output in outputs.values():
-                self.assertTrue(output.name.startswith("diagnostic_running_"))
                 self.assertTrue(output.exists())
-            self.assertFalse((comparison_dir / "comparison_online.png").exists())
+            self.assertFalse(
+                any(comparison_dir.glob("diagnostic_running_*.png"))
+            )
 
     def test_verified_completion_is_source_for_actual_online_steps(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -12,7 +12,7 @@ from robust_o2o.paths import (
 
 
 class ResultPathTest(unittest.TestCase):
-    def test_new_comparisons_include_protocol_and_profile_namespaces(self):
+    def test_comparison_path_is_compact(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             comparison = comparison_directory(
@@ -21,15 +21,11 @@ class ResultPathTest(unittest.TestCase):
                 "clean",
                 "none",
                 "group",
-                "rpex_d4rl_v2_legacy",
-                "reference",
             )
             self.assertEqual(
                 comparison,
                 root
                 / "comparisons"
-                / "rpex_d4rl_v2_legacy"
-                / "reference"
                 / "hopper-medium-replay-v2"
                 / "clean"
                 / "none"
@@ -57,6 +53,27 @@ class ResultPathTest(unittest.TestCase):
             )
             self.assertNotIn("local_gymnasium_v4", comparison.parts)
 
+    def test_single_run_layout_is_compact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            comparison, runs = resolve_run_layout(
+                str(root),
+                "halfcheetah-medium-replay-v2",
+                "random",
+                "observations",
+                "halfcheetah_5x5_test",
+            )
+            expected = (
+                root
+                / "comparisons"
+                / "halfcheetah-medium-replay-v2"
+                / "random"
+                / "observations"
+                / "halfcheetah_5x5_test"
+            )
+            self.assertEqual(comparison, expected)
+            self.assertEqual(runs, expected / "runs")
+
     def test_existing_comparison_runs_directory_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -67,6 +84,16 @@ class ResultPathTest(unittest.TestCase):
             self.assertEqual(comparison, runs.parent)
             self.assertEqual(resolved_runs, runs)
             self.assertEqual(results_root_from_output(str(runs)), root)
+
+    def test_arbitrary_runs_directory_does_not_bypass_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "runs"
+            comparison, resolved_runs = resolve_run_layout(
+                str(root), "hopper", "clean", "none", "group"
+            )
+            expected = root / "comparisons/hopper/clean/none/group"
+            self.assertEqual(comparison, expected)
+            self.assertEqual(resolved_runs, expected / "runs")
 
 
 if __name__ == "__main__":

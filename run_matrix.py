@@ -31,7 +31,6 @@ from robust_o2o.fidelity import (
     STRICT_FINAL_SEEDS,
     STRICT_FINAL_TASKS,
     SUITE_PROFILES,
-    strict_final_algorithms,
 )
 from robust_o2o.final_gate import (
     FinalAuditGateError,
@@ -39,38 +38,15 @@ from robust_o2o.final_gate import (
     require_final_benchmark_audit,
     validate_research_label_contract,
 )
+from robust_o2o.launcher_utils import (
+    CHILD_IDENTITY_OPTIONS,
+    canonical_algorithms,
+    passthrough_conflicts,
+)
 
-
-RESERVED_PASSTHROUGH_OPTIONS = {
-    "--algorithm",
-    "--benchmark-seed-set",
-    "--comparison-name",
-    "--corruption",
-    "--corruption-target",
-    "--env-name",
-    "--implementation-profile",
-    "--algorithm-profile",
-    "--online-corruption-scale-profile",
-    "--output-dir",
-    "--protocol",
-    "--run-purpose",
-    "--seed",
-    "--stage",
-    "--suite-profile",
-}
 
 def _csv(value: str):
     return [item.strip() for item in value.split(",") if item.strip()]
-
-
-def _canonical_algorithms(values: list[str]) -> list[str]:
-    requested = [
-        item.strip().lower()
-        for value in values
-        for item in value.split(",")
-        if item.strip()
-    ]
-    return [ALGORITHM_ALIASES.get(value, value) for value in requested]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -191,7 +167,7 @@ def _validate_args(
     if args.run_purpose == "research_benchmark" and args.protocol == LOCAL_PROTOCOL:
         parser.error(RESEARCH_BENCHMARK_PROTOCOL_ERROR)
 
-    args.algorithms = _canonical_algorithms(args.algorithms)
+    args.algorithms = canonical_algorithms(args.algorithms, ALGORITHM_ALIASES)
 
     unknown_algorithms = sorted(set(args.algorithms) - set(ALGORITHMS))
     if unknown_algorithms:
@@ -234,11 +210,7 @@ def _validate_args(
         except ValueError:
             parser.error(f"invalid seed: {seed!r}")
 
-    conflicts = sorted(
-        option
-        for option in passthrough
-        if option.split("=", 1)[0] in RESERVED_PASSTHROUGH_OPTIONS
-    )
+    conflicts = passthrough_conflicts(passthrough, CHILD_IDENTITY_OPTIONS)
     if conflicts:
         parser.error(
             "these child identity/provenance options cannot be overridden: "
@@ -253,7 +225,7 @@ def _validate_args(
     except ResearchLabelContractError as exc:
         parser.error(str(exc))
 
-    if args.protocol in (LOCAL_PROTOCOL, "local_gymnasium_v4") and not args.allow_diagnostic_protocol:
+    if args.protocol == LOCAL_PROTOCOL and not args.allow_diagnostic_protocol:
         parser.error(
             "the local Gymnasium protocol is diagnostic-only; pass "
             "--allow-diagnostic-protocol to acknowledge this"
@@ -269,11 +241,6 @@ def _validate_args(
     if args.run_purpose == "final_benchmark":
         if tuple(parsed_seeds) != STRICT_FINAL_SEEDS:
             parser.error("final_benchmark requires exactly ordered seeds 0,1,2,3,4")
-        if args.suite_profile != "primary_research_benchmark":
-            parser.error(
-                "final_benchmark requires --suite-profile "
-                "primary_research_benchmark"
-            )
         if args.protocol != DEFAULT_PROTOCOL:
             parser.error(
                 "final_benchmark requires rpex_d4rl_v2_legacy; no local fallback"
@@ -300,14 +267,6 @@ def _validate_args(
             parser.error(
                 "final_benchmark permits only medium-replay-v2 tasks: "
                 + ", ".join(unsupported_tasks)
-            )
-        forbidden = sorted(
-            set(args.algorithms) - set(strict_final_algorithms())
-        )
-        if forbidden:
-            parser.error(
-                "final_benchmark rejects non-allowlisted baselines: "
-                + ", ".join(forbidden)
             )
         if (
             "adversarial" in args.corruptions

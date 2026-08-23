@@ -18,17 +18,6 @@ from robust_o2o.config import ALGORITHMS, ExperimentConfig, LOCAL_PROTOCOL  # no
 from robust_o2o.experiment import run_experiment  # noqa: E402
 from robust_o2o.logging_utils import RunLogger  # noqa: E402
 
-
-STATUS_CODES = (
-    "PASS_CODE_INVARIANTS",
-    "PASS_LEARNING_SIGNAL",
-    "FAIL_CODE_INVARIANT",
-    "FAIL_NUMERICAL",
-    "FAIL_NO_PARAMETER_UPDATE",
-    "FAIL_NO_RETURN_IMPROVEMENT",
-    "INCONCLUSIVE_SHORT_RUN",
-)
-
 PARAMETER_DELTA_TOLERANCE = 1e-8
 MIN_LEARNING_UPDATES = 100
 MIN_RETURN_IMPROVEMENT = 1.0

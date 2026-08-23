@@ -691,7 +691,7 @@ class FidelityProfileTest(unittest.TestCase):
         _assert_nested_equal(self, replay.state_dict(), resumed_replay.state_dict())
         self.assertEqual(uninterrupted.total_updates, 200)
 
-    def test_run_path_contains_manifest_hash(self):
+    def test_run_path_is_compact_and_manifest_is_hashed(self):
         with tempfile.TemporaryDirectory() as directory:
             config = ExperimentConfig(
                 "wsrl",
@@ -709,16 +709,19 @@ class FidelityProfileTest(unittest.TestCase):
                 normalizer_sha256="normalizer",
             )
             logger.write_config(resolved)
-            self.assertTrue(any(part.startswith("manifest_") for part in logger.run_dir.parts))
             manifest = json.loads(
                 (logger.run_dir / "experiment_manifest.json").read_text(
                     encoding="utf-8"
                 )
             )
-            self.assertIn(
-                f"manifest_{manifest['manifest_sha256'][:16]}",
-                logger.run_dir.parts,
+            relative_run = logger.run_dir.relative_to(
+                logger.comparison_dir / "runs"
             )
+            self.assertEqual(relative_run.parts[0], "wsrl")
+            self.assertRegex(relative_run.parts[1], r"^seed_l0_c\d+$")
+            self.assertEqual(len(relative_run.parts), 3)
+            self.assertFalse((logger.run_dir / "resolved_config.json").exists())
+            self.assertTrue(manifest["manifest_sha256"])
             completion_path = logger.write_completion_manifest(
                 {
                     "requested_online_steps": 500_000,

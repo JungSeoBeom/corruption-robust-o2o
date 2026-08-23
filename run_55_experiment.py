@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import re
 import shlex
 import subprocess
 import sys
@@ -33,10 +32,14 @@ from robust_o2o.fidelity import (
     SUITE_PROFILES,
     strict_final_algorithms,
 )
+from robust_o2o.launcher_utils import (
+    RUN55_FIXED_OPTIONS,
+    canonical_algorithms,
+    flatten_cli_values,
+    passthrough_conflicts,
+    valid_comparison_name,
+)
 ENV_NAME = "halfcheetah-medium-replay-v2"
-# Backward-compatible import name used by existing launcher callers.  New runs
-# always use the five canonical main-baseline names from fidelity.py.
-ALGORITHMS = MAIN_BASELINES
 CORRUPTION_SUITES = ("clean", "random", "adversarial", "all")
 CLEAN_SETTINGS = (("clean", "none"),)
 DIAGNOSTIC_RANDOM_SETTINGS = (
@@ -52,9 +55,6 @@ STRICT_RANDOM_SETTINGS = (
     ("random", "rewards"),
     ("random", "dynamics"),
 )
-# Backward-compatible name for callers that use the historical diagnostic
-# clean-plus-four matrix.
-RANDOM_SETTINGS = DIAGNOSTIC_RANDOM_SETTINGS
 ADVERSARIAL_SETTINGS = tuple(
     ("adversarial", target)
     for target in SUPPORTED_ADVERSARIAL_TARGETS
@@ -63,61 +63,10 @@ ADVERSARIAL_SETTINGS = tuple(
 # core.  It is not an end-to-end condition certificate and therefore
 # authorizes no strict adversarial setting.
 STRICT_ADVERSARIAL_SETTINGS: tuple[tuple[str, str], ...] = ()
-# Backward-compatible import used by older callers; the default suite remains
-# clean plus the four random targets.
-SETTINGS = RANDOM_SETTINGS
-RESERVED_PASSTHROUGH_OPTIONS = {
-    "--algorithm",
-    "--algorithms",
-    "--optional-baselines",
-    "--benchmark-seed-set",
-    "--comparison-name",
-    "--corruption",
-    "--corruption-target",
-    "--corruption-suite",
-    "--env-name",
-    "--stage",
-    "--suite-profile",
-    "--run-purpose",
-    "--online-corruption-scale-profile",
-    "--implementation-profile",
-    "--algorithm-profile",
-    "--output-dir",
-    "--protocol",
-    "--seed",
-    "--seeds",
-    "--evaluation-interval",
-    "--eval-period",
-    "--evaluation-episodes",
-    "--eval-episodes",
-    "--final-window-size",
-    "--offline-steps",
-    "--online-steps",
-}
-
-
-def _flatten_cli_values(values: Iterable[str]) -> list[str]:
-    """Accept both comma-separated and shell-space-separated CLI lists."""
-
-    return [
-        item.strip()
-        for value in values
-        for item in value.split(",")
-        if item.strip()
-    ]
-
-
-def _canonical_algorithms(values: Iterable[str]) -> list[str]:
-    return [
-        ALGORITHM_ALIASES.get(value.strip().lower(), value.strip().lower())
-        for value in _flatten_cli_values(values)
-    ]
-
-
 def _default_experiment_name(env_name: str) -> str:
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     domain = env_name.split("-", 1)[0]
-    return f"{domain}_research_benchmark_{stamp}_{str(uuid.uuid4())[:8]}"
+    return f"{domain}_5x5_{stamp}_{str(uuid.uuid4())[:8]}"
 
 
 def _selected_algorithms(args: argparse.Namespace) -> tuple[str, ...]:
@@ -156,12 +105,6 @@ def build_parser() -> argparse.ArgumentParser:
             "main baselines as comma-separated and/or space-separated names; "
             "Cal-QL/PQE aliases are normalized to canonical names"
         ),
-    )
-    parser.add_argument(
-        "--optional-baselines",
-        nargs="+",
-        default=[],
-        help=argparse.SUPPRESS,
     )
     parser.add_argument("--seeds", nargs="+", default=["0"])
     parser.add_argument("--offline-steps", type=int, default=500_000)
@@ -221,14 +164,8 @@ def _validate_args(
         args.protocol = LOCAL_PROTOCOL
     if args.run_purpose == "research_benchmark" and args.protocol == LOCAL_PROTOCOL:
         parser.error(RESEARCH_BENCHMARK_PROTOCOL_ERROR)
-    args.algorithms = _canonical_algorithms(args.algorithms)
-    args.seeds = _flatten_cli_values(args.seeds)
-    if args.optional_baselines:
-        parser.error(
-            "--optional-baselines is retired: Cal-QL and Pessimistic "
-            "Q-Ensemble are main baselines; select their canonical names with "
-            "--algorithms"
-        )
+    args.algorithms = canonical_algorithms(args.algorithms, ALGORITHM_ALIASES)
+    args.seeds = flatten_cli_values(args.seeds)
     if not args.seeds:
         parser.error("--seeds cannot be empty")
     for seed in args.seeds:
@@ -322,11 +259,6 @@ def _validate_args(
                 "final_benchmark requires exactly seeds 0,1,2,3,4; "
                 "single-seed runs are smoke/diagnostic only"
             )
-        if args.suite_profile != "primary_research_benchmark":
-            parser.error(
-                "final_benchmark requires "
-                "--suite-profile primary_research_benchmark"
-            )
         if args.protocol != DEFAULT_PROTOCOL:
             parser.error(
                 "final_benchmark requires the strict rpex_d4rl_v2_legacy protocol"
@@ -342,22 +274,17 @@ def _validate_args(
             in ("research_benchmark", "primary_research_benchmark")
             else "dataset_std_scaled_extension"
         )
-    if args.protocol in (LOCAL_PROTOCOL, "local_gymnasium_v4") and not args.allow_diagnostic_protocol:
+    if args.protocol == LOCAL_PROTOCOL and not args.allow_diagnostic_protocol:
         parser.error(
             "the local Gymnasium protocol is diagnostic-only; pass "
             "--allow-diagnostic-protocol to acknowledge this"
         )
-    if args.experiment_name and (
-        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.experiment_name)
-        or args.experiment_name in (".", "..")
-    ):
+    if args.experiment_name and not valid_comparison_name(args.experiment_name):
         parser.error(
             "--experiment-name may contain only letters, digits, '.', '_', and '-', "
             "and must start with a letter or digit"
         )
-    conflicts = sorted(
-        option for option in passthrough if option.split("=", 1)[0] in RESERVED_PASSTHROUGH_OPTIONS
-    )
+    conflicts = passthrough_conflicts(passthrough, RUN55_FIXED_OPTIONS)
     if conflicts:
         parser.error(
             "these options are fixed by the 5x5 suite and cannot be overridden: "

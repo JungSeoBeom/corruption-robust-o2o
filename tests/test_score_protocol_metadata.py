@@ -115,7 +115,6 @@ class ScoreProtocolMetadataTest(unittest.TestCase):
         self.assertEqual(legacy["protocol"], LEGACY_PROTOCOL)
         self.assertEqual(legacy["run_purpose"], "research_benchmark")
         self.assertEqual(legacy["score_semantics"], LEGACY_SCORE_SEMANTICS)
-        self.assertEqual(legacy["normalized_score_rule"], LEGACY_SCORE_SEMANTICS)
         self.assertTrue(legacy["benchmark_eligible"])
 
         local = ExperimentConfig(
@@ -126,7 +125,6 @@ class ScoreProtocolMetadataTest(unittest.TestCase):
         ).to_dict()
         self.assertEqual(local["protocol"], LOCAL_PROTOCOL)
         self.assertEqual(local["score_semantics"], LOCAL_SCORE_SEMANTICS)
-        self.assertEqual(local["normalized_score_rule"], LOCAL_SCORE_SEMANTICS)
         self.assertFalse(local["benchmark_eligible"])
 
         with self.assertRaisesRegex(ValueError, "ResearchBenchmarkProtocolError"):
@@ -167,7 +165,7 @@ class ScoreProtocolMetadataTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("plot_results.update_live_comparison_plots"):
+            with patch("plot_results.update_comparison_plots"):
                 legacy_config = _research_config(output_dir=str(root / "legacy"))
                 legacy_logger = RunLogger(legacy_config)
                 legacy_logger.write_config(_runtime_config(legacy_config))

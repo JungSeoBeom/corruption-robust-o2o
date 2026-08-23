@@ -11,8 +11,6 @@ from robust_o2o.config import ExperimentConfig
 from robust_o2o.fidelity import (
     BASELINE_REPRODUCTION_REGISTRY,
     MAIN_BASELINES,
-    OPTIONAL_ADAPTED_BASELINES,
-    OPTIONAL_APPROXIMATION_BASELINES,
 )
 from robust_o2o.experiment import _runtime_update_metadata
 from robust_o2o.paths import comparison_directory
@@ -37,7 +35,7 @@ class ResearchBenchmarkConfigTest(unittest.TestCase):
         values.update(overrides)
         return ExperimentConfig(**values)
 
-    def test_main_and_optional_baseline_registry_is_explicit(self):
+    def test_main_baseline_registry_is_explicit(self):
         self.assertEqual(
             MAIN_BASELINES,
             (
@@ -48,19 +46,10 @@ class ResearchBenchmarkConfigTest(unittest.TestCase):
                 "pessimistic_q_ensemble",
             ),
         )
-        self.assertEqual(OPTIONAL_ADAPTED_BASELINES, ())
-        self.assertEqual(OPTIONAL_APPROXIMATION_BASELINES, ())
         for algorithm in MAIN_BASELINES:
             record = BASELINE_REPRODUCTION_REGISTRY[algorithm]
             self.assertEqual(record.benchmark_role, "main")
             self.assertTrue(record.main_table_eligible)
-        for algorithm in (
-            *OPTIONAL_ADAPTED_BASELINES,
-            *OPTIONAL_APPROXIMATION_BASELINES,
-        ):
-            self.assertFalse(
-                BASELINE_REPRODUCTION_REGISTRY[algorithm].main_table_eligible
-            )
 
     def test_custom_budget_seed_and_common_reporting_are_not_overridden(self):
         for algorithm in MAIN_BASELINES:
@@ -503,8 +492,6 @@ class ResearchReadinessTest(unittest.TestCase):
                 "clean",
                 "none",
                 "existing",
-                "rpex_d4rl_v2_legacy",
-                "research_benchmark__research_benchmark__research_benchmark",
             )
             path.mkdir(parents=True)
             args = build_readiness_parser().parse_args(

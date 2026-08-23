@@ -760,8 +760,6 @@ def run_checks(
                 corruption,
                 target,
                 args.experiment_name,
-                args.protocol,
-                "research_benchmark__research_benchmark__research_benchmark",
             )
             if path.exists():
                 collision_paths.append(str(path))

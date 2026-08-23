@@ -73,14 +73,6 @@ MAIN_BASELINES = (
     "cal_ql",
     "pessimistic_q_ensemble",
 )
-# Kept as empty imports so older launcher/reporting code fails closed instead
-# of breaking at import time while it migrates to the five-main-baseline
-# contract.
-OPTIONAL_ADAPTED_BASELINES: tuple[str, ...] = ()
-OPTIONAL_APPROXIMATION_BASELINES: tuple[str, ...] = ()
-OPTIONAL_BASELINES: tuple[str, ...] = ()
-RESEARCH_BASELINES = MAIN_BASELINES
-
 # Read-only normalization for manifests produced before the canonical names
 # were introduced.  Launch configuration must not use this mapping: old names
 # are not registry entries and must never appear in a new run directory.

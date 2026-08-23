@@ -498,25 +498,3 @@ def validate_certificate_receipt(
         path=str(receipt_path),
         receipt_sha256=actual_digest,
     )
-
-
-def validate_required_certificates(
-    specs: Iterable[CertificateSpec],
-    *,
-    root: str | Path,
-    certificate_dir: str | Path | None = None,
-) -> dict[str, CertificateValidation]:
-    materialized = tuple(specs)
-    all_fixture_paths = {
-        path for spec in materialized for path in spec.required_fixture_paths
-    }
-    context = build_certificate_context(root, fixture_paths=all_fixture_paths)
-    directory = (
-        certificate_directory(root) if certificate_dir is None else Path(certificate_dir)
-    )
-    return {
-        spec.certificate_id: validate_certificate_receipt(
-            spec, certificate_dir=directory, context=context
-        )
-        for spec in materialized
-    }

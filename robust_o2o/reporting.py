@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, Mapping
 
 import numpy as np
 
+from .config import LEGACY_PROTOCOL, LEGACY_SCORE_SEMANTICS
 from .fidelity import (
     BASELINE_REPRODUCTION_REGISTRY,
     COMMON_BENCHMARK_REPORTING_RULE,
@@ -159,14 +159,9 @@ RESEARCH_SUMMARY_COLUMNS = (
 )
 
 MAIN_BASELINES = frozenset(CANONICAL_MAIN_BASELINES)
-ADAPTED_BASELINES: frozenset[str] = frozenset()
-APPROXIMATION_BASELINES: frozenset[str] = frozenset()
-
 CALQL_ONLINE_BUDGET_SEMANTICS = (
     "calql_complete_current_episode_at_or_after_requested"
 )
-LEGACY_RESEARCH_PROTOCOL = "rpex_d4rl_v2_legacy"
-D4RL_SCORE_SEMANTICS = "d4rl_normalized_return"
 DIAGNOSTIC_SCORE_SEMANTICS = frozenset(
     {
         # Canonical repository spelling.
@@ -203,7 +198,7 @@ def classify_score_semantics(
         )
     )
     declared = metadata.get("score_semantics")
-    if protocol != LEGACY_RESEARCH_PROTOCOL:
+    if protocol != LEGACY_PROTOCOL:
         if declared in DIAGNOSTIC_SCORE_SEMANTICS:
             return str(declared), False
         # The local protocol itself is sufficient to label the scale as
@@ -212,7 +207,7 @@ def classify_score_semantics(
             return "diagnostic_d4rl_reference_scaled_return", False
         return "unknown_legacy_score", False
 
-    if declared != D4RL_SCORE_SEMANTICS:
+    if declared != LEGACY_SCORE_SEMANTICS:
         return str(declared or "unknown_legacy_score"), False
     declared_eligible = metadata.get("benchmark_eligible")
     explicitly_eligible = isinstance(
@@ -223,7 +218,7 @@ def classify_score_semantics(
         and metadata.get("run_purpose")
         in ("research_benchmark", "final_benchmark")
     )
-    return D4RL_SCORE_SEMANTICS, eligible
+    return LEGACY_SCORE_SEMANTICS, eligible
 
 
 def validate_calql_completion_accounting(
@@ -1259,8 +1254,6 @@ def _research_summary_table(
     research_frame,
     per_seed,
     aggregate,
-    *,
-    expected_seeds: Iterable[int] | None,
 ):
     """Build the canonical seed-explicit five-baseline main table.
 
@@ -1432,7 +1425,7 @@ def _research_summary_table(
                     "research summary received a non-completed run after "
                     f"eligibility filtering: {run_dir} ({raw_status})"
                 )
-            if algorithm == "cal_ql" and raw_status == "completed":
+            if algorithm == "cal_ql":
                 accounting = {
                     field: _single_value(run, field, str(run_dir))
                     for field in CALQL_FAIRNESS_FIELDS
@@ -1457,7 +1450,7 @@ def _research_summary_table(
                 len(score) == 1
                 and "__partial_" in str(score.iloc[0]["aggregation_rule"])
             )
-            if raw_status == "completed" and partial_window:
+            if partial_window:
                 status = "partial"
                 seed_score = float("nan")
             elif not cohort_complete:
@@ -1492,8 +1485,8 @@ def write_reporting_outputs(
 
     frame = _ensure_classification_columns(frame)
     benchmark_score_contract = (
-        (frame["protocol"] == LEGACY_RESEARCH_PROTOCOL)
-        & (frame["score_semantics"] == D4RL_SCORE_SEMANTICS)
+        (frame["protocol"] == LEGACY_PROTOCOL)
+        & (frame["score_semantics"] == LEGACY_SCORE_SEMANTICS)
         & frame["benchmark_eligible"].fillna(False).astype(bool)
     )
     research_rows = (
@@ -1683,7 +1676,6 @@ def write_reporting_outputs(
         research_frame,
         research_seed,
         research_aggregate,
-        expected_seeds=expected_seeds,
     )
     adapted_seed, adapted_summary = aggregate_seed_scores(
         adapted_frame,
@@ -1738,7 +1730,3 @@ def write_reporting_outputs(
     )
     diagnostic_summary.to_csv(outputs["diagnostic_summary"], index=False)
     return outputs
-
-
-def reporting_registry_payload() -> dict[str, dict]:
-    return {name: asdict(rule) for name, rule in REPORTING_RULES.items()}

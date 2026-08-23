@@ -432,7 +432,7 @@ The final offline checkpoint is stored as
 immediately if the checkpoint algorithm, environment, or
 observation/action dimensions do not match the current command. The state
 normalization mode, location, and scale are also restored from the checkpoint.
-New runs write both `config.json` and `resolved_config.json`.
+New runs write the resolved configuration once, in `config.json`.
 
 Interrupted-run continuation is different. Reissue the original semantic
 arguments and point `--resume-run` at its run directory:
@@ -475,7 +475,7 @@ python scripts/diagnose_training.py \
 ```
 
 Each diagnostic run writes `diagnostics_summary.json`,
-`diagnostics_summary.csv`, and `resolved_config.json` in its run directory.
+`diagnostics_summary.csv`, and `config.json` in its run directory.
 
 ### Checkpoint intervals and retention
 
@@ -483,16 +483,15 @@ Checkpoints are separated by algorithm through the run directory and by phase
 inside each run:
 
 ```text
-results/comparisons/<protocol>/<suite+profile>/<env>/<corruption>/<target>/<comparison_id>/runs/
-└── <algorithm>/<suite>/<implementation>/<fidelity>/<budget>/.../
-    └── manifest_<sha>/<run_id>/
-        └── checkpoints/
-    ├── offline/
-    │   ├── step_000100000_manifest_<sha>.pt
-    │   └── final_manifest_<sha>.pt
-    └── online/
-        ├── step_000100000_manifest_<sha>.pt
-        └── final_manifest_<sha>.pt
+results/comparisons/<env>/<corruption>/<target>/<comparison_id>/runs/
+└── <algorithm>/seed_l<learner>_c<corruption>/<run_id>/
+    └── checkpoints/
+        ├── offline/
+        │   ├── step_000100000_manifest_<sha>.pt
+        │   └── final_manifest_<sha>.pt
+        └── online/
+            ├── step_000100000_manifest_<sha>.pt
+            └── final_manifest_<sha>.pt
 ```
 
 The shared periodic interval defaults to `100,000`. Five periodic checkpoints
@@ -552,7 +551,7 @@ python run_all_algorithms.py \
 Each comparison is stored separately:
 
 ```text
-results/comparisons/<protocol>/<profile>/<env>/<corruption>/<target>/<comparison_id>/
+results/comparisons/<env>/<corruption>/<target>/<comparison_id>/
 ├── runs/
 │   └── <algorithm>/...
 ├── comparison_offline_online.png
@@ -569,9 +568,9 @@ results/comparisons/<protocol>/<profile>/<env>/<corruption>/<target>/<comparison
 ```
 
 - The three `comparison_*.png` files show the combined, offline-only, and
-  online-only curves and include completed runs only. Separate
-  `diagnostic_running_{offline_online,offline,online}.png` files are refreshed
-  after every evaluation and may include the currently running algorithm.
+  online-only curves. They are refreshed after every evaluation and may include
+  the currently running algorithm; a successfully completed suite republishes
+  them using completed runs only.
 - The matching CSV files contain mean/std/count at every evaluation step.
 - `final_scores.csv`: backward-compatible common last-three metric; it is not a
   paper metric
@@ -595,42 +594,37 @@ every completed algorithm followed by the overall start, end, and elapsed time.
 Use `--comparison-name NAME` to set the final directory name and `--keep-going`
 to continue with the remaining algorithms if one run fails.
 
-### Research benchmark suite
+### 5×5 suite
 
 `run_55_experiment.py` keeps its historical filename. Its default research
 matrix is 5 algorithms × 5 conditions: the five main baselines, clean, and the
-four individual random-corruption targets. Hopper remains the default. Run the
-readiness check first, then launch explicit seeds and budgets:
+four individual random-corruption targets. HalfCheetah is the default and both
+offline and online budgets default to 500,000 steps.
+
+On macOS, the Gymnasium-v4 backend is diagnostic-only, so declare that purpose
+explicitly:
 
 ```bash
 conda activate corruption
-python scripts/check_research_readiness.py \
-  --env-name hopper-medium-replay-v2 \
-  --corruption-suite random \
-  --protocol local_gymnasium_v4_diagnostic \
-  --allow-diagnostic-protocol
-
 python run_55_experiment.py \
-  --run-purpose research_benchmark \
-  --env-name hopper-medium-replay-v2 \
-  --algorithms rpex,riql_naive,wsrl,cal_ql,pessimistic_q_ensemble \
+  --env-name halfcheetah-medium-replay-v2 \
   --corruption-suite random \
-  --seeds 0,1,2,3,4 \
-  --offline-steps 500000 \
-  --online-steps 500000 \
+  --seeds 0 \
+  --run-purpose diagnostic \
+  --suite-profile common_budget_diagnostic \
   --protocol local_gymnasium_v4_diagnostic \
   --allow-diagnostic-protocol
 ```
 
-Before training, the checker reports `CONFIG-READY / RUNTIME EVIDENCE PENDING`:
-this is expected because no completed online trajectories or member checkpoint
-files exist yet. After a smoke or full run, point it at the comparison or run
-directories to validate Cal-QL online MC-return evidence and PQE's five unique
-member checkpoints:
+For a research-labelled run, use the pinned Linux D4RL-v2 environment and the
+default legacy protocol. Run the readiness checker before training. It reports
+`CONFIG-READY / RUNTIME EVIDENCE PENDING` until completed Cal-QL trajectories
+and PQE member checkpoints exist. Afterward, point it at the comparison or run
+directories to validate that evidence:
 
 ```bash
 python scripts/check_research_readiness.py \
-  --env-name hopper-medium-replay-v2 \
+  --env-name halfcheetah-medium-replay-v2 \
   --corruption-suite random \
   --run-dir /absolute/path/to/comparison_directory
 ```
@@ -773,23 +767,23 @@ structure:
 
 ```text
 results/
-└── comparisons/<protocol>/<profile>/<env>/<corruption>/<target>/<comparison_id>/
+└── comparisons/<env>/<corruption>/<target>/<comparison_id>/
     ├── comparison_offline_online.png
     ├── comparison_offline.png
     ├── comparison_online.png
-    └── runs/<algorithm>/<suite>/<implementation>/<fidelity>/<budget>/.../
-        └── manifest_<sha>/<timestamp>_<id>/
-    ├── config.json
-    ├── result.log
-    ├── metrics.csv
-    ├── train_metrics.jsonl
-    ├── performance.png
-    ├── summary.json
-    └── checkpoints/
-        ├── offline/
-        │   └── final_manifest_<sha>.pt
-        └── online/
-            └── final_manifest_<sha>.pt
+    └── runs/<algorithm>/seed_l<learner>_c<corruption>/<run_id>/
+        ├── config.json
+        ├── experiment_manifest.json
+        ├── result.log
+        ├── metrics.csv
+        ├── train_metrics.jsonl
+        ├── performance.png
+        ├── summary.json
+        └── checkpoints/
+            ├── offline/
+            │   └── final_manifest_<sha>.pt
+            └── online/
+                └── final_manifest_<sha>.pt
 ```
 
 - `metrics.csv`: evaluation step, raw return, D4RL normalized return, standard
@@ -864,7 +858,7 @@ ELAPSED: 04:05:05 (14705.000 seconds)
   implementation differences. Use the same device for all results in a
   comparison table.
 - Never aggregate different environment protocols, implementation profiles, or
-  suite profiles. Every run has a canonical manifest SHA in its path and
+  suite profiles. Every run has a hashed canonical manifest and manifest-tagged
   checkpoints; plotting rejects non-seed manifest differences and duplicates.
 - A single-seed curve has no seed-uncertainty band. Episode-return dispersion is
   not substituted for across-seed uncertainty.

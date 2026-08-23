@@ -143,10 +143,11 @@ python run_all_algorithms.py \
 
 ## Saved provenance
 
-Strict and local results use separate canonical namespaces under
-`results/comparisons/<environment_protocol>/<algorithm_profile>/`. The local
-canonical name is `local_gymnasium_v4_diagnostic`, and selecting it also
-requires `--allow-diagnostic-protocol`.
+Strict and local results use the shared compact layout
+`results/comparisons/<env>/<corruption>/<target>/<comparison_id>/`. Protocol and
+algorithm-profile provenance is stored in each manifest instead of directory
+names. The local protocol name is `local_gymnasium_v4_diagnostic`, and selecting
+it also requires `--allow-diagnostic-protocol`.
 Every run's `config.json` records the protocol, complete requested ID,
 `env.spec.id`, unwrapped class/module, package versions, required and installed
 D4RL commits, dataset URL/path/SHA-256 when available, dimensions, dataset size,

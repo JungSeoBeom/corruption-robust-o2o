@@ -13,13 +13,12 @@ from robust_o2o.config import (
 from robust_o2o.fidelity import MAIN_BASELINES
 from run_55_experiment import (
     ADVERSARIAL_SETTINGS,
-    ALGORITHMS,
     CLEAN_SETTINGS,
     DIAGNOSTIC_RANDOM_SETTINGS,
     ENV_NAME,
-    SETTINGS,
     STRICT_ADVERSARIAL_SETTINGS,
     STRICT_RANDOM_SETTINGS,
+    _default_experiment_name,
     _validate_args,
     build_parser,
     commands,
@@ -32,15 +31,21 @@ from run_matrix import (
 
 
 class Run55ExperimentTest(unittest.TestCase):
+    def test_default_experiment_name_uses_compact_5x5_label(self):
+        name = _default_experiment_name("halfcheetah-medium-replay-v2")
+        self.assertRegex(
+            name,
+            r"^halfcheetah_5x5_\d{8}_\d{6}_[0-9a-f]{8}$",
+        )
+
     def test_default_matrix_and_step_schedule(self):
         parser = build_parser()
         args = parser.parse_args([])
         _validate_args(parser, args, ())
         generated = list(commands(args, (), "test_suite"))
 
-        self.assertEqual(ALGORITHMS, MAIN_BASELINES)
         self.assertEqual(
-            ALGORITHMS,
+            MAIN_BASELINES,
             (
                 "rpex",
                 "riql_naive",
@@ -50,7 +55,7 @@ class Run55ExperimentTest(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            SETTINGS,
+            DIAGNOSTIC_RANDOM_SETTINGS,
             (
                 ("clean", "none"),
                 ("random", "observations"),
@@ -70,12 +75,15 @@ class Run55ExperimentTest(unittest.TestCase):
         self.assertEqual(args.eval_episodes, 10)
         self.assertEqual(args.final_window_size, 3)
 
-        for command, (corruption, target) in zip(generated, SETTINGS):
+        for command, (corruption, target) in zip(
+            generated, DIAGNOSTIC_RANDOM_SETTINGS
+        ):
             self.assertEqual(command[command.index("--env-name") + 1], ENV_NAME)
             self.assertEqual(command[command.index("--corruption") + 1], corruption)
             self.assertEqual(command[command.index("--corruption-target") + 1], target)
             self.assertEqual(
-                command[command.index("--algorithms") + 1], ",".join(ALGORITHMS)
+                command[command.index("--algorithms") + 1],
+                ",".join(MAIN_BASELINES),
             )
             self.assertEqual(command[command.index("--stage") + 1], "both")
             self.assertEqual(command[command.index("--offline-steps") + 1], "500000")
@@ -296,9 +304,11 @@ class Run55ExperimentTest(unittest.TestCase):
 
     def test_hidden_optional_flag_is_rejected(self):
         parser = build_parser()
-        args = parser.parse_args(["--optional-baselines", "cal_ql"])
+        args, passthrough = parser.parse_known_args(
+            ["--optional-baselines", "cal_ql"]
+        )
         with self.assertRaises(SystemExit):
-            _validate_args(parser, args, ())
+            _validate_args(parser, args, passthrough)
 
     def test_matrix_defaults_to_main_five_and_normalizes_aliases(self):
         parser = build_matrix_parser()

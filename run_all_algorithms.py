@@ -7,7 +7,6 @@ import argparse
 import csv
 import json
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -44,10 +43,16 @@ from robust_o2o.fidelity import (
     STRICT_FINAL_SEEDS,
     SUITE_PROFILES,
     STRICT_FINAL_TASKS,
-    strict_final_algorithms,
 )
 from robust_o2o.environment import preflight_runtime
 from robust_o2o.logging_utils import format_duration, format_timestamp
+from robust_o2o.launcher_utils import (
+    CHILD_IDENTITY_OPTIONS,
+    canonical_algorithms,
+    flatten_cli_values,
+    passthrough_conflicts,
+    valid_comparison_name,
+)
 from robust_o2o.paths import comparison_directory
 
 
@@ -74,42 +79,6 @@ TIMING_FIELDS = (
     "elapsed_seconds",
     "returncode",
 )
-
-RESERVED_PASSTHROUGH_OPTIONS = {
-    "--algorithm",
-    "--benchmark-seed-set",
-    "--comparison-name",
-    "--corruption",
-    "--corruption-target",
-    "--env-name",
-    "--implementation-profile",
-    "--algorithm-profile",
-    "--online-corruption-scale-profile",
-    "--output-dir",
-    "--protocol",
-    "--run-purpose",
-    "--seed",
-    "--stage",
-    "--suite-profile",
-}
-
-def _flatten_cli_values(values: Iterable[str]) -> list[str]:
-    """Accept comma-separated, space-separated, or mixed CLI lists."""
-
-    return [
-        item.strip()
-        for value in values
-        for item in value.split(",")
-        if item.strip()
-    ]
-
-
-def _canonical_algorithms(values: Iterable[str]) -> list[str]:
-    return [
-        ALGORITHM_ALIASES.get(value.strip().lower(), value.strip().lower())
-        for value in _flatten_cli_values(values)
-    ]
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -171,8 +140,8 @@ def _validate_args(
     if args.algorithms is None:
         args.algorithms = list(MAIN_BASELINES)
     else:
-        args.algorithms = _canonical_algorithms(args.algorithms)
-    args.seeds = _flatten_cli_values(args.seeds)
+        args.algorithms = canonical_algorithms(args.algorithms, ALGORITHM_ALIASES)
+    args.seeds = flatten_cli_values(args.seeds)
     if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
         args.protocol = LOCAL_PROTOCOL
     original_env_name = args.env_name
@@ -225,18 +194,14 @@ def _validate_args(
             int(seed)
         except ValueError:
             parser.error(f"invalid seed: {seed!r}")
-    conflicts = sorted(
-        option
-        for option in passthrough
-        if option.split("=", 1)[0] in RESERVED_PASSTHROUGH_OPTIONS
-    )
+    conflicts = passthrough_conflicts(passthrough, CHILD_IDENTITY_OPTIONS)
     if conflicts:
         parser.error(
             "these child identity/provenance options cannot be overridden: "
             + ", ".join(conflicts)
         )
     if (
-        args.run_purpose == "final_benchmark"
+        args.run_purpose in ("paper_reproduction", "final_benchmark")
         or args.suite_profile == "primary_research_benchmark"
     ):
         from robust_o2o.final_gate import (
@@ -270,11 +235,6 @@ def _validate_args(
                 "(it is inferred from --seeds when omitted)"
             )
         args.benchmark_seed_set = list(STRICT_FINAL_SEEDS)
-        if args.suite_profile != "primary_research_benchmark":
-            parser.error(
-                "final_benchmark requires "
-                "--suite-profile primary_research_benchmark"
-            )
         if args.protocol != DEFAULT_PROTOCOL:
             parser.error(
                 "final_benchmark requires rpex_d4rl_v2_legacy; no local fallback"
@@ -285,14 +245,6 @@ def _validate_args(
             parser.error(
                 "final_benchmark permits only hopper/halfcheetah/walker2d "
                 "medium-replay-v2 tasks"
-            )
-        forbidden = sorted(
-            set(args.algorithms) - set(strict_final_algorithms())
-        )
-        if forbidden:
-            parser.error(
-                "final_benchmark rejects non-exact/non-allowlisted baselines: "
-                + ", ".join(forbidden)
             )
         if args.implementation_profile not in (None, "official_code_reference"):
             parser.error(
@@ -329,16 +281,6 @@ def _validate_args(
                 "hopper-medium-replay-v2: the registered optimizer-core "
                 "fixture is bound to the Hopper EDAC checkpoint"
             )
-    if args.suite_profile == "primary_research_benchmark":
-        forbidden = sorted(
-            set(args.algorithms) - set(strict_final_algorithms())
-        )
-        if forbidden:
-            parser.error(
-                "primary_research_benchmark excludes non-allowlisted ports: "
-                + ", ".join(forbidden)
-                + "; use common_budget_diagnostic for these algorithms"
-            )
     if args.online_corruption_scale_profile is None:
         args.online_corruption_scale_profile = (
             "rpex_official_code"
@@ -358,10 +300,7 @@ def _validate_args(
     if abs(sum(args.mixed_ratios) - 1.0) > 1e-6:
         parser.error("--mixed-ratios must sum to 1.0")
     if args.comparison_name:
-        if (
-            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.comparison_name)
-            or args.comparison_name in (".", "..")
-        ):
+        if not valid_comparison_name(args.comparison_name):
             parser.error(
                 "--comparison-name may contain only letters, digits, '.', '_', "
                 "and '-', and must start with a letter or digit"
@@ -372,7 +311,7 @@ def _validate_args(
         and not is_inflight_pre_gate_run55_descendant()
     ):
         parser.error(RESEARCH_BENCHMARK_PROTOCOL_ERROR)
-    if args.protocol in (LOCAL_PROTOCOL, "local_gymnasium_v4") and not args.allow_diagnostic_protocol:
+    if args.protocol == LOCAL_PROTOCOL and not args.allow_diagnostic_protocol:
         parser.error(
             "the local Gymnasium protocol is diagnostic-only; pass "
             "--allow-diagnostic-protocol to acknowledge this"
@@ -390,11 +329,6 @@ def _comparison_directory(args: argparse.Namespace) -> Path:
         args.corruption,
         args.corruption_target,
         name,
-        args.protocol,
-        (
-            f"{args.run_purpose}__{args.suite_profile}__"
-            f"{args.implementation_profile or 'auto'}"
-        ),
     )
 
 
@@ -511,8 +445,8 @@ def _print_algorithm_summary(summary: dict, prefix: str) -> None:
     )
 
 
-def _remove_invalid_canonical_artifacts(comparison_dir: Path) -> None:
-    """Remove canonical-looking outputs after any incomplete aggregation."""
+def _remove_invalid_summary_artifacts(comparison_dir: Path) -> None:
+    """Remove final summaries while preserving useful in-progress curves."""
 
     names = {
         "final_scores.csv",
@@ -528,9 +462,6 @@ def _remove_invalid_canonical_artifacts(comparison_dir: Path) -> None:
         "diagnostic_per_seed_final_scores.csv",
         "diagnostic_summary.csv",
     }
-    for phase in ("offline_online", "offline", "online"):
-        names.add(f"comparison_{phase}.png")
-        names.add(f"comparison_{phase}.csv")
     for name in names:
         (comparison_dir / name).unlink(missing_ok=True)
 
@@ -673,7 +604,7 @@ def main() -> int:
         aggregation_error = (
             f"suite is incomplete: completed controller records="
             f"{len(run_records)}/{len(generated_commands)}, failed={failures}; "
-            "canonical result artifacts were not published"
+            "final summary artifacts were not published"
         )
     else:
         try:
@@ -724,7 +655,7 @@ def main() -> int:
             aggregation_error = f"{type(exc).__name__}: {exc}"
     if aggregation_error:
         print(f"Aggregation skipped: {aggregation_error}", file=sys.stderr)
-        _remove_invalid_canonical_artifacts(comparison_dir)
+        _remove_invalid_summary_artifacts(comparison_dir)
 
     end_wall = datetime.now().astimezone()
     elapsed = time.perf_counter() - start_monotonic

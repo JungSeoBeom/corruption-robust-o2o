@@ -67,7 +67,6 @@ RESEARCH_BENCHMARK_PROTOCOL_ERROR = (
     "for smoke testing, or execute the research benchmark in the pinned "
     "Linux D4RL-v2 environment."
 )
-ALGORITHM_PROFILES = IMPLEMENTATION_PROFILES
 CALIBRATION_MASK_MODES = ("all", "oracle_exclude_corrupted", "disabled")
 
 ACTION_DIMS = {
@@ -1885,7 +1884,6 @@ class ExperimentConfig:
             and record.main_table_eligible
             and self.calibration_mask_mode != "oracle_exclude_corrupted"
         )
-        result["research_benchmark_eligible"] = result["main_table_eligible"]
         result["task_scope"] = (
             record.task_scope if record is not None else self.task_profile
         )
@@ -1896,11 +1894,6 @@ class ExperimentConfig:
             "replay_transition_poisoning"
         )
         result["clean_evaluation"] = True
-        result["normalized_score_rule"] = (
-            LEGACY_SCORE_SEMANTICS
-            if self.protocol == LEGACY_PROTOCOL
-            else LOCAL_SCORE_SEMANTICS
-        )
         result["parity_status"] = (
             record.parity_status if record is not None else "unverified"
         )

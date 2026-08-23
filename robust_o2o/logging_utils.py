@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import json
 import logging
-import shutil
 import time
 import uuid
 from datetime import datetime
@@ -139,33 +138,10 @@ class RunLogger:
             config.corruption,
             config.corruption_target,
             comparison_id,
-            config.protocol,
-            config.algorithm_profile,
         )
         self.run_dir = (
             runs_dir
-            / config.run_purpose
             / config.algorithm
-            / config.suite_profile
-            / config.implementation_profile
-            / config.implementation_fidelity
-            / (
-                f"budget_{config.suite_profile}_off{config.offline_steps}"
-                f"_on{config.online_steps}_utd"
-                f"{config.wsrl_utd_ratio if config.algorithm == 'wsrl' else config.updates_per_step}"
-            )
-            / config.resolved_algorithm_profile
-            / config.online_replay_profile
-            / config.evaluation_policy_profile
-            / config.attack_timing
-            / config.random_attack_semantics
-            / config.adversarial_attack_profile
-            / config.mixed_corruption_profile
-            / config.action_execution_profile
-            / config.task_profile
-            / config.corruption
-            / config.corruption_target
-            / config.env_name
             / f"seed_l{config.learner_seed}_c{config.corruption_seed}"
             / run_id
         )
@@ -258,7 +234,7 @@ class RunLogger:
             event = {
                 "timestamp": resume_timestamp.isoformat(),
                 "resume_source": str(self.config.resume_run),
-                "resolved_config_sha256": requested_manifest["manifest_sha256"],
+                "requested_manifest_sha256": requested_manifest["manifest_sha256"],
                 "resume_identity_sha256": requested_identity,
                 "launch_manifest_sha256": manifest["manifest_sha256"],
                 "resume_final_audit_receipt_sha256": requested_manifest.get(
@@ -298,39 +274,20 @@ class RunLogger:
         if not self._manifest_written:
             manifest = build_experiment_manifest(config)
             manifest_hash = manifest["manifest_sha256"]
-            old_dir = self.run_dir
-            desired_dir = (
-                old_dir.parent
-                / f"manifest_{manifest_hash[:16]}"
-                / self.run_id
-            )
-            for handler in self.logger.handlers:
-                handler.close()
-            self.logger.handlers = []
-            desired_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(old_dir), str(desired_dir))
-            self.run_dir = desired_dir
-            self.metrics_path = self.run_dir / "metrics.csv"
-            self.train_metrics_path = self.run_dir / "train_metrics.jsonl"
-            self._configure_handlers()
-            config = {
-                **config,
-                "run_dir": str(self.run_dir),
-                "manifest_sha256": manifest_hash,
-            }
             setattr(self.config, "_manifest_sha256", manifest_hash)
             with (self.run_dir / "experiment_manifest.json").open(
                 "w", encoding="utf-8"
             ) as stream:
                 json.dump(manifest, stream, indent=2, ensure_ascii=False)
             self._manifest_written = True
-        for filename in ("config.json", "resolved_config.json"):
-            with (self.run_dir / filename).open("w", encoding="utf-8") as stream:
-                json.dump(config, stream, indent=2, ensure_ascii=False, default=str)
+        config = {
+            **config,
+            "run_dir": str(self.run_dir),
+            "manifest_sha256": getattr(self.config, "_manifest_sha256"),
+        }
+        with (self.run_dir / "config.json").open("w", encoding="utf-8") as stream:
+            json.dump(config, stream, indent=2, ensure_ascii=False, default=str)
         self._log_score_protocol_banner_once()
-
-    def _benchmark_eligible(self) -> bool:
-        return self._score_benchmark_eligible
 
     def _log_score_protocol_banner_once(self) -> None:
         if self._score_protocol_banner_logged:
@@ -346,6 +303,20 @@ class RunLogger:
                 self.config.protocol,
                 LOCAL_SCORE_SEMANTICS,
             )
+
+    def _refresh_comparison_plots(self) -> None:
+        try:
+            from plot_results import update_comparison_plots
+
+            update_comparison_plots(
+                self.comparison_dir,
+                self.config.env_name,
+                self.config.corruption,
+                self.config.corruption_target,
+                include_running=True,
+            )
+        except Exception as exc:
+            self.logger.warning("comparison plot refresh skipped: %s", exc)
 
     def write_completion_manifest(self, outcomes: Dict[str, Any]) -> Path:
         """Write immutable launch provenance plus measured run outcomes.
@@ -456,19 +427,9 @@ class RunLogger:
             score_label,
             score_mean,
             score_std,
-            str(self._benchmark_eligible()).lower(),
+            str(self._score_benchmark_eligible).lower(),
         )
-        try:
-            from plot_results import update_live_comparison_plots
-
-            update_live_comparison_plots(
-                self.comparison_dir,
-                self.config.env_name,
-                self.config.corruption,
-                self.config.corruption_target,
-            )
-        except Exception as exc:
-            self.logger.warning("comparison plot refresh skipped: %s", exc)
+        self._refresh_comparison_plots()
 
     def finish(
         self, status: str, error: Optional[str] = None
@@ -493,17 +454,7 @@ class RunLogger:
         with (self.run_dir / "summary.json").open("w", encoding="utf-8") as stream:
             json.dump(summary, stream, indent=2, ensure_ascii=False)
         if status == "completed":
-            try:
-                from plot_results import update_live_comparison_plots
-
-                update_live_comparison_plots(
-                    self.comparison_dir,
-                    self.config.env_name,
-                    self.config.corruption,
-                    self.config.corruption_target,
-                )
-            except Exception as exc:
-                self.logger.warning("final comparison plot refresh skipped: %s", exc)
+            self._refresh_comparison_plots()
         self.logger.info("status=%s run_dir=%s", status, self.run_dir)
         # Keep these as the final three normal output lines, per the benchmark
         # requirement. The CLI prints tracebacks before calling finish().

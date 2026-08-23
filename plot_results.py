@@ -16,6 +16,26 @@ from robust_o2o.fidelity import (
 from robust_o2o.manifest import aggregation_signature
 
 
+_PLOT_ALGORITHM_LABELS = {
+    "rpex": "RPEX",
+    "riql_pex": "RIQL+PEX",
+    "riql_naive": "RIQL-naive",
+    "uwmsg": "UWMSG",
+    "pex": "PEX",
+    "cal_ql": "Cal-QL",
+    "wsrl": "WSRL",
+    "ro2o": "RO2O",
+    "pessimistic_q_ensemble": "Pessimistic Q-Ensemble",
+}
+
+
+def _plot_algorithm_label(algorithm: object) -> str:
+    """Return a concise legend name; provenance remains in CSV/manifests."""
+
+    name = str(algorithm)
+    return _PLOT_ALGORITHM_LABELS.get(name, name)
+
+
 def _imports():
     try:
         import matplotlib
@@ -57,14 +77,14 @@ def _concat_nonempty_frames(frames):
 def _score_plot_labels(metadata):
     """Return labels from declared protocol metadata, never numeric values."""
 
+    from robust_o2o.config import LEGACY_SCORE_SEMANTICS
     from robust_o2o.reporting import (
-        D4RL_SCORE_SEMANTICS,
         DIAGNOSTIC_SCORE_SEMANTICS,
         classify_score_semantics,
     )
 
     semantics, _ = classify_score_semantics(metadata)
-    if semantics == D4RL_SCORE_SEMANTICS:
+    if semantics == LEGACY_SCORE_SEMANTICS:
         return "D4RL normalized return", None
     if semantics in DIAGNOSTIC_SCORE_SEMANTICS:
         return (
@@ -326,7 +346,6 @@ def _load_runs(root: Path):
                 "implementation_profile": "legacy_current",
                 "implementation_fidelity": "legacy_unknown",
                 "suite_profile": "legacy_current",
-                "legacy_source_profile": config.get("algorithm_profile"),
             }
         current_manifest = int(manifest.get("manifest_schema_version", 0)) >= 2
         if current_manifest:
@@ -476,7 +495,6 @@ def _load_runs(root: Path):
         frame["algorithm_profile"] = manifest.get(
             "implementation_profile", "legacy_current"
         )
-        frame["implementation_profile"] = frame["algorithm_profile"]
         frame["implementation_fidelity"] = manifest.get(
             "implementation_fidelity", "legacy_unknown"
         )
@@ -487,17 +505,11 @@ def _load_runs(root: Path):
         frame["benchmark_role"] = manifest.get(
             "benchmark_role", "diagnostic"
         )
-        frame["main_table_eligible"] = bool(
-            manifest.get("main_table_eligible", False)
-        )
         frame["uses_corruption_labels"] = bool(
             manifest.get("uses_corruption_labels", False)
         )
         frame["upstream_commit"] = manifest.get(
             "upstream_commit", "unknown"
-        )
-        frame["reporting_rule"] = manifest.get(
-            "reporting_rule", "unknown"
         )
         frame["learner_parity_verified"] = bool(
             manifest.get("learner_parity_verified", False)
@@ -522,9 +534,6 @@ def _load_runs(root: Path):
         frame["attack_timing"] = manifest.get("attack_timing", "legacy_unknown")
         frame["corruption_application_contract"] = manifest.get(
             "corruption_application_contract", "legacy_unknown"
-        )
-        frame["environment_interaction_corrupted"] = bool(
-            manifest.get("environment_interaction_corrupted", False)
         )
         frame["evaluation_corruption"] = manifest.get(
             "evaluation_corruption", "legacy_unknown"
@@ -819,7 +828,6 @@ def write_final_score_summary(
     phase: str = "online",
 ) -> Path:
     """Write the declared common last-three metric (never a paper metric)."""
-    _, pd = _imports()
     from robust_o2o.reporting import (
         aggregate_seed_scores,
         common_reporting_rule,
@@ -1051,47 +1059,7 @@ def plot_aggregate(
         for key, value in zip(group_keys, group):
             summary[key] = value
         summary_frames.append(summary)
-        display_name = str(group_frame["display_name"].iloc[0])
-        label = f"{display_name} [{group[4]}]"
-        if group_frame["suite_profile"].iloc[0] in (
-            "common_budget_robustness",
-            "common_budget_diagnostic",
-        ):
-            label += " | COMMON-BUDGET / NOT PAPER REPRO"
-        if (
-            group_frame["adversarial_attack_profile"].iloc[0]
-            == "experimental_sign_pgd"
-        ):
-            label += " | EXPERIMENTAL SIGN-PGD"
-        if group_frame["attack_timing"].iloc[0] != "legacy_unknown":
-            timing_label = {
-                "official_code_post_transition_replay_poisoning": "post-replay",
-                "paper_pre_action_sensor_actuator": "pre-action",
-            }.get(
-                group_frame["attack_timing"].iloc[0],
-                group_frame["attack_timing"].iloc[0],
-            )
-            label += f" | {timing_label}"
-        if group_frame["online_corruption_scale_profile"].iloc[0] != "legacy_unknown":
-            scale_label = {
-                "rpex_official_code": "unit-scale",
-                "dataset_std_scaled_extension": "dataset-std",
-            }.get(
-                group_frame["online_corruption_scale_profile"].iloc[0],
-                group_frame["online_corruption_scale_profile"].iloc[0],
-            )
-            label += f" | {scale_label}"
-        if (
-            group[0] == "wsrl"
-            and group_frame["wsrl_entropy_profile"].iloc[0] == "legacy_zero"
-        ):
-            label += " | LEGACY ENTROPY 0"
-        if "oracle" in str(group[4]):
-            label += " ORACLE"
-        if phase in ("offline", "offline_online") and group[0] == "wsrl":
-            label = f"CQL-REDQ pretrainer for WSRL [{group[4]}]"
-        if len(frame["env_name"].unique()) > 1:
-            label += f" | {group[7]}"
+        label = _plot_algorithm_label(group[0])
         axis.plot(summary[x_column], summary["mean"], label=label)
         axis.fill_between(
             summary[x_column],
@@ -1151,37 +1119,15 @@ def plot_aggregate(
     return output
 
 
-def update_live_comparison_plots(
-    comparison_dir: Path,
-    env_name: Optional[str] = None,
-    corruption: Optional[str] = None,
-    target: Optional[str] = None,
-) -> dict[str, Path]:
-    """Refresh only explicitly non-canonical running/partial plots."""
-
-    runs_dir = comparison_dir / "runs"
-    outputs = {}
-    for phase in ("offline_online", "offline", "online"):
-        output = comparison_dir / f"diagnostic_running_{phase}.png"
-        outputs[phase] = plot_aggregate(
-            runs_dir,
-            output,
-            env_name,
-            corruption,
-            target,
-            phase,
-            include_running=True,
-        )
-    return outputs
-
-
 def update_comparison_plots(
     comparison_dir: Path,
     env_name: Optional[str] = None,
     corruption: Optional[str] = None,
     target: Optional[str] = None,
+    *,
+    include_running: bool = False,
 ) -> dict[str, Path]:
-    """Publish completed canonical plots after suite-level validation."""
+    """Refresh the three standard comparison plots."""
     runs_dir = comparison_dir / "runs"
     outputs = {}
     for phase in ("offline_online", "offline", "online"):
@@ -1193,11 +1139,8 @@ def update_comparison_plots(
             corruption,
             target,
             phase,
-            include_running=False,
+            include_running=include_running,
         )
-    update_live_comparison_plots(
-        comparison_dir, env_name, corruption, target
-    )
     return outputs
 
 

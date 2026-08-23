@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from typing import Any, Mapping
 
 from .config import LEGACY_PROTOCOL, LEGACY_SCORE_SEMANTICS
@@ -632,9 +631,3 @@ SEED_FIELDS = {
 def aggregation_signature(manifest: Mapping[str, Any]) -> str:
     comparable = {key: value for key, value in manifest.items() if key not in SEED_FIELDS}
     return canonical_json_sha256(comparable)
-
-
-def canonical_manifest_json(manifest: Mapping[str, Any]) -> str:
-    return json.dumps(
-        manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    )

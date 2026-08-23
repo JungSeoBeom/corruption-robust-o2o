@@ -15,6 +15,7 @@ from robust_o2o.config import LOCAL_PROTOCOL
 from robust_o2o.fidelity import MAIN_BASELINES
 from robust_o2o.logging_utils import format_duration, format_timestamp
 from run_all_algorithms import (
+    _comparison_directory,
     _validate_args as validate_run_all_args,
     build_parser as build_run_all_parser,
     main,
@@ -24,13 +25,43 @@ from run_all_algorithms import (
 
 
 class TimingTest(unittest.TestCase):
+    def test_run_all_uses_compact_comparison_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = build_run_all_parser().parse_args(
+                [
+                    "--env-name",
+                    "halfcheetah-medium-replay-v2",
+                    "--corruption",
+                    "random",
+                    "--corruption-target",
+                    "observations",
+                    "--protocol",
+                    LOCAL_PROTOCOL,
+                    "--run-purpose",
+                    "diagnostic",
+                    "--suite-profile",
+                    "common_budget_diagnostic",
+                    "--output-root",
+                    directory,
+                    "--comparison-name",
+                    "halfcheetah_5x5_test",
+                ]
+            )
+            self.assertEqual(
+                _comparison_directory(args),
+                Path(directory).resolve()
+                / "comparisons"
+                / "halfcheetah-medium-replay-v2"
+                / "random"
+                / "observations"
+                / "halfcheetah_5x5_test",
+            )
+
     def test_run_all_rejects_fresh_research_local_protocol(self):
         with tempfile.TemporaryDirectory() as directory:
             existing_runs = (
                 Path(directory)
                 / "comparisons"
-                / LOCAL_PROTOCOL
-                / "old_profile"
                 / "hopper-medium-replay-v2"
                 / "clean"
                 / "none"
@@ -416,7 +447,7 @@ class TimingTest(unittest.TestCase):
                 "gym-0.23.1+d4rl-v2+mujoco_py",
             )
 
-    def test_failed_diagnostic_suite_does_not_publish_canonical_artifacts(self):
+    def test_failed_suite_removes_summaries_but_keeps_progress_plots(self):
         with tempfile.TemporaryDirectory() as directory:
             arguments = [
                 "run_all_algorithms.py",
@@ -440,11 +471,13 @@ class TimingTest(unittest.TestCase):
                 "dataset_backend": "d4rl.qlearning_dataset(terminate_on_end=False)",
                 "dataset_path": str(Path(directory) / "dataset.hdf5"),
             }
-            canonical_names = (
+            summary_names = (
                 "final_scores.csv",
                 "research_summary.csv",
                 "adapted_baselines_summary.csv",
                 "diagnostic_summary.csv",
+            )
+            progress_names = (
                 "comparison_online.png",
                 "comparison_online.csv",
             )
@@ -453,7 +486,7 @@ class TimingTest(unittest.TestCase):
                 self.assertFalse(check)
                 runs_dir = Path(command[command.index("--output-dir") + 1])
                 comparison_dir = runs_dir.parent
-                for name in canonical_names:
+                for name in (*summary_names, *progress_names):
                     (comparison_dir / name).write_text(
                         "partial", encoding="utf-8"
                     )
@@ -484,11 +517,13 @@ class TimingTest(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertFalse(manifest["benchmark_valid"])
             self.assertIn("suite is incomplete", manifest["aggregation_error"])
-            self.assertEqual(
-                list(manifest_path.parent.glob("comparison_*")), []
-            )
-            for name in canonical_names:
+            for name in summary_names:
                 self.assertFalse((manifest_path.parent / name).exists())
+            for name in progress_names:
+                self.assertEqual(
+                    (manifest_path.parent / name).read_text(encoding="utf-8"),
+                    "partial",
+                )
 
 
 if __name__ == "__main__":
