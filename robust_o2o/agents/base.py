@@ -11,7 +11,7 @@ from ..replay import TensorBatch
 def soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
     with torch.no_grad():
         for target_parameter, parameter in zip(target.parameters(), source.parameters()):
-            target_parameter.data.mul_(1.0 - tau).add_(parameter.data, alpha=tau)
+            target_parameter.mul_(1.0 - tau).add_(parameter, alpha=tau)
 
 
 def gradient_norm(parameters) -> torch.Tensor:
@@ -42,7 +42,7 @@ class BaseAgent(nn.Module):
         self,
         state: torch.Tensor,
         evaluate: bool = False,
-        evaluation_mode: str = "deterministic_diagnostic",
+        evaluation_mode: str = "deterministic",
     ) -> torch.Tensor:
         raise NotImplementedError
 

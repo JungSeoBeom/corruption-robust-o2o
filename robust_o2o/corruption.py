@@ -65,10 +65,7 @@ def validate_adversarial_target(config: ExperimentConfig) -> None:
 def _load_checkpoint_payload(
     checkpoint: Path, device: torch.device
 ) -> Mapping[str, Any]:
-    try:
-        payload = torch.load(checkpoint, map_location=device, weights_only=True)
-    except TypeError:  # pragma: no cover - compatibility with older PyTorch
-        payload = torch.load(checkpoint, map_location=device)
+    payload = torch.load(checkpoint, map_location=device, weights_only=True)
     if not isinstance(payload, Mapping):
         raise ValueError("adversarial oracle checkpoint must contain a mapping")
     return payload
@@ -404,7 +401,7 @@ def resolve_attack_checkpoint(config: ExperimentConfig) -> Path:
             "Attacker checkpoint SHA256 mismatch: "
             f"expected={expected_sha256.lower()} actual={actual_sha256.lower()}"
         )
-    if config.run_purpose == "research_benchmark":
+    if config.is_research_suite:
         pinned_environment_hash = default_attack_checkpoint_sha256(config.env_name)
         if (
             pinned_environment_hash is None
@@ -483,7 +480,7 @@ def make_numpy_corruption_rng(
 
     if (
         config.implementation_profile == "official_code_reference"
-        and config.run_purpose != "research_benchmark"
+        and not config.is_research_suite
     ):
         return np.random.RandomState(int(config.corruption_seed))
     return np.random.default_rng(int(config.corruption_seed))
@@ -494,7 +491,7 @@ def corruption_rng_implementation(config: ExperimentConfig) -> str:
         "numpy.random.RandomState"
         if (
             config.implementation_profile == "official_code_reference"
-            and config.run_purpose != "research_benchmark"
+            and not config.is_research_suite
         )
         else "numpy.random.Generator(PCG64)"
     )
@@ -1277,7 +1274,7 @@ def corrupt_online_transition(
             # exact-RNG requirement and does not perform this ghost draw.
             legacy_official_rng = (
                 config.implementation_profile == "official_code_reference"
-                and config.run_purpose != "research_benchmark"
+                and not config.is_research_suite
                 and config.corruption != "clean"
             )
             ghost_target = (
@@ -1423,7 +1420,7 @@ def corrupt_pre_action_value(
     state_std: np.ndarray,
     action_std: np.ndarray,
 ) -> np.ndarray:
-    if config.run_purpose == "research_benchmark":
+    if config.is_research_suite:
         raise RuntimeError(
             "pre-action sensor/actuator corruption is outside the benchmark "
             f"contract ({CORRUPTION_APPLICATION_CONTRACT}); generate a clean "

@@ -9,12 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .config import (
-    LEGACY_PROTOCOL,
-    LEGACY_SCORE_SEMANTICS,
-    LOCAL_PROTOCOL,
-    LOCAL_SCORE_SEMANTICS,
-)
+from .config import SCORE_SEMANTICS
 from .paths import resolve_run_layout
 from .manifest import (
     build_experiment_manifest,
@@ -35,8 +30,6 @@ METRIC_FIELDS = (
     "return_std",
     "normalized_return_mean",
     "normalized_return_std",
-    "diagnostic_d4rl_reference_scaled_return_mean",
-    "diagnostic_d4rl_reference_scaled_return_std",
     "evaluation_mode",
     "return_deterministic",
     "normalized_return_deterministic",
@@ -72,8 +65,7 @@ class RunLogger:
         run_id = f"{stamp}_{short_id}"
         self.run_id = run_id
         self.short_id = short_id
-        self._score_protocol_banner_logged = False
-        self._score_benchmark_eligible = False
+        self._score_benchmark_eligible = True
         self._resume_committed = not bool(config.resume_run)
         if config.resume_run:
             run_dir = resolve_resume_run_directory(config.resume_run)
@@ -158,7 +150,6 @@ class RunLogger:
         self._manifest_written = False
         self.last_eval: Optional[Dict[str, float]] = None
         self.config = config
-        self._log_score_protocol_banner_once()
 
     def _configure_handlers(self) -> None:
         formatter = logging.Formatter(
@@ -186,13 +177,8 @@ class RunLogger:
         return self.elapsed_offset + time.perf_counter() - self.start_monotonic
 
     def write_config(self, config: Dict[str, Any]) -> None:
-        self._score_benchmark_eligible = bool(
-            config.get("run_purpose")
-            in ("research_benchmark", "final_benchmark")
-            and config.get("protocol") == LEGACY_PROTOCOL
-            and config.get("environment_protocol", config.get("protocol"))
-            == LEGACY_PROTOCOL
-            and config.get("score_semantics") == LEGACY_SCORE_SEMANTICS
+        self._score_benchmark_eligible = (
+            config.get("score_semantics") == SCORE_SEMANTICS
         )
         config = {
             **config,
@@ -237,9 +223,6 @@ class RunLogger:
                 "requested_manifest_sha256": requested_manifest["manifest_sha256"],
                 "resume_identity_sha256": requested_identity,
                 "launch_manifest_sha256": manifest["manifest_sha256"],
-                "resume_final_audit_receipt_sha256": requested_manifest.get(
-                    "final_audit_receipt_sha256"
-                ),
                 "previous_status": previous_summary.get("status"),
                 "superseded_completion_manifest": (
                     str(superseded_completion)
@@ -269,7 +252,6 @@ class RunLogger:
                 json.dump(running_summary, stream, indent=2, ensure_ascii=False)
             temporary_summary.replace(summary_path)
             self._configure_handlers()
-            self._log_score_protocol_banner_once()
             return
         if not self._manifest_written:
             manifest = build_experiment_manifest(config)
@@ -287,22 +269,6 @@ class RunLogger:
         }
         with (self.run_dir / "config.json").open("w", encoding="utf-8") as stream:
             json.dump(config, stream, indent=2, ensure_ascii=False, default=str)
-        self._log_score_protocol_banner_once()
-
-    def _log_score_protocol_banner_once(self) -> None:
-        if self._score_protocol_banner_logged:
-            return
-        self._score_protocol_banner_logged = True
-        if self.config.protocol == LOCAL_PROTOCOL:
-            self.logger.warning(
-                "================ DIAGNOSTIC EVALUATION ONLY ================ "
-                "protocol=%s score_semantics=%s "
-                "benchmark_eligible=false. Scores from this run are not "
-                "comparable to the legacy D4RL-v2 research benchmark and "
-                "will be excluded from research_summary.csv.",
-                self.config.protocol,
-                LOCAL_SCORE_SEMANTICS,
-            )
 
     def write_completion_manifest(self, outcomes: Dict[str, Any]) -> Path:
         """Write immutable launch provenance plus measured run outcomes.
@@ -361,29 +327,8 @@ class RunLogger:
         metrics: Dict[str, float],
     ) -> None:
         persisted_metrics = dict(metrics)
-        if self.config.protocol == LOCAL_PROTOCOL:
-            score_mean = metrics.get(
-                "diagnostic_d4rl_reference_scaled_return_mean"
-            )
-            score_std = metrics.get(
-                "diagnostic_d4rl_reference_scaled_return_std"
-            )
-            if score_mean is None:
-                score_mean = metrics["normalized_return_mean"]
-            if score_std is None:
-                score_std = metrics["normalized_return_std"]
-            persisted_metrics[
-                "diagnostic_d4rl_reference_scaled_return_mean"
-            ] = score_mean
-            persisted_metrics[
-                "diagnostic_d4rl_reference_scaled_return_std"
-            ] = score_std
-            for key in tuple(persisted_metrics):
-                if key.startswith("normalized_return"):
-                    persisted_metrics.pop(key)
-        else:
-            score_mean = metrics["normalized_return_mean"]
-            score_std = metrics["normalized_return_std"]
+        score_mean = metrics["normalized_return_mean"]
+        score_std = metrics["normalized_return_std"]
         record = {
             "timestamp": datetime.now().astimezone().isoformat(),
             "elapsed_seconds": self.elapsed,
@@ -397,23 +342,15 @@ class RunLogger:
             writer = csv.DictWriter(stream, fieldnames=METRIC_FIELDS)
             writer.writerow({key: record.get(key, "") for key in METRIC_FIELDS})
         self.last_eval = persisted_metrics
-        score_label = (
-            "normalized"
-            if self.config.protocol == LEGACY_PROTOCOL
-            else "diagnostic_scaled"
-        )
         self.logger.info(
-            "%s step=%d env_steps=%d return=%.1f±%.1f %s=%.1f±%.1f "
-            "benchmark_eligible=%s",
+            "%s step=%d env_steps=%d return=%.1f±%.1f normalized=%.1f±%.1f",
             phase,
             step,
             env_steps,
             metrics["return_mean"],
             metrics["return_std"],
-            score_label,
             score_mean,
             score_std,
-            str(self._score_benchmark_eligible).lower(),
         )
 
     def finish(

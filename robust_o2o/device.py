@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import random
-from typing import Optional
 
 import numpy as np
 import torch
@@ -34,21 +33,12 @@ def resolve_device(requested: str = "auto", cuda_device: int = 0) -> torch.devic
     return torch.device("cpu")
 
 
-def seed_everything(seed: int, env: Optional[object] = None) -> None:
+def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    if env is not None:
-        if hasattr(env, "seed"):
-            env.seed(seed)
-        action_space = getattr(env, "action_space", None)
-        if action_space is not None and hasattr(action_space, "seed"):
-            action_space.seed(seed)
-        observation_space = getattr(env, "observation_space", None)
-        if observation_space is not None and hasattr(observation_space, "seed"):
-            observation_space.seed(seed)
 
 
 def seed_env_only(env: object, seed: int) -> None:

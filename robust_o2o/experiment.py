@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from .agents import build_agent
-from .config import LEGACY_PROTOCOL, ExperimentConfig
+from .config import ExperimentConfig
 from .calql_online import CalQLTrajectoryAccumulator, dynamic_batch_counts
 from .corruption import (
     AttackOracle,
@@ -569,10 +569,7 @@ def _policy_log_std_metrics(agent: object) -> Dict[str, float]:
 
 
 def _torch_load(path: Path, device: torch.device) -> Dict[str, Any]:
-    try:
-        return torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=device)
+    return torch.load(path, map_location=device, weights_only=False)
 
 
 def resolve_resume_checkpoint(path_value: str, device: torch.device) -> tuple[Path, Dict[str, Any]]:
@@ -1151,7 +1148,7 @@ def _evaluate(
     env_steps: int,
 ) -> None:
     modes = (
-        ("method_faithful", "deterministic_diagnostic")
+        ("method_faithful", "deterministic")
         if config.evaluation_mode == "both"
         else (config.evaluation_mode,)
     )
@@ -1174,13 +1171,13 @@ def _evaluate(
     primary_mode = (
         "method_faithful"
         if config.algorithm == "rpex" and "method_faithful" in evaluations
-        else "deterministic_diagnostic"
-        if "deterministic_diagnostic" in evaluations
+        else "deterministic"
+        if "deterministic" in evaluations
         else modes[0]
     )
     metrics = dict(evaluations[primary_mode])
     for mode, values in evaluations.items():
-        suffix = "deterministic" if mode == "deterministic_diagnostic" else "method_faithful"
+        suffix = "deterministic" if mode == "deterministic" else "method_faithful"
         metrics[f"return_{suffix}"] = values["return_mean"]
         metrics[f"normalized_return_{suffix}"] = values[
             "normalized_return_mean"
@@ -1194,8 +1191,6 @@ def _evaluate(
 def run_experiment(
     config: ExperimentConfig,
     logger: RunLogger,
-    *,
-    final_audit_receipt: Optional[Dict[str, Any]] = None,
 ) -> Path:
     device = resolve_device(config.device, config.cuda_device)
     seed_everything(config.learner_seed)
@@ -1222,15 +1217,14 @@ def run_experiment(
 
     state_dim = raw_dataset["observations"].shape[1]
     action_dim = raw_dataset["actions"].shape[1]
-    if config.protocol == LEGACY_PROTOCOL:
-        expected_dims = EXPECTED_LOCOMOTION_DIMS[
-            config.env_name.split("-", 1)[0]
-        ]
-        if (state_dim, action_dim) != expected_dims:
-            raise RuntimeError(
-                "Strict D4RL-v2 observation/action dimensions mismatch: "
-                f"expected={expected_dims}, actual={(state_dim, action_dim)}"
-            )
+    expected_dims = EXPECTED_LOCOMOTION_DIMS[
+        config.env_name.split("-", 1)[0]
+    ]
+    if (state_dim, action_dim) != expected_dims:
+        raise RuntimeError(
+            "D4RL-v2 observation/action dimensions mismatch: "
+            f"expected={expected_dims}, actual={(state_dim, action_dim)}"
+        )
 
     with ExitStack() as stack:
         env = make_env(config.env_name, config.protocol)
@@ -1271,12 +1265,9 @@ def run_experiment(
                 raise RuntimeError(f"{role} environment horizon mismatch")
         max_action = float(np.max(np.abs(env.action_space.high)))
         environment_horizon = protocol_metadata["environment_max_episode_steps"]
-        if (
-            config.protocol == LEGACY_PROTOCOL
-            and config.max_episode_steps != environment_horizon
-        ):
+        if config.max_episode_steps != environment_horizon:
             raise RuntimeError(
-                "Strict protocol horizon mismatch: "
+                "Environment horizon mismatch: "
                 f"--max-episode-steps={config.max_episode_steps}, "
                 f"environment spec={environment_horizon}"
             )
@@ -1293,8 +1284,6 @@ def run_experiment(
             _, checkpoint_payload = resolve_resume_checkpoint(config.resume_run, device)
             _validate_checkpoint(checkpoint_payload, config, state_dim, action_dim)
             _restore_agent_config(config, checkpoint_payload)
-            if config.run_purpose == "final_benchmark":
-                config._validate_final_benchmark()
             resume_payload = checkpoint_payload["resume_state"]
         if config.initialize_from_checkpoint:
             checkpoint_path = Path(
@@ -1303,8 +1292,6 @@ def run_experiment(
             checkpoint_payload = _torch_load(checkpoint_path, device)
             _validate_checkpoint(checkpoint_payload, config, state_dim, action_dim)
             _restore_agent_config(config, checkpoint_payload)
-            if config.run_purpose == "final_benchmark":
-                config._validate_final_benchmark()
 
         oracle: Optional[AttackOracle] = make_attack_oracle(
             config, state_dim, action_dim, max_action, device
@@ -1426,19 +1413,6 @@ def run_experiment(
                 ),
             }
         )
-        if final_audit_receipt is not None:
-            from .final_gate import write_final_audit_evidence
-
-            evidence_dir = logger.run_dir
-            if config.resume_run:
-                receipt_sha256 = str(
-                    getattr(config, "_final_audit_receipt_sha256", "unknown")
-                )
-                evidence_dir = (
-                    logger.run_dir / "resume_audit_evidence" / receipt_sha256
-                )
-                evidence_dir.mkdir(parents=True, exist_ok=True)
-            write_final_audit_evidence(evidence_dir, final_audit_receipt)
         logger.logger.info(
             "protocol=%s algorithm=%s env=%s corruption=%s/%s device=%s",
             config.protocol,
@@ -1473,7 +1447,7 @@ def run_experiment(
                 config.max_episode_steps,
                 config.eval_seed,
                 config.protocol,
-                "deterministic_diagnostic",
+                "deterministic",
                 config.action_execution_profile,
             )
             diagnostic_initial_return = initial_metrics["return_mean"]
@@ -1482,7 +1456,7 @@ def run_experiment(
                 0,
                 0,
                 agent.total_updates,
-                {**initial_metrics, "evaluation_mode": "deterministic_diagnostic"},
+                {**initial_metrics, "evaluation_mode": "deterministic"},
             )
 
         if config.stage in ("offline", "both"):
@@ -1546,7 +1520,7 @@ def run_experiment(
                 config.max_episode_steps,
                 config.eval_seed,
                 config.protocol,
-                "deterministic_diagnostic",
+                "deterministic",
                 config.action_execution_profile,
             )
             final_return = final_metrics["return_mean"]

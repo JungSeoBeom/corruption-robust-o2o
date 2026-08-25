@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -32,9 +31,6 @@ from .fidelity import (
     FinalBenchmarkValidationError,
     MAIN_BASELINES,
     REPORTING_RULES,
-    RPEX_GOLDEN_FIXTURE_CERTIFICATES,
-    STRICT_FINAL_SEEDS,
-    STRICT_FINAL_TASKS,
     baseline_record_is_strict_eligible,
     resolve_riql_reference_row,
     validate_reproduction_fixture,
@@ -53,20 +49,9 @@ ALGORITHMS = (
     "pessimistic_q_ensemble",
 )
 
-LEGACY_PROTOCOL = "rpex_d4rl_v2_legacy"
-LOCAL_PROTOCOL = "local_gymnasium_v4_diagnostic"
-LEGACY_LOCAL_PROTOCOL_ALIAS = "local_gymnasium_v4"
-DEFAULT_PROTOCOL = LEGACY_PROTOCOL
-PROTOCOLS = (LEGACY_PROTOCOL, LOCAL_PROTOCOL, LEGACY_LOCAL_PROTOCOL_ALIAS)
-LEGACY_SCORE_SEMANTICS = "d4rl_normalized_return"
-LOCAL_SCORE_SEMANTICS = "diagnostic_d4rl_reference_scaled_return"
-RESEARCH_BENCHMARK_PROTOCOL_ERROR = (
-    "ResearchBenchmarkProtocolError: research_benchmark requires the legacy "
-    "D4RL-v2 evaluation protocol. The current environment only supports "
-    "Gymnasium-v4 diagnostic evaluation. Run with --run-purpose diagnostic "
-    "for smoke testing, or execute the research benchmark in the pinned "
-    "Linux D4RL-v2 environment."
-)
+DEFAULT_PROTOCOL = "gymnasium_mujoco_v4_d4rl_v2"
+PROTOCOLS = (DEFAULT_PROTOCOL,)
+SCORE_SEMANTICS = "d4rl_reference_scaled_return"
 CALIBRATION_MASK_MODES = ("all", "oracle_exclude_corrupted", "disabled")
 
 ACTION_DIMS = {
@@ -75,62 +60,6 @@ ACTION_DIMS = {
     "walker2d": 6,
 }
 
-
-def is_inflight_pre_gate_run55_descendant(pid: int | None = None) -> bool:
-    """Allow only the run_55 process tree that predates this protocol gate.
-
-    The repository may be edited while a long suite is still spawning child
-    controllers.  A persistent path- or flag-based exception would let later
-    launches mislabel local diagnostics as research.  Process ancestry and the
-    gate file's modification time provide a fail-closed, self-expiring bridge
-    for that already-running controller only.
-    """
-
-    try:
-        import psutil
-
-        process = psutil.Process(pid) if pid is not None else psutil.Process()
-        gate_installed_at = Path(__file__).stat().st_mtime
-        expected_script = Path(__file__).resolve().parents[1] / "run_55_experiment.py"
-        for ancestor in process.parents():
-            command = ancestor.cmdline()
-            if not command or ancestor.create_time() >= gate_installed_at:
-                continue
-            script_arguments = [
-                argument
-                for argument in command[1:]
-                if Path(argument).name == "run_55_experiment.py"
-            ]
-            if not script_arguments:
-                continue
-            script = Path(script_arguments[0])
-            if not script.is_absolute():
-                script = Path(ancestor.cwd()) / script
-            if script.resolve() != expected_script:
-                continue
-
-            def has_option(name: str, value: str) -> bool:
-                return any(
-                    argument == f"{name}={value}"
-                    or (
-                        argument == name
-                        and index + 1 < len(command)
-                        and command[index + 1] == value
-                    )
-                    for index, argument in enumerate(command)
-                )
-
-            if (
-                has_option("--run-purpose", "research_benchmark")
-                and has_option("--protocol", LOCAL_PROTOCOL)
-                and "--allow-diagnostic-protocol" in command
-            ):
-                return True
-    except Exception:
-        # Missing psutil, exited ancestors, access errors, and malformed
-        # command lines all fail closed.
-        return False
-    return False
 
 ALGORITHM_TITLES = {
     "rpex": "RPEX: Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption",
@@ -205,12 +134,13 @@ class ExperimentConfig:
     implementation_profile: Optional[str] = None
     implementation_fidelity: Optional[str] = None
     suite_profile: str = "common_budget_robustness"
-    run_purpose: str = "diagnostic"
+    # Internal result metadata. The runtime protocol is intentionally no
+    # longer selectable from the CLI.
+    run_purpose: str = "experiment"
     # Input-only compatibility shim.  ``reference`` is accepted only so old
     # commands fail with a precise migration message instead of being silently
     # promoted to a paper reference.
     algorithm_profile: Optional[str] = None
-    allow_diagnostic_protocol: bool = False
     allow_legacy_checkpoint_without_fingerprint: bool = False
 
     # ``seed`` remains the stable public/base seed. Role seeds are derived once
@@ -221,12 +151,6 @@ class ExperimentConfig:
     replay_seed: Optional[int] = None
     train_env_seed: Optional[int] = None
     eval_seed: Optional[int] = None
-    # A per-run declaration of the controller-level seed cohort.  A strict
-    # child run is never publication eligible merely because its own seed is
-    # valid; the launcher must attest that the complete, ordered cohort was
-    # scheduled.
-    benchmark_seed_set: Tuple[int, ...] = ()
-
     output_dir: str = "results"
     dataset_dir: Optional[str] = None
     checkpoint: Optional[str] = None
@@ -269,6 +193,9 @@ class ExperimentConfig:
     state_normalization: str = "standard"
     deterministic_policy: bool = False
     action_distribution: str = "tanh_gaussian"
+    # Resolved internally from the suite/implementation profile. It is not a
+    # public CLI control, so one comparison cannot mix evaluation policies by
+    # accident.
     evaluation_mode: Optional[str] = None
     online_replay_profile: str = "official_code_online_only"
     evaluation_policy_profile: str = "official_code_epsilon_switching"
@@ -394,8 +321,6 @@ class ExperimentConfig:
         self.corruption_target = self.corruption_target.lower()
         self.stage = self.stage.lower()
         self.protocol = self.protocol.lower()
-        if self.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
-            self.protocol = LOCAL_PROTOCOL
         if self.implementation_profile is not None:
             self.implementation_profile = self.implementation_profile.lower()
         if self.algorithm_profile is not None:
@@ -455,7 +380,6 @@ class ExperimentConfig:
             )
         )
         self.pqe_member_checkpoints = tuple(self.pqe_member_checkpoints)
-        self.benchmark_seed_set = tuple(int(value) for value in self.benchmark_seed_set)
         self.attack_norm = self.attack_norm.lower()
         self.mixed_ratios = tuple(float(value) for value in self.mixed_ratios)
 
@@ -465,12 +389,7 @@ class ExperimentConfig:
             self.implementation_profile == "official_code_reference"
             and self.corruption_seed != self.seed
         ):
-            error_type = (
-                FinalBenchmarkValidationError
-                if self.run_purpose == "final_benchmark"
-                else ValueError
-            )
-            raise error_type(
+            raise ValueError(
                 "official_code_reference requires corruption_seed == seed "
                 "because pinned RPEX passes config.seed directly to its NumPy "
                 "and Torch attack RNGs"
@@ -508,12 +427,7 @@ class ExperimentConfig:
                 or not math.isclose(self.online_attack_step_size, 0.1)
             )
         ):
-            error_type = (
-                FinalBenchmarkValidationError
-                if self.run_purpose == "final_benchmark"
-                else ValueError
-            )
-            raise error_type(
+            raise ValueError(
                 "rpex_official_adam requires the pinned upstream schedule: "
                 "offline=100x0.01 and online=2x0.1"
             )
@@ -522,9 +436,9 @@ class ExperimentConfig:
                 "method_faithful"
                 if self.implementation_profile
                 in ("official_code_reference", "paper_reference")
-                else "deterministic_diagnostic"
+                else "deterministic"
             )
-        if self.run_purpose == "research_benchmark":
+        if self.is_research_suite:
             # RPEX's reported policy is the upstream epsilon/Q policy-expansion
             # rule.  Its deterministic argmax is kept as a secondary diagnostic.
             # The remaining methods report their deterministic clean policy.
@@ -532,8 +446,8 @@ class ExperimentConfig:
                 self.evaluation_mode = "both"
                 self.evaluation_policy_profile = "official_code_epsilon_switching"
             else:
-                self.evaluation_mode = "deterministic_diagnostic"
-                self.evaluation_policy_profile = "deterministic_diagnostic"
+                self.evaluation_mode = "deterministic"
+                self.evaluation_policy_profile = "deterministic"
 
         if not self.normalize_states:
             self.state_normalization = "none"
@@ -552,7 +466,7 @@ class ExperimentConfig:
             raise ValueError(f"Unknown corruption target {self.corruption_target!r}")
         if self.stage not in ("offline", "online", "both"):
             raise ValueError("stage must be offline, online, or both")
-        if self.protocol not in (LEGACY_PROTOCOL, LOCAL_PROTOCOL):
+        if self.protocol != DEFAULT_PROTOCOL:
             raise ValueError(
                 f"Unknown protocol {self.protocol!r}; choose from {PROTOCOLS}"
             )
@@ -620,12 +534,7 @@ class ExperimentConfig:
             and self.corruption_target in ("observations", "actions", "dynamics", "mixed")
             and self.online_corruption_scale_profile != "rpex_official_code"
         ):
-            error_type = (
-                FinalBenchmarkValidationError
-                if self.run_purpose == "final_benchmark"
-                else ValueError
-            )
-            raise error_type(
+            raise ValueError(
                 "official_code_reference requires "
                 "online_corruption_scale_profile=rpex_official_code"
             )
@@ -648,12 +557,12 @@ class ExperimentConfig:
                 "or official_unsquashed_gaussian"
             )
         if self.evaluation_mode not in (
-            "deterministic_diagnostic",
+            "deterministic",
             "method_faithful",
             "both",
         ):
             raise ValueError(
-                "evaluation_mode must be deterministic_diagnostic, "
+                "evaluation_mode must be deterministic, "
                 "method_faithful, or both"
             )
         if self.mc_return_source not in (
@@ -788,17 +697,8 @@ class ExperimentConfig:
                 "wsrl_target_critic_subsample_size must be between 1 and "
                 "sac_num_critics"
             )
-        if self.run_purpose == "final_benchmark":
-            self._validate_final_benchmark()
-        elif self.run_purpose == "research_benchmark":
+        if self.is_research_suite:
             self._validate_research_benchmark()
-        elif self.run_purpose == "paper_reproduction":
-            raise FinalBenchmarkValidationError(
-                "paper_reproduction is reserved until a paper-specific task, seed, "
-                "budget, environment, and reporting contract is certified. Use "
-                "run_purpose=diagnostic for exploratory/common-budget runs or "
-                "run_purpose=final_benchmark for the audited strict suite."
-            )
 
     def _validate_research_benchmark(self) -> None:
         """Validate the practical custom-budget benchmark contract.
@@ -808,15 +708,10 @@ class ExperimentConfig:
         protects the interpretation of the common benchmark instead.
         """
 
-        if self.protocol != LEGACY_PROTOCOL:
-            if not is_inflight_pre_gate_run55_descendant():
-                raise ValueError(RESEARCH_BENCHMARK_PROTOCOL_ERROR)
-
         if self.suite_profile != "research_benchmark":
             raise ValueError(
-                "run_purpose=research_benchmark requires "
-                "suite_profile=research_benchmark so research and diagnostic "
-                "outputs cannot share a result namespace"
+                "research benchmark validation requires "
+                "suite_profile=research_benchmark"
             )
         if self.implementation_profile != "research_benchmark":
             raise ValueError(
@@ -835,11 +730,11 @@ class ExperimentConfig:
                 "research_benchmark forbids oracle_exclude_corrupted: "
                 "corruption masks/labels must not be passed to the learner"
             )
-        expected_evaluation_mode = "both" if self.algorithm == "rpex" else "deterministic_diagnostic"
+        expected_evaluation_mode = "both" if self.algorithm == "rpex" else "deterministic"
         expected_evaluation_policy = (
             "official_code_epsilon_switching"
             if self.algorithm == "rpex"
-            else "deterministic_diagnostic"
+            else "deterministic"
         )
         if self.evaluation_mode != expected_evaluation_mode:
             raise ValueError(
@@ -971,387 +866,6 @@ class ExperimentConfig:
                 }
             if mismatches:
                 raise ValueError(f"PQE main frozen config mismatch: {mismatches}")
-
-    def _validate_final_benchmark(self) -> None:
-        """Fail before creating a run directory for any non-final setting."""
-
-        failures: list[tuple[str, object, object, bool]] = []
-
-        def require(
-            condition: bool,
-            name: str,
-            current: object,
-            required: object,
-            diagnostic_available: bool = True,
-        ) -> None:
-            if not condition:
-                failures.append(
-                    (name, current, required, diagnostic_available)
-                )
-
-        record = BASELINE_REPRODUCTION_REGISTRY.get(self.algorithm)
-        required_role_seeds = {
-            "learner_seed": self.seed,
-            "corruption_seed": self.seed,
-            "replay_seed": self.seed,
-            "train_env_seed": self.seed,
-            "eval_seed": self.seed,
-        }
-        require(
-            self.stage == "both",
-            "stage",
-            self.stage,
-            "both",
-        )
-        require(
-            self.benchmark_seed_set == STRICT_FINAL_SEEDS,
-            "benchmark_seed_set",
-            self.benchmark_seed_set,
-            STRICT_FINAL_SEEDS,
-            False,
-        )
-        require(
-            self.protocol == LEGACY_PROTOCOL,
-            "environment_protocol",
-            self.protocol,
-            LEGACY_PROTOCOL,
-        )
-        require(
-            self.env_name in STRICT_FINAL_TASKS,
-            "task",
-            self.env_name,
-            STRICT_FINAL_TASKS,
-        )
-        require(
-            self.suite_profile == "primary_research_benchmark",
-            "suite_profile",
-            self.suite_profile,
-            "primary_research_benchmark",
-        )
-        require(
-            record is not None and baseline_record_is_strict_eligible(record),
-            "baseline_registry",
-            (
-                None
-                if record is None
-                else {
-                    "reproduction_status": record.reproduction_status,
-                    "parity_status": record.parity_status,
-                    "strict_final_eligible": record.strict_final_eligible,
-                }
-            ),
-            "explicit end_to_end_verified or official_adapter_verified baseline",
-        )
-        require(
-            self.implementation_profile == "official_code_reference",
-            "implementation_profile",
-            self.implementation_profile,
-            "official_code_reference",
-        )
-        require(
-            self.implementation_fidelity
-            in (
-                "exact_upstream_port",
-                "framework_port_verified",
-                "end_to_end_verified",
-                "official_adapter_verified",
-            ),
-            "implementation_fidelity",
-            self.implementation_fidelity,
-            "verified end-to-end port or verified official adapter",
-        )
-        required_budget = {
-            "rpex": (2_000_001, 1_000_001),
-            "riql_naive": (2_000_001, 1_000_001),
-            "riql_pex": (2_000_001, 1_000_001),
-            "wsrl": (250_000, 500_000),
-        }.get(self.algorithm)
-        require(
-            required_budget is not None
-            and (self.offline_steps, self.online_steps) == required_budget,
-            "official_budget",
-            (self.offline_steps, self.online_steps),
-            required_budget,
-        )
-        require(
-            self.corruption_seed == self.seed,
-            "corruption_seed",
-            self.corruption_seed,
-            self.seed,
-        )
-        for seed_name, required_seed in required_role_seeds.items():
-            require(
-                getattr(self, seed_name) == required_seed,
-                seed_name,
-                getattr(self, seed_name),
-                required_seed,
-            )
-        exact_values = {
-            "initial_collection_steps": 5_000,
-            "warmup_steps": 5_000,
-            "updates_per_step": 1,
-            "batch_size": 256,
-            "replay_size": 1_000_000,
-            "eval_period": 10_000,
-            "max_episode_steps": 1_000,
-            "offline_attack_steps": 100,
-            "online_attack_steps": 2,
-            "hidden_dim": 256,
-            "hidden_layers": 2,
-            "normalize_states": True,
-            "state_normalization": "standard",
-            "deterministic_policy": False,
-            "action_distribution": "official_unsquashed_gaussian",
-            "evaluation_mode": "method_faithful",
-            "online_replay_profile": "official_code_online_only",
-            "attack_timing": "official_code_post_transition_replay_poisoning",
-            "random_attack_semantics": "post_transition_replay_poisoning",
-            "action_execution_profile": "official_algorithm_behavior",
-            "task_profile": "official_supported_task",
-            "adversarial_attack_profile": "rpex_official_adam",
-            "offline_adversarial_reward_rule": "official_sign_flip",
-            "online_adversarial_reward_rule": "official_uniform_replacement",
-            "attack_norm": "linf",
-            "diagnostic_mode": False,
-            "allow_experimental_adversarial_attack": False,
-            "allow_legacy_checkpoint_without_fingerprint": False,
-        }
-        for name, required_value in exact_values.items():
-            require(
-                getattr(self, name) == required_value,
-                name,
-                getattr(self, name),
-                required_value,
-            )
-        exact_float_values = {
-            "learning_rate": 3e-4,
-            "actor_learning_rate": 3e-4,
-            "critic_learning_rate": 3e-4,
-            "temperature_learning_rate": 3e-4,
-            "discount": 0.99,
-            "target_update_rate": 0.005,
-            "expectile": 0.7,
-            "beta": 3.0,
-            "inv_temperature": 3.0,
-            "kappa": 0.1,
-            "attack_step_size": 0.01,
-            "online_attack_step_size": 0.1,
-            "attack_min_step_size": 0.0,
-        }
-        for name, required_value in exact_float_values.items():
-            current = getattr(self, name)
-            require(
-                current is not None and math.isclose(current, required_value),
-                name,
-                current,
-                required_value,
-            )
-        require(
-            self.max_grad_norm is None,
-            "max_grad_norm",
-            self.max_grad_norm,
-            None,
-        )
-        require(
-            math.isclose(self.effective_offline_ratio, 0.0),
-            "effective_offline_ratio",
-            self.effective_offline_ratio,
-            0.0,
-        )
-        expected_evaluation_policy = (
-            "official_code_epsilon_switching"
-            if self.algorithm == "rpex"
-            else "deterministic_diagnostic"
-        )
-        require(
-            self.evaluation_policy_profile == expected_evaluation_policy,
-            "evaluation_policy_profile",
-            self.evaluation_policy_profile,
-            expected_evaluation_policy,
-        )
-        expected_policy_extraction = "awr"
-        require(
-            self.policy_extraction == expected_policy_extraction,
-            "policy_extraction",
-            self.policy_extraction,
-            expected_policy_extraction,
-        )
-        require(
-            not self.initialize_from_checkpoint and not self.checkpoint,
-            "initialize_from_checkpoint",
-            self.initialize_from_checkpoint or self.checkpoint,
-            None,
-            False,
-        )
-        require(
-            not self.riql_config_extension,
-            "riql_config_extension",
-            self.riql_config_extension,
-            False,
-        )
-        if self.corruption != "clean":
-            require(
-                math.isclose(self.offline_corruption_rate, 0.3),
-                "offline_corruption_rate",
-                self.offline_corruption_rate,
-                0.3,
-            )
-            require(
-                math.isclose(self.online_corruption_rate, 0.5),
-                "online_corruption_rate",
-                self.online_corruption_rate,
-                0.5,
-            )
-            require(
-                math.isclose(self.corruption_range, 1.0),
-                "corruption_range_epsilon",
-                self.corruption_range,
-                1.0,
-            )
-            require(
-                self.corruption_target in INDIVIDUAL_CORRUPTION_TARGETS,
-                "corruption_target",
-                self.corruption_target,
-                INDIVIDUAL_CORRUPTION_TARGETS,
-            )
-        require(
-            self.online_corruption_scale_profile == "rpex_official_code",
-            "online_corruption_scale_profile",
-            self.online_corruption_scale_profile,
-            "rpex_official_code",
-        )
-        require(
-            self.adversarial_attack_profile != "experimental_sign_pgd",
-            "adversarial_attack_profile",
-            self.adversarial_attack_profile,
-            "rpex_official_adam",
-        )
-        require(
-            self.calibration_mask_mode == "all",
-            "calibration_mask_mode",
-            self.calibration_mask_mode,
-            "all (no oracle exclusion)",
-        )
-        reporting = REPORTING_RULES.get(self.algorithm)
-        require(
-            reporting is not None and reporting.verified,
-            "reporting_rule",
-            None if reporting is None else reporting.rule_id,
-            "verified algorithm-specific reporting rule",
-        )
-        if reporting is not None:
-            require(
-                self.eval_episodes == reporting.evaluation_episodes,
-                "evaluation_episodes",
-                self.eval_episodes,
-                reporting.evaluation_episodes,
-            )
-        require(
-            self.condition_status
-            not in (
-                "diagnostic_extension",
-                "non_publication_diagnostic",
-                "paper_condition_fixture_unverified",
-                "adversarial_optimizer_core_diagnostic",
-            ),
-            "condition_status",
-            self.condition_status,
-            "condition backed by an end-to-end algorithm-condition certificate",
-            False,
-        )
-        fixture_id = self.corruption_fixture_id
-        if self.corruption != "clean":
-            require(
-                fixture_id is not None,
-                "corruption_fixture_scope",
-                f"{self.corruption}/{self.corruption_target}",
-                "a target-specific certified upstream fixture",
-                False,
-            )
-        if fixture_id is not None:
-            fixture_path = (
-                Path(__file__).resolve().parents[1]
-                / "tests"
-                / "fixtures"
-                / f"{fixture_id}.json"
-            )
-            try:
-                validate_reproduction_fixture(fixture_path, fixture_id)
-            except ValueError as exc:
-                require(
-                    False,
-                    "corruption_fixture_verification",
-                    str(exc),
-                    f"certified fixture {fixture_id}",
-                    False,
-                )
-        if self.corruption == "adversarial" and self.corruption_target != "rewards":
-            checkpoint = (
-                Path(self.attack_checkpoint).expanduser().resolve()
-                if self.attack_checkpoint
-                else default_attack_checkpoint(self.env_name)
-            )
-            required_sha256 = (
-                self.attack_checkpoint_sha256
-                if self.attack_checkpoint
-                else default_attack_checkpoint_sha256(self.env_name)
-            )
-            require(
-                checkpoint is not None and checkpoint.is_file(),
-                "attack_checkpoint",
-                checkpoint,
-                "existing pinned EDAC checkpoint",
-                False,
-            )
-            require(
-                bool(required_sha256),
-                "attack_checkpoint_sha256",
-                required_sha256,
-                "pinned or explicitly supplied SHA-256",
-                False,
-            )
-            if checkpoint is not None and checkpoint.is_file() and required_sha256:
-                digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-                require(
-                    digest.lower() == required_sha256.lower(),
-                    "attack_checkpoint_sha256",
-                    digest,
-                    required_sha256.lower(),
-                    False,
-                )
-                pinned_sha256 = default_attack_checkpoint_sha256(self.env_name)
-                require(
-                    pinned_sha256 is not None and digest.lower() == pinned_sha256,
-                    "attack_oracle_checkpoint_identity",
-                    digest.lower(),
-                    pinned_sha256,
-                    False,
-                )
-                certificate = RPEX_GOLDEN_FIXTURE_CERTIFICATES.get(
-                    fixture_id or ""
-                )
-                certificate_sha256 = (
-                    certificate.checkpoint_sha256
-                    if certificate is not None
-                    else None
-                )
-                require(
-                    certificate_sha256 is not None
-                    and digest.lower() == certificate_sha256.lower(),
-                    "attack_fixture_checkpoint_identity",
-                    digest.lower(),
-                    certificate_sha256,
-                    False,
-                )
-        if failures:
-            lines = ["Final benchmark validation failed before execution:"]
-            for name, current, required, diagnostic_available in failures:
-                lines.append(
-                    f"- {name}: current={current!r}; required={required!r}; "
-                    "diagnostic_mode_available="
-                    f"{'yes' if diagnostic_available else 'no'}"
-                )
-            raise FinalBenchmarkValidationError("\n".join(lines))
 
     def _resolve_role_seeds(self) -> None:
         official_corruption_stream = (
@@ -1552,12 +1066,7 @@ class ExperimentConfig:
             in ("official_code_reference", "research_benchmark")
             and self.policy_extraction != "awr"
         ):
-            error_type = (
-                FinalBenchmarkValidationError
-                if self.run_purpose == "final_benchmark"
-                else ValueError
-            )
-            raise error_type(
+            raise ValueError(
                 "official_code_reference uses RIQL AWR policy extraction for "
                 "every corruption target; ALIGN-IQL is diagnostic-only"
             )
@@ -1570,9 +1079,7 @@ class ExperimentConfig:
                     self.corruption_target,
                     allow_extension=common_budget_suite or research_suite,
                 )
-            except ValueError as exc:
-                if self.run_purpose == "final_benchmark":
-                    raise FinalBenchmarkValidationError(str(exc)) from exc
+            except ValueError:
                 raise
             self.riql_config_row = row_key
             self.riql_config_extension = row.extension
@@ -1694,7 +1201,7 @@ class ExperimentConfig:
                     ACTION_DIMS[self.env_name.split("-", 1)[0]]
                 )
         if self.algorithm not in ("rpex", "riql_pex"):
-            self.evaluation_policy_profile = "deterministic_diagnostic"
+            self.evaluation_policy_profile = "deterministic"
         if self.algorithm == "pex":
             self.online_replay_profile = "fixed_offline_online_mixture"
         elif self.algorithm == "cal_ql":
@@ -1705,6 +1212,15 @@ class ExperimentConfig:
                 if self.pqe_replay_mode == "balanced_density"
                 else "fixed_offline_online_mixture"
             )
+
+    @property
+    def is_research_suite(self) -> bool:
+        """Whether the explicit research suite/profile contract is active."""
+
+        return (
+            self.suite_profile == "research_benchmark"
+            and self.implementation_profile == "research_benchmark"
+        )
 
     @property
     def resolved_algorithm_profile(self) -> str:
@@ -1770,9 +1286,7 @@ class ExperimentConfig:
         # Re-check immediately before provenance is serialized.  Resume code
         # may restore architecture/objective fields from an older checkpoint;
         # such a mutation must never leave a publication-eligible manifest.
-        if self.run_purpose == "final_benchmark":
-            self._validate_final_benchmark()
-        elif self.run_purpose == "research_benchmark":
+        if self.is_research_suite:
             self._validate_research_benchmark()
         result = asdict(self)
         result["effective_offline_ratio"] = self.effective_offline_ratio
@@ -1835,7 +1349,7 @@ class ExperimentConfig:
             in ("official_code_reference", "research_benchmark")
             else (
                 "deterministic_policy_mean"
-                if self.run_purpose == "research_benchmark"
+                if self.is_research_suite
                 else "algorithm_profile_default"
             )
         )
@@ -1868,10 +1382,9 @@ class ExperimentConfig:
             result["display_name"] = record.display_name
         reporting = (
             COMMON_BENCHMARK_REPORTING_RULE
-            if self.run_purpose == "research_benchmark"
+            if self.is_research_suite
             else REPORTING_RULES.get(self.algorithm)
         )
-        condition_status = self.condition_status
         result["implementation_type"] = (
             record.implementation_type if record is not None else "unregistered"
         )
@@ -1879,7 +1392,7 @@ class ExperimentConfig:
             record.benchmark_role if record is not None else "diagnostic"
         )
         result["main_table_eligible"] = bool(
-            self.run_purpose == "research_benchmark"
+            self.is_research_suite
             and record is not None
             and record.main_table_eligible
             and self.calibration_mask_mode != "oracle_exclude_corrupted"
@@ -1896,40 +1409,6 @@ class ExperimentConfig:
         result["clean_evaluation"] = True
         result["parity_status"] = (
             record.parity_status if record is not None else "unverified"
-        )
-        result["learner_parity_verified"] = bool(
-            record is not None and baseline_record_is_strict_eligible(record)
-        )
-        result["config_extension_active"] = bool(
-            self.riql_config_extension
-            or self.implementation_fidelity
-            in (
-                "task_port",
-                "approximation",
-                "diagnostic_extension",
-                "framework_port_unverified",
-                "source_aligned_port",
-                "paper_code_conflict",
-                "legacy_unknown",
-            )
-            or condition_status
-            in (
-                "diagnostic_extension",
-                "non_publication_diagnostic",
-                "paper_condition_fixture_unverified",
-                "adversarial_optimizer_core_diagnostic",
-            )
-        )
-        result["diagnostic_profile_active"] = bool(
-            self.diagnostic_mode
-            or self.run_purpose in ("smoke", "diagnostic")
-            or self.suite_profile
-            in ("common_budget_robustness", "common_budget_diagnostic")
-        )
-        result["not_paper_reproduction"] = bool(
-            result["config_extension_active"]
-            or result["diagnostic_profile_active"]
-            or condition_status != "paper_reproduction_condition"
         )
         result["condition_status"] = self.condition_status
         result["corruption_protocol_source"] = (
@@ -1965,97 +1444,13 @@ class ExperimentConfig:
         result["reporting_rule_verified"] = bool(
             reporting is not None and reporting.verified
         )
-        if self.run_purpose == "research_benchmark":
-            # Golden fixtures belong exclusively to strict/paper diagnostics;
-            # the practical benchmark neither loads nor requires them.
-            result["corruption_fixture_id"] = None
-            result["corruption_fixture_verified"] = False
-        else:
-            result["corruption_fixture_id"] = self.corruption_fixture_id
-            result["corruption_fixture_verified"] = bool(
-                self.corruption_fixture_id is not None
-                and self._corruption_fixture_is_verified()
-            )
-        # These are runtime/certificate facts, not configuration claims.  A
-        # config is serialized before the dataset, worktree and receipts are
-        # verified, so it must never self-attest them.  The manifest layer may
-        # promote each field only after validating its bound executable receipt.
-        result["condition_certificate_verified"] = False
-        result["strict_runtime_fixture_verified"] = False
-        result["strict_environment_preflight_verified"] = False
-        result["save_resume_certificate_verified"] = False
-        result["audit_receipt_verified"] = False
-        result["repository_worktree_clean"] = False
-        result["dataset_hash_recorded"] = False
-        result["required_checkpoint_hashes_verified"] = False
         upstream_commit = UPSTREAM_COMMITS.get(self.algorithm)
-        result["source_commit_pinned"] = bool(
-            isinstance(upstream_commit, str)
-            and len(upstream_commit) == 40
-            and all(character in "0123456789abcdef" for character in upstream_commit)
-        )
-        result["controller_seed_cohort_attested"] = bool(
-            getattr(self, "_controller_seed_cohort_attested", False)
-        )
-        result["final_audit_context_token"] = getattr(
-            self, "_final_audit_context_token", None
-        )
-        result["final_audit_receipt_sha256"] = getattr(
-            self, "_final_audit_receipt_sha256", None
-        )
-        eligibility_evidence_verified = bool(
-            self.run_purpose == "final_benchmark"
-            and self.benchmark_seed_set == STRICT_FINAL_SEEDS
-            and result["controller_seed_cohort_attested"]
-            and result["learner_parity_verified"]
-            and result["reporting_rule_verified"]
-            and result["condition_certificate_verified"]
-            and result["strict_runtime_fixture_verified"]
-            and result["strict_environment_preflight_verified"]
-            and result["save_resume_certificate_verified"]
-            and result["audit_receipt_verified"]
-            and result["repository_worktree_clean"]
-            and result["dataset_hash_recorded"]
-            and result["required_checkpoint_hashes_verified"]
-            and result["source_commit_pinned"]
-            and not result["config_extension_active"]
-            and not result["diagnostic_profile_active"]
-            and (
-                self.corruption == "clean"
-                or result["corruption_fixture_verified"]
-            )
-        )
-        result["paper_reproduction_eligible"] = bool(
-            eligibility_evidence_verified
-            and condition_status == "paper_reproduction_condition"
-        )
-        result["common_benchmark_eligible"] = bool(
-            eligibility_evidence_verified
-            and condition_status == "benchmark_transfer"
-        )
-        result["publication_eligible"] = bool(
-            result["paper_reproduction_eligible"]
-            or result["common_benchmark_eligible"]
-        )
         result["oracle_information"] = (
             self.calibration_mask_mode == "oracle_exclude_corrupted"
         )
         result["upstream_commit"] = upstream_commit
-        result["score_semantics"] = (
-            LEGACY_SCORE_SEMANTICS
-            if self.protocol == LEGACY_PROTOCOL
-            else LOCAL_SCORE_SEMANTICS
-        )
-        # This field classifies score comparability only.  The stricter
-        # algorithm/parity qualifications remain in main_table_eligible and
-        # the publication eligibility fields above.  In particular, an
-        # explicitly acknowledged Gymnasium-v4 run must never be aggregated
-        # as a D4RL legacy-protocol research score merely because its
-        # run_purpose says research_benchmark.
-        result["benchmark_eligible"] = bool(
-            self.run_purpose in ("research_benchmark", "final_benchmark")
-            and self.protocol == LEGACY_PROTOCOL
-        )
+        result["score_semantics"] = SCORE_SEMANTICS
+        result["benchmark_eligible"] = True
         if self.algorithm == "wsrl":
             result.update(
                 {
@@ -2135,7 +1530,7 @@ class ExperimentConfig:
 
     @property
     def condition_status(self) -> str:
-        if self.run_purpose == "research_benchmark":
+        if self.is_research_suite:
             role = BASELINE_REPRODUCTION_REGISTRY[self.algorithm].benchmark_role
             return {
                 "main": "research_benchmark_condition",
@@ -2182,16 +1577,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-env-seed", type=int)
     parser.add_argument("--eval-seed", type=int)
     parser.add_argument(
-        "--benchmark-seed-set",
-        type=int,
-        nargs="+",
-        default=(),
-        help=(
-            "controller-declared seed cohort; strict final runs require the "
-            "ordered set 0 1 2 3 4"
-        ),
-    )
-    parser.add_argument(
         "--implementation-profile",
         "--algorithm-profile",
         dest="implementation_profile",
@@ -2203,21 +1588,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=SUITE_PROFILES,
         default="common_budget_robustness",
     )
-    parser.add_argument("--run-purpose", choices=RUN_PURPOSES, default="diagnostic")
-    parser.add_argument(
-        "--protocol",
-        choices=PROTOCOLS,
-        default=DEFAULT_PROTOCOL,
-        help=(
-            "rpex_d4rl_v2_legacy for exact reproduction, or "
-            "local_gymnasium_v4_diagnostic for a non-benchmark local runtime"
-        ),
-    )
-    parser.add_argument(
-        "--allow-diagnostic-protocol",
-        action="store_true",
-        help="required acknowledgement for the non-benchmark Gymnasium protocol",
-    )
     parser.add_argument(
         "--allow-legacy-checkpoint-without-fingerprint",
         action="store_true",
@@ -2225,10 +1595,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default="results")
     parser.add_argument(
         "--dataset-dir",
-        help=(
-            "D4RL dataset directory; passed to pinned D4RL in legacy mode and "
-            "read directly in local Gymnasium mode"
-        ),
+        help="directory containing the D4RL-v2 HDF5 datasets",
     )
     parser.add_argument("--checkpoint", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -2316,10 +1683,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         default="tanh_gaussian",
         help="bounded default, or unsafe reproduction-only PEX/RPEX Gaussian",
-    )
-    parser.add_argument(
-        "--evaluation-mode",
-        choices=("deterministic_diagnostic", "method_faithful", "both"),
     )
     parser.add_argument(
         "--online-replay-profile", choices=ONLINE_REPLAY_PROFILES,
@@ -2485,14 +1848,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
             DeprecationWarning,
             stacklevel=2,
         )
-    config = ExperimentConfig(**vars(args))
-    if config.protocol == LOCAL_PROTOCOL and not config.allow_diagnostic_protocol:
-        raise ValueError(
-            "The local Gymnasium protocol is diagnostic-only. Re-run with "
-            "--allow-diagnostic-protocol to acknowledge that it is not a "
-            "strict D4RL benchmark result."
-        )
-    return config
+    return ExperimentConfig(**vars(args))
 
 
 def default_attack_checkpoint(env_name: str) -> Optional[Path]:
