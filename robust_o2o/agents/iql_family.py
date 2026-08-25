@@ -244,7 +244,7 @@ class IQLFamilyAgent(BaseAgent):
         states: torch.Tensor,
         evaluate: bool,
         return_components: bool = False,
-        evaluation_mode: str = "deterministic_diagnostic",
+        evaluation_mode: str = "deterministic",
     ):
         if self.offline_actor is None:
             raise RuntimeError("begin_online() must be called before policy expansion")
@@ -252,7 +252,7 @@ class IQLFamilyAgent(BaseAgent):
         evaluation_profile = self.config.evaluation_policy_profile
         method_faithful = evaluate and (
             evaluation_profile == "official_code_epsilon_switching"
-            and evaluation_mode != "deterministic_diagnostic"
+            and evaluation_mode != "deterministic"
         )
         if method_faithful:
             if isinstance(self.actor, DeterministicPolicy):
@@ -307,7 +307,7 @@ class IQLFamilyAgent(BaseAgent):
         self,
         state: torch.Tensor,
         evaluate: bool = False,
-        evaluation_mode: str = "deterministic_diagnostic",
+        evaluation_mode: str = "deterministic",
     ) -> torch.Tensor:
         single = state.ndim == 1
         states = state.unsqueeze(0) if single else state

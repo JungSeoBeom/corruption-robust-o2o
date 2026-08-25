@@ -5,7 +5,7 @@ from typing import Iterable, Mapping
 
 import numpy as np
 
-from .config import LEGACY_PROTOCOL, LEGACY_SCORE_SEMANTICS
+from .config import DEFAULT_PROTOCOL, SCORE_SEMANTICS
 from .fidelity import (
     BASELINE_REPRODUCTION_REGISTRY,
     COMMON_BENCHMARK_REPORTING_RULE,
@@ -170,6 +170,8 @@ DIAGNOSTIC_SCORE_SEMANTICS = frozenset(
         "diagnostic_scaled",
     }
 )
+_HISTORICAL_LEGACY_PROTOCOL = "rpex_d4rl_v2_legacy"
+_HISTORICAL_LEGACY_SCORE_SEMANTICS = "d4rl_normalized_return"
 CALQL_FAIRNESS_FIELDS = (
     "requested_online_steps",
     "actual_online_steps",
@@ -183,12 +185,10 @@ CALQL_FAIRNESS_FIELDS = (
 def classify_score_semantics(
     metadata: Mapping[str, object],
 ) -> tuple[str, bool]:
-    """Return the declared score meaning and fail-closed benchmark eligibility.
+    """Return declared score semantics and aggregation eligibility.
 
-    A numeric score is never inspected.  Local Gymnasium runs are diagnostic
-    regardless of their requested purpose, while a research score requires all
-    three explicit pieces of provenance: legacy protocol, D4RL semantics, and
-    an affirmative eligibility flag for a research or audited-final run.
+    Historical manifests remain readable, while new runs use one fixed
+    Gymnasium/MuJoCo-v4 protocol and one D4RL-reference score definition.
     """
 
     protocol = str(
@@ -198,17 +198,26 @@ def classify_score_semantics(
         )
     )
     declared = metadata.get("score_semantics")
-    if protocol != LEGACY_PROTOCOL:
+    if protocol == DEFAULT_PROTOCOL:
+        if declared != SCORE_SEMANTICS:
+            return str(declared or "unknown_score"), False
+        declared_eligible = metadata.get("benchmark_eligible", True)
+        eligible = not isinstance(declared_eligible, (bool, np.bool_)) or bool(
+            declared_eligible
+        )
+        return SCORE_SEMANTICS, eligible
+
+    if protocol != _HISTORICAL_LEGACY_PROTOCOL:
         if declared in DIAGNOSTIC_SCORE_SEMANTICS:
             return str(declared), False
         # The local protocol itself is sufficient to label the scale as
         # diagnostic, but never to make it benchmark eligible.
         if "gymnasium" in protocol or protocol == "gymnasium_v4_diagnostic":
             return "diagnostic_d4rl_reference_scaled_return", False
-        return "unknown_legacy_score", False
+        return "unknown_score", False
 
-    if declared != LEGACY_SCORE_SEMANTICS:
-        return str(declared or "unknown_legacy_score"), False
+    if declared != _HISTORICAL_LEGACY_SCORE_SEMANTICS:
+        return str(declared or "unknown_score"), False
     declared_eligible = metadata.get("benchmark_eligible")
     explicitly_eligible = isinstance(
         declared_eligible, (bool, np.bool_)
@@ -218,7 +227,7 @@ def classify_score_semantics(
         and metadata.get("run_purpose")
         in ("research_benchmark", "final_benchmark")
     )
-    return LEGACY_SCORE_SEMANTICS, eligible
+    return _HISTORICAL_LEGACY_SCORE_SEMANTICS, eligible
 
 
 def validate_calql_completion_accounting(
@@ -1485,13 +1494,19 @@ def write_reporting_outputs(
 
     frame = _ensure_classification_columns(frame)
     benchmark_score_contract = (
-        (frame["protocol"] == LEGACY_PROTOCOL)
-        & (frame["score_semantics"] == LEGACY_SCORE_SEMANTICS)
-        & frame["benchmark_eligible"].fillna(False).astype(bool)
+        (
+            (frame["protocol"] == DEFAULT_PROTOCOL)
+            & (frame["score_semantics"] == SCORE_SEMANTICS)
+        )
+        | (
+            (frame["protocol"] == _HISTORICAL_LEGACY_PROTOCOL)
+            & (frame["score_semantics"] == _HISTORICAL_LEGACY_SCORE_SEMANTICS)
+        )
     )
+    benchmark_score_contract &= frame["benchmark_eligible"].fillna(False).astype(bool)
     research_rows = (
         frame[
-            (frame["run_purpose"] == "research_benchmark")
+            (frame["run_purpose"].isin(("experiment", "research_benchmark")))
             & (frame["run_status"] == "completed")
             & benchmark_score_contract
         ]

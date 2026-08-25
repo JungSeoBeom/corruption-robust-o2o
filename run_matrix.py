@@ -16,30 +16,17 @@ from robust_o2o.config import (
     BENCHMARK_ENVS,
     CORRUPTION_MODES,
     CORRUPTION_TARGETS,
-    DEFAULT_PROTOCOL,
-    LOCAL_PROTOCOL,
-    LEGACY_LOCAL_PROTOCOL_ALIAS,
-    PROTOCOLS,
-    RESEARCH_BENCHMARK_PROTOCOL_ERROR,
     normalize_env_name,
 )
 from robust_o2o.fidelity import (
     IMPLEMENTATION_PROFILES,
     MAIN_BASELINES,
     ONLINE_CORRUPTION_SCALE_PROFILES,
-    RUN_PURPOSES,
-    STRICT_FINAL_SEEDS,
-    STRICT_FINAL_TASKS,
     SUITE_PROFILES,
-)
-from robust_o2o.final_gate import (
-    FinalAuditGateError,
-    ResearchLabelContractError,
-    require_final_benchmark_audit,
-    validate_research_label_contract,
 )
 from robust_o2o.launcher_utils import (
     CHILD_IDENTITY_OPTIONS,
+    REMOVED_LAUNCH_OPTIONS,
     canonical_algorithms,
     passthrough_conflicts,
 )
@@ -56,7 +43,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--algorithms",
         nargs="+",
-        default=list(MAIN_BASELINES),
         help="algorithm names separated by commas, spaces, or both",
     )
     parser.add_argument(
@@ -72,23 +58,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--targets",
         type=_csv,
-        default=["observations", "actions", "rewards", "dynamics"],
+        default=["observations", "actions", "rewards", "dynamics", "mixed"],
     )
     parser.add_argument("--seeds", type=_csv, default=["0"])
     parser.add_argument("--corruption-ranges", type=_csv, default=["1.0"])
     parser.add_argument("--stage", choices=("offline", "online", "both"), default="both")
-    parser.add_argument("--protocol", choices=PROTOCOLS, default=DEFAULT_PROTOCOL)
     parser.add_argument("--implementation-profile", choices=IMPLEMENTATION_PROFILES)
     parser.add_argument(
         "--suite-profile", choices=SUITE_PROFILES,
         default="common_budget_robustness",
     )
-    parser.add_argument("--run-purpose", choices=RUN_PURPOSES, default="diagnostic")
     parser.add_argument(
         "--online-corruption-scale-profile",
         choices=ONLINE_CORRUPTION_SCALE_PROFILES,
     )
-    parser.add_argument("--allow-diagnostic-protocol", action="store_true")
     parser.add_argument("--output-dir", default="results")
     parser.add_argument("--comparison-name")
     parser.add_argument("--dry-run", action="store_true")
@@ -104,7 +87,10 @@ def commands(
     script = Path(__file__).resolve().parent / "run_experiment.py"
     scale_profile = args.online_corruption_scale_profile or (
         "rpex_official_code"
-        if args.suite_profile in ("method_fidelity", "primary_research_benchmark")
+        if args.suite_profile in (
+            "method_fidelity",
+            "primary_research_benchmark",
+        )
         else "dataset_std_scaled_extension"
     )
     for algorithm, env_name, corruption, seed in itertools.product(
@@ -128,12 +114,8 @@ def commands(
                 seed,
                 "--stage",
                 args.stage,
-                "--protocol",
-                args.protocol,
                 "--suite-profile",
                 args.suite_profile,
-                "--run-purpose",
-                args.run_purpose,
                 "--online-corruption-scale-profile",
                 scale_profile,
                 "--corruption-range",
@@ -142,18 +124,10 @@ def commands(
                 args.output_dir,
                 "--comparison-name",
                 comparison_name,
-                *(["--allow-diagnostic-protocol"] if args.allow_diagnostic_protocol else []),
                 *passthrough,
             ]
             if args.implementation_profile:
                 command.extend(("--implementation-profile", args.implementation_profile))
-            if args.run_purpose == "final_benchmark":
-                command.extend(
-                    (
-                        "--benchmark-seed-set",
-                        *(str(seed) for seed in STRICT_FINAL_SEEDS),
-                    )
-                )
             yield command
 
 
@@ -162,11 +136,12 @@ def _validate_args(
     args: argparse.Namespace,
     passthrough: list[str],
 ) -> None:
-    if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
-        args.protocol = LOCAL_PROTOCOL
-    if args.run_purpose == "research_benchmark" and args.protocol == LOCAL_PROTOCOL:
-        parser.error(RESEARCH_BENCHMARK_PROTOCOL_ERROR)
-
+    if args.algorithms is None:
+        args.algorithms = list(
+            MAIN_BASELINES
+            if args.suite_profile == "research_benchmark"
+            else ALGORITHMS
+        )
     args.algorithms = canonical_algorithms(args.algorithms, ALGORITHM_ALIASES)
 
     unknown_algorithms = sorted(set(args.algorithms) - set(ALGORITHMS))
@@ -201,12 +176,11 @@ def _validate_args(
             "non-clean corruptions require at least one --corruption-ranges value"
         )
 
-    parsed_seeds: list[int] = []
     if not args.seeds:
         parser.error("--seeds cannot be empty")
     for seed in args.seeds:
         try:
-            parsed_seeds.append(int(seed))
+            int(seed)
         except ValueError:
             parser.error(f"invalid seed: {seed!r}")
 
@@ -216,20 +190,9 @@ def _validate_args(
             "these child identity/provenance options cannot be overridden: "
             + ", ".join(conflicts)
         )
-    try:
-        validate_research_label_contract(
-            args.run_purpose,
-            args.suite_profile,
-            args.algorithms,
-        )
-    except ResearchLabelContractError as exc:
-        parser.error(str(exc))
-
-    if args.protocol == LOCAL_PROTOCOL and not args.allow_diagnostic_protocol:
-        parser.error(
-            "the local Gymnasium protocol is diagnostic-only; pass "
-            "--allow-diagnostic-protocol to acknowledge this"
-        )
+    removed = passthrough_conflicts(passthrough, REMOVED_LAUNCH_OPTIONS)
+    if removed:
+        parser.error("these options were removed: " + ", ".join(removed))
     for value in args.corruption_ranges:
         try:
             parsed = float(value)
@@ -238,52 +201,6 @@ def _validate_args(
         if parsed < 0.0:
             parser.error("--corruption-ranges cannot contain negative values")
 
-    if args.run_purpose == "final_benchmark":
-        if tuple(parsed_seeds) != STRICT_FINAL_SEEDS:
-            parser.error("final_benchmark requires exactly ordered seeds 0,1,2,3,4")
-        if args.protocol != DEFAULT_PROTOCOL:
-            parser.error(
-                "final_benchmark requires rpex_d4rl_v2_legacy; no local fallback"
-            )
-        if args.stage != "both":
-            parser.error("final_benchmark requires --stage both")
-        if args.implementation_profile not in (None, "official_code_reference"):
-            parser.error(
-                "final_benchmark requires --implementation-profile "
-                "official_code_reference"
-            )
-        if args.online_corruption_scale_profile not in (
-            None,
-            "rpex_official_code",
-        ):
-            parser.error(
-                "final_benchmark requires --online-corruption-scale-profile "
-                "rpex_official_code"
-            )
-        if any(float(value) != 1.0 for value in args.corruption_ranges):
-            parser.error("final_benchmark requires exactly --corruption-ranges 1.0")
-        unsupported_tasks = sorted(set(args.envs) - set(STRICT_FINAL_TASKS))
-        if unsupported_tasks:
-            parser.error(
-                "final_benchmark permits only medium-replay-v2 tasks: "
-                + ", ".join(unsupported_tasks)
-            )
-        if (
-            "adversarial" in args.corruptions
-            and set(args.targets) - {"observations"}
-        ):
-            parser.error(
-                "final_benchmark adversarial corruption is certified only for "
-                "the observations target"
-            )
-        if (
-            "random" in args.corruptions
-            and set(args.targets) - {"observations", "actions", "rewards", "dynamics"}
-        ):
-            parser.error(
-                "final_benchmark random corruption requires certified individual "
-                "targets (observations/actions/rewards/dynamics)"
-            )
 
 
 def main() -> int:
@@ -297,17 +214,6 @@ def main() -> int:
     generated_commands = list(commands(args, passthrough, comparison_name))
     if not generated_commands:
         parser.error("the resolved matrix contains no runs")
-    try:
-        require_final_benchmark_audit(
-            args.run_purpose,
-            dry_run=args.dry_run,
-        )
-    except FinalAuditGateError as exc:
-        print(f"FINAL_BENCHMARK_AUDIT_GATE_FAILED: {exc}", file=sys.stderr)
-        return 2
-    if args.run_purpose in ("smoke", "diagnostic"):
-        print("NOT A PAPER REPRODUCTION RUN", flush=True)
-        print("NOT PUBLICATION-ELIGIBLE", flush=True)
     failures = 0
     for index, command in enumerate(generated_commands, start=1):
         print(f"[{index}] {shlex.join(command)}", flush=True)

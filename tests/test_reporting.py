@@ -11,7 +11,7 @@ from robust_o2o.fidelity import (
     MAIN_BASELINES,
     REPORTING_RULES,
 )
-from robust_o2o.config import LEGACY_PROTOCOL, LEGACY_SCORE_SEMANTICS
+from robust_o2o.config import DEFAULT_PROTOCOL, SCORE_SEMANTICS
 from robust_o2o.reporting import (
     CALQL_ONLINE_BUDGET_SEMANTICS,
     PER_SEED_COLUMNS,
@@ -57,8 +57,8 @@ def evaluation_frame(
                 "condition_certificate_verified": True,
                 "condition_status": "paper_reproduction_condition",
                 "run_purpose": "final_benchmark",
-                "protocol": LEGACY_PROTOCOL,
-                "score_semantics": LEGACY_SCORE_SEMANTICS,
+                "protocol": DEFAULT_PROTOCOL,
+                "score_semantics": SCORE_SEMANTICS,
                 "benchmark_eligible": True,
                 "planned_online_steps": 40_000,
                 "planned_offline_steps": 2_000_000,
@@ -95,8 +95,8 @@ def evaluation_frame(
                     "condition_certificate_verified": True,
                     "condition_status": "paper_reproduction_condition",
                     "run_purpose": "final_benchmark",
-                    "protocol": LEGACY_PROTOCOL,
-                    "score_semantics": LEGACY_SCORE_SEMANTICS,
+                    "protocol": DEFAULT_PROTOCOL,
+                    "score_semantics": SCORE_SEMANTICS,
                     "benchmark_eligible": True,
                     "planned_online_steps": 40_000,
                     "planned_offline_steps": 2_000_000,
@@ -119,18 +119,18 @@ class ReportingRuleTest(unittest.TestCase):
         self.assertEqual(
             classify_score_semantics(
                 {
-                    "protocol": LEGACY_PROTOCOL,
-                    "score_semantics": LEGACY_SCORE_SEMANTICS,
+                    "protocol": DEFAULT_PROTOCOL,
+                    "score_semantics": SCORE_SEMANTICS,
                     "benchmark_eligible": True,
                     "run_purpose": "research_benchmark",
                 }
             ),
-            (LEGACY_SCORE_SEMANTICS, True),
+            (SCORE_SEMANTICS, True),
         )
         diagnostic = classify_score_semantics(
             {
                 "protocol": "local_gymnasium_v4_diagnostic",
-                "score_semantics": LEGACY_SCORE_SEMANTICS,
+                "score_semantics": SCORE_SEMANTICS,
                 "benchmark_eligible": True,
                 "run_purpose": "research_benchmark",
             }
@@ -142,22 +142,22 @@ class ReportingRuleTest(unittest.TestCase):
         self.assertEqual(
             classify_score_semantics(
                 {
-                    "protocol": LEGACY_PROTOCOL,
+                    "protocol": DEFAULT_PROTOCOL,
                     "run_purpose": "research_benchmark",
                 }
             ),
-            ("unknown_legacy_score", False),
+            ("unknown_score", False),
         )
         self.assertEqual(
             classify_score_semantics(
                 {
                     "protocol": "unknown_legacy_protocol",
-                    "score_semantics": LEGACY_SCORE_SEMANTICS,
+                    "score_semantics": SCORE_SEMANTICS,
                     "benchmark_eligible": True,
                     "run_purpose": "research_benchmark",
                 }
             ),
-            ("unknown_legacy_score", False),
+            ("unknown_score", False),
         )
 
     def test_calql_completion_accounting_contract(self):
@@ -439,7 +439,7 @@ class ReportingRuleTest(unittest.TestCase):
         self.assertEqual(research_summary["seed_score"].tolist(), [3.0])
         self.assertEqual(
             research_summary["score_semantics"].tolist(),
-            [LEGACY_SCORE_SEMANTICS],
+            [SCORE_SEMANTICS],
         )
         self.assertEqual(diagnostic_summary["mean"].tolist(), [103.0])
         self.assertEqual(
@@ -450,7 +450,7 @@ class ReportingRuleTest(unittest.TestCase):
         self.assertEqual(
             set(common_summary["score_semantics"]),
             {
-                LEGACY_SCORE_SEMANTICS,
+                SCORE_SEMANTICS,
                 "diagnostic_d4rl_reference_scaled_return",
             },
         )

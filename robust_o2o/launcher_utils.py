@@ -4,10 +4,18 @@ import re
 from collections.abc import Iterable, Mapping
 
 
+REMOVED_LAUNCH_OPTIONS = frozenset(
+    {
+        "--allow-diagnostic-protocol",
+        "--benchmark-seed-set",
+        "--protocol",
+        "--run-purpose",
+    }
+)
+
 CHILD_IDENTITY_OPTIONS = frozenset(
     {
         "--algorithm",
-        "--benchmark-seed-set",
         "--comparison-name",
         "--corruption",
         "--corruption-target",
@@ -16,8 +24,6 @@ CHILD_IDENTITY_OPTIONS = frozenset(
         "--algorithm-profile",
         "--online-corruption-scale-profile",
         "--output-dir",
-        "--protocol",
-        "--run-purpose",
         "--seed",
         "--stage",
         "--suite-profile",

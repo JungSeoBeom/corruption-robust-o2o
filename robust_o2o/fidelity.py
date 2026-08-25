@@ -56,6 +56,7 @@ SUITE_PROFILES = (
     "common_budget_robustness",
 )
 RUN_PURPOSES = (
+    "experiment",
     "smoke",
     "diagnostic",
     "research_benchmark",
@@ -92,7 +93,7 @@ ONLINE_REPLAY_PROFILES = (
 EVALUATION_POLICY_PROFILES = (
     "official_code_epsilon_switching",
     "paper_greedy_highest_weight",
-    "deterministic_diagnostic",
+    "deterministic",
 )
 ATTACK_TIMINGS = (
     "official_code_post_transition_replay_poisoning",

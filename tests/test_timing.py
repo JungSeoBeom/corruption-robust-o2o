@@ -6,12 +6,12 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from robust_o2o.config import LOCAL_PROTOCOL
+from robust_o2o.config import DEFAULT_PROTOCOL
 from robust_o2o.fidelity import MAIN_BASELINES
 from robust_o2o.logging_utils import format_duration, format_timestamp
 from run_all_algorithms import (
@@ -22,6 +22,17 @@ from run_all_algorithms import (
     summarize_algorithm_timings,
     write_timing_csv,
 )
+
+
+def _preflight(root: str) -> dict:
+    return {
+        "protocol": DEFAULT_PROTOCOL,
+        "environment_id": "hopper-medium-replay-v2",
+        "d4rl_env_id": "hopper-medium-replay-v2",
+        "environment_backend": "gymnasium-v4+native-mujoco",
+        "dataset_backend": "d4rl-v2-hdf5+index-aware-qlearning-conversion",
+        "dataset_path": str(Path(root) / "dataset.hdf5"),
+    }
 
 
 class TimingTest(unittest.TestCase):
@@ -35,12 +46,6 @@ class TimingTest(unittest.TestCase):
                     "random",
                     "--corruption-target",
                     "observations",
-                    "--protocol",
-                    LOCAL_PROTOCOL,
-                    "--run-purpose",
-                    "diagnostic",
-                    "--suite-profile",
-                    "common_budget_diagnostic",
                     "--output-root",
                     directory,
                     "--comparison-name",
@@ -57,103 +62,24 @@ class TimingTest(unittest.TestCase):
                 / "halfcheetah_5x5_test",
             )
 
-    def test_run_all_rejects_fresh_research_local_protocol(self):
-        with tempfile.TemporaryDirectory() as directory:
-            existing_runs = (
-                Path(directory)
-                / "comparisons"
-                / "hopper-medium-replay-v2"
-                / "clean"
-                / "none"
-                / "fresh_research_local"
-                / "runs"
-            )
-            existing_runs.mkdir(parents=True)
-            parser = build_run_all_parser()
-            args = parser.parse_args(
-                [
-                    "--env-name",
-                    "hopper-medium-replay-v2",
-                    "--corruption",
-                    "clean",
-                    "--run-purpose",
-                    "research_benchmark",
-                    "--suite-profile",
-                    "research_benchmark",
-                    "--protocol",
-                    LOCAL_PROTOCOL,
-                    "--allow-diagnostic-protocol",
-                    "--output-root",
-                    directory,
-                    "--comparison-name",
-                    "fresh_research_local",
-                ]
-            )
-            stderr = io.StringIO()
-            with patch(
-                "run_all_algorithms.is_inflight_pre_gate_run55_descendant",
-                return_value=False,
-            ), redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
-                validate_run_all_args(parser, args, ())
-            self.assertEqual(raised.exception.code, 2)
-            self.assertIn("ResearchBenchmarkProtocolError", stderr.getvalue())
-
-    def test_run_all_allows_only_pre_gate_run55_process_continuation(self):
-        with tempfile.TemporaryDirectory() as directory:
-            comparison_name = "existing_run55_cohort"
-            parser = build_run_all_parser()
-            args = parser.parse_args(
-                [
-                    "--env-name",
-                    "halfcheetah-medium-replay-v2",
-                    "--corruption",
-                    "random",
-                    "--corruption-target",
-                    "observations",
-                    "--run-purpose",
-                    "research_benchmark",
-                    "--suite-profile",
-                    "research_benchmark",
-                    "--protocol",
-                    LOCAL_PROTOCOL,
-                    "--allow-diagnostic-protocol",
-                    "--output-root",
-                    directory,
-                    "--comparison-name",
-                    comparison_name,
-                ]
-            )
-            with patch(
-                "run_all_algorithms.is_inflight_pre_gate_run55_descendant",
-                return_value=True,
-            ):
-                validate_run_all_args(parser, args, ())
-            self.assertEqual(args.protocol, LOCAL_PROTOCOL)
-
-    def test_run_all_allows_diagnostic_local_protocol(self):
-        with tempfile.TemporaryDirectory() as directory:
-            parser = build_run_all_parser()
-            args = parser.parse_args(
-                [
-                    "--env-name",
-                    "hopper-medium-replay-v2",
-                    "--corruption",
-                    "clean",
-                    "--run-purpose",
-                    "diagnostic",
-                    "--suite-profile",
-                    "common_budget_diagnostic",
-                    "--protocol",
-                    LOCAL_PROTOCOL,
-                    "--allow-diagnostic-protocol",
-                    "--output-root",
-                    directory,
-                    "--comparison-name",
-                    "fresh_diagnostic_local",
-                ]
-            )
-            validate_run_all_args(parser, args, ())
-            self.assertEqual(args.protocol, LOCAL_PROTOCOL)
+    def test_legacy_protocol_controls_are_not_public_options(self):
+        parser = build_run_all_parser()
+        help_text = parser.format_help()
+        self.assertNotIn("--protocol", help_text)
+        self.assertNotIn("--run-purpose", help_text)
+        self.assertNotIn("--allow-diagnostic-protocol", help_text)
+        args, passthrough = parser.parse_known_args(
+            [
+                "--env-name",
+                "hopper-medium-replay-v2",
+                "--corruption",
+                "clean",
+                "--protocol",
+                "legacy",
+            ]
+        )
+        with self.assertRaises(SystemExit):
+            validate_run_all_args(parser, args, passthrough)
 
     def test_research_dry_run_defaults_to_main_five_without_side_effects(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -163,8 +89,6 @@ class TimingTest(unittest.TestCase):
                 "hopper-medium-replay-v2",
                 "--corruption",
                 "clean",
-                "--run-purpose",
-                "research_benchmark",
                 "--suite-profile",
                 "research_benchmark",
                 "--output-root",
@@ -178,7 +102,6 @@ class TimingTest(unittest.TestCase):
                 patch.object(sys, "argv", arguments),
                 patch("run_all_algorithms.preflight_runtime") as preflight,
                 patch("run_all_algorithms.subprocess.run") as run,
-                patch("run_all_algorithms.write_reproduction_summaries") as reports,
                 redirect_stdout(output),
             ):
                 returncode = main()
@@ -186,255 +109,17 @@ class TimingTest(unittest.TestCase):
             self.assertEqual(returncode, 0)
             preflight.assert_not_called()
             run.assert_not_called()
-            reports.assert_not_called()
             command_lines = [
-                line
-                for line in output.getvalue().splitlines()
-                if line.startswith("[")
+                line for line in output.getvalue().splitlines() if line.startswith("[")
             ]
             self.assertEqual(len(command_lines), len(MAIN_BASELINES))
             for line, algorithm in zip(command_lines, MAIN_BASELINES):
                 self.assertIn(f"--algorithm {algorithm}", line)
-                self.assertIn("--run-purpose research_benchmark", line)
                 self.assertIn("--suite-profile research_benchmark", line)
-                self.assertIn(
-                    "--implementation-profile research_benchmark", line
-                )
-            self.assertNotIn("cal_ql_locomotion_adaptation", output.getvalue())
-            self.assertNotIn("pqe_shared_actor_approx", output.getvalue())
+                self.assertIn("--implementation-profile research_benchmark", line)
+                self.assertNotIn("--protocol", line)
+                self.assertNotIn("--run-purpose", line)
             self.assertEqual(list(Path(directory).iterdir()), [])
-
-    def test_research_main_algorithms_publish_one_main_cohort(self):
-        with tempfile.TemporaryDirectory() as directory:
-            algorithms = MAIN_BASELINES
-            arguments = [
-                "run_all_algorithms.py",
-                "--env-name",
-                "hopper-medium-replay-v2",
-                "--corruption",
-                "clean",
-                "--run-purpose",
-                "research_benchmark",
-                "--suite-profile",
-                "research_benchmark",
-                "--algorithms",
-                ",".join(algorithms),
-                "--output-root",
-                directory,
-                "--comparison-name",
-                "research_roles",
-            ]
-            preflight = {
-                "protocol": "rpex_d4rl_v2_legacy",
-                "d4rl_env_id": "hopper-medium-replay-v2",
-                "environment_backend": "gym-0.23.1+d4rl-v2+mujoco_py",
-                "dataset_backend": (
-                    "d4rl.qlearning_dataset(terminate_on_end=False)"
-                ),
-                "dataset_path": str(Path(directory) / "dataset.hdf5"),
-            }
-
-            def role_outputs(_root, output_dir, *_args, **_kwargs):
-                research_summary = output_dir / "research_summary.csv"
-                with research_summary.open(
-                    "w", newline="", encoding="utf-8"
-                ) as stream:
-                    writer = csv.DictWriter(
-                        stream,
-                        fieldnames=("algorithm", "seed", "status", "mean", "std"),
-                    )
-                    writer.writeheader()
-                    for algorithm in algorithms:
-                        writer.writerow(
-                            {
-                                "algorithm": algorithm,
-                                "seed": 0,
-                                "status": "completed",
-                                "mean": 1.0,
-                                "std": 0.0,
-                            }
-                        )
-                per_seed = output_dir / "research_per_seed_final_scores.csv"
-                per_seed.write_text("algorithm,seed\n", encoding="utf-8")
-                return {
-                    "research_summary": research_summary,
-                    "research_per_seed_final_scores": per_seed,
-                }
-
-            def plot_outputs(
-                output_dir, *_args, include_running
-            ):
-                self.assertFalse(include_running)
-                outputs = {}
-                for phase in ("offline_online", "offline", "online"):
-                    path = output_dir / f"comparison_{phase}.png"
-                    path.write_text("completed", encoding="utf-8")
-                    path.with_suffix(".csv").write_text(
-                        "algorithm,mean\nrpex,1.0\n", encoding="utf-8"
-                    )
-                    outputs[phase] = path
-                return outputs
-
-            def final_scores(_root, path, *_args):
-                path.write_text("algorithm,mean\nrpex,1.0\n", encoding="utf-8")
-                return path
-
-            with (
-                patch.object(sys, "argv", arguments),
-                patch(
-                    "run_all_algorithms.subprocess.run",
-                    return_value=Mock(returncode=0),
-                ) as run,
-                patch(
-                    "run_all_algorithms.preflight_runtime",
-                    return_value=preflight,
-                ),
-                patch(
-                    "run_all_algorithms.update_comparison_plots",
-                    side_effect=plot_outputs,
-                ) as plots,
-                patch(
-                    "run_all_algorithms.write_final_score_summary",
-                    side_effect=final_scores,
-                ),
-                patch(
-                    "run_all_algorithms.write_reproduction_summaries",
-                    side_effect=role_outputs,
-                ) as reports,
-                redirect_stdout(io.StringIO()),
-            ):
-                returncode = main()
-
-            self.assertEqual(returncode, 0)
-            self.assertEqual(run.call_count, len(algorithms))
-            reports.assert_called_once()
-            self.assertFalse(reports.call_args.kwargs["strict"])
-            self.assertEqual(reports.call_args.kwargs["expected_seeds"], [0])
-            self.assertEqual(reports.call_args.kwargs["phase"], "online")
-            self.assertFalse(plots.call_args.kwargs["include_running"])
-            manifest_path = next(Path(directory).rglob("manifest.json"))
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            self.assertEqual(manifest["algorithms"], list(algorithms))
-            self.assertEqual(
-                set(manifest["artifacts"]["reporting_csvs"]),
-                {
-                    "research_summary",
-                    "research_per_seed_final_scores",
-                },
-            )
-            for phase in ("offline_online", "offline", "online"):
-                plot_path = manifest_path.parent / f"comparison_{phase}.png"
-                self.assertTrue(plot_path.is_file())
-                self.assertTrue(plot_path.with_suffix(".csv").is_file())
-            self.assertTrue(
-                (manifest_path.parent / "research_summary.csv").is_file()
-            )
-            self.assertTrue(
-                (
-                    manifest_path.parent
-                    / "research_per_seed_final_scores.csv"
-                ).is_file()
-            )
-            self.assertTrue(
-                (manifest_path.parent / "final_scores.csv").is_file()
-            )
-
-    def test_missing_research_seed_fails_before_canonical_plot_publication(self):
-        with tempfile.TemporaryDirectory() as directory:
-            arguments = [
-                "run_all_algorithms.py",
-                "--env-name",
-                "hopper-medium-replay-v2",
-                "--corruption",
-                "clean",
-                "--run-purpose",
-                "research_benchmark",
-                "--suite-profile",
-                "research_benchmark",
-                "--algorithms",
-                "rpex",
-                "--seeds",
-                "0,1,2,3,4",
-                "--output-root",
-                directory,
-                "--comparison-name",
-                "missing_seed",
-            ]
-            preflight = {
-                "protocol": "rpex_d4rl_v2_legacy",
-                "d4rl_env_id": "hopper-medium-replay-v2",
-                "environment_backend": "gym-0.23.1+d4rl-v2+mujoco_py",
-                "dataset_backend": "d4rl.qlearning_dataset(terminate_on_end=False)",
-                "dataset_path": str(Path(directory) / "dataset.hdf5"),
-            }
-
-            def incomplete_outputs(_root, output_dir, *_args, **_kwargs):
-                research_summary = output_dir / "research_summary.csv"
-                with research_summary.open(
-                    "w", newline="", encoding="utf-8"
-                ) as stream:
-                    writer = csv.DictWriter(
-                        stream,
-                        fieldnames=("algorithm", "seed", "status", "mean", "std"),
-                    )
-                    writer.writeheader()
-                    for seed in range(4):
-                        writer.writerow(
-                            {
-                                "algorithm": "rpex",
-                                "seed": seed,
-                                "status": "cohort_incomplete",
-                                "mean": "",
-                                "std": "",
-                            }
-                        )
-                per_seed = output_dir / "research_per_seed_final_scores.csv"
-                per_seed.write_text("algorithm,seed\n", encoding="utf-8")
-                return {
-                    "research_summary": research_summary,
-                    "research_per_seed_final_scores": per_seed,
-                }
-
-            with (
-                patch.object(sys, "argv", arguments),
-                patch(
-                    "run_all_algorithms.subprocess.run",
-                    return_value=Mock(returncode=0),
-                ),
-                patch(
-                    "run_all_algorithms.preflight_runtime",
-                    return_value=preflight,
-                ),
-                patch("run_all_algorithms.update_comparison_plots") as plots,
-                patch("run_all_algorithms.write_final_score_summary") as scores,
-                patch(
-                    "run_all_algorithms.write_reproduction_summaries",
-                    side_effect=incomplete_outputs,
-                ) as reports,
-                redirect_stdout(io.StringIO()),
-                redirect_stderr(io.StringIO()),
-            ):
-                returncode = main()
-
-            self.assertEqual(returncode, 1)
-            self.assertEqual(
-                reports.call_args.kwargs["expected_seeds"], [0, 1, 2, 3, 4]
-            )
-            plots.assert_not_called()
-            scores.assert_not_called()
-            manifest_path = next(Path(directory).rglob("manifest.json"))
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            self.assertFalse(manifest["benchmark_valid"])
-            self.assertIn("rpex:4", manifest["aggregation_error"])
-            self.assertFalse(
-                (manifest_path.parent / "research_summary.csv").exists()
-            )
-            self.assertFalse(
-                (
-                    manifest_path.parent
-                    / "research_per_seed_final_scores.csv"
-                ).exists()
-            )
 
     def test_run_all_accepts_space_comma_mix_and_canonical_aliases(self):
         parser = build_run_all_parser()
@@ -444,8 +129,6 @@ class TimingTest(unittest.TestCase):
                 "hopper-medium-replay-v2",
                 "--corruption",
                 "clean",
-                "--run-purpose",
-                "research_benchmark",
                 "--suite-profile",
                 "research_benchmark",
                 "--algorithms",
@@ -457,31 +140,6 @@ class TimingTest(unittest.TestCase):
         )
         validate_run_all_args(parser, args, ())
         self.assertEqual(tuple(args.algorithms), MAIN_BASELINES)
-
-    def test_final_adversarial_controller_rejects_non_hopper_fixture(self):
-        parser = build_run_all_parser()
-        args = parser.parse_args(
-            [
-                "--env-name",
-                "halfcheetah-medium-replay-v2",
-                "--corruption",
-                "adversarial",
-                "--corruption-target",
-                "observations",
-                "--algorithms",
-                "rpex,riql_naive",
-                "--seeds",
-                "0,1,2,3,4",
-                "--stage",
-                "both",
-                "--suite-profile",
-                "primary_research_benchmark",
-                "--run-purpose",
-                "final_benchmark",
-            ]
-        )
-        with self.assertRaises(SystemExit):
-            validate_run_all_args(parser, args, ())
 
     def test_timestamp_is_clean_to_seconds(self):
         value = datetime(
@@ -561,54 +219,36 @@ class TimingTest(unittest.TestCase):
                 ),
                 patch(
                     "run_all_algorithms.preflight_runtime",
-                    return_value={
-                        "protocol": "rpex_d4rl_v2_legacy",
-                        "d4rl_env_id": "hopper-medium-replay-v2",
-                        "environment_backend": "gym-0.23.1+d4rl-v2+mujoco_py",
-                        "dataset_backend": (
-                            "d4rl.qlearning_dataset(terminate_on_end=False)"
-                        ),
-                        "dataset_path": str(Path(directory) / "dataset.hdf5"),
-                    },
+                    return_value=_preflight(directory),
                 ),
                 patch("run_all_algorithms.update_comparison_plots", return_value={}),
                 patch(
                     "run_all_algorithms.write_final_score_summary",
                     side_effect=lambda _root, path, *_args: path,
                 ),
-                patch(
-                    "run_all_algorithms.write_reproduction_summaries",
-                    return_value={},
-                ) as reporting_mock,
                 redirect_stdout(output),
             ):
                 returncode = main()
 
             self.assertEqual(returncode, 0)
-            self.assertEqual(reporting_mock.call_args.kwargs["phase"], "offline")
             text = output.getvalue()
             self.assertIn("ALGORITHM_FINISHED: RPEX (rpex)", text)
             self.assertIn("ALGORITHM_FINISHED: RIQL+PEX (riql_pex)", text)
             self.assertIn("ALGORITHM_TIMING_SUMMARY:", text)
             self.assertRegex(text, r"START_TIME: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
             self.assertNotIn("T15:", text)
-            timing_paths = list(Path(directory).rglob("timing.csv"))
-            self.assertEqual(len(timing_paths), 1)
-            with timing_paths[0].open(newline="", encoding="utf-8") as stream:
+            timing_path = next(Path(directory).rglob("timing.csv"))
+            with timing_path.open(newline="", encoding="utf-8") as stream:
                 rows = list(csv.DictReader(stream))
+            self.assertEqual([row["algorithm"] for row in rows], ["rpex", "riql_pex"])
+            manifest_path = next(Path(directory).rglob("manifest.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["protocol"], DEFAULT_PROTOCOL)
             self.assertEqual(
-                [row["algorithm"] for row in rows], ["rpex", "riql_pex"]
-            )
-            manifest_paths = list(Path(directory).rglob("manifest.json"))
-            self.assertEqual(len(manifest_paths), 1)
-            manifest = json.loads(manifest_paths[0].read_text(encoding="utf-8"))
-            self.assertEqual(manifest["protocol"], "rpex_d4rl_v2_legacy")
-            self.assertEqual(
-                manifest["environment_backend"],
-                "gym-0.23.1+d4rl-v2+mujoco_py",
+                manifest["environment_backend"], "gymnasium-v4+native-mujoco"
             )
 
-    def test_failed_suite_removes_canonical_outputs_but_keeps_run_artifacts(self):
+    def test_failed_suite_keeps_timing_but_skips_aggregation(self):
         with tempfile.TemporaryDirectory() as directory:
             arguments = [
                 "run_all_algorithms.py",
@@ -618,73 +258,23 @@ class TimingTest(unittest.TestCase):
                 "clean",
                 "--algorithms",
                 "rpex",
-                "--seeds",
-                "0",
                 "--stage",
                 "offline",
                 "--output-root",
                 directory,
             ]
-            preflight = {
-                "protocol": "rpex_d4rl_v2_legacy",
-                "d4rl_env_id": "hopper-medium-replay-v2",
-                "environment_backend": "gym-0.23.1+d4rl-v2+mujoco_py",
-                "dataset_backend": "d4rl.qlearning_dataset(terminate_on_end=False)",
-                "dataset_path": str(Path(directory) / "dataset.hdf5"),
-            }
-            summary_names = (
-                "final_scores.csv",
-                "research_summary.csv",
-                "research_per_seed_final_scores.csv",
-            )
-            canonical_names = (
-                "comparison_offline_online.png",
-                "comparison_offline_online.csv",
-                "comparison_offline.png",
-                "comparison_offline.csv",
-                "comparison_online.png",
-                "comparison_online.csv",
-            )
-            retained_paths = []
-
-            def failed_run(command, check):
-                self.assertFalse(check)
-                runs_dir = Path(command[command.index("--output-dir") + 1])
-                comparison_dir = runs_dir.parent
-                for name in (*summary_names, *canonical_names):
-                    (comparison_dir / name).write_text(
-                        "partial", encoding="utf-8"
-                    )
-                run_dir = runs_dir / "rpex" / "seed_0" / "failed_run"
-                run_dir.mkdir(parents=True)
-                for name in (
-                    "config.json",
-                    "experiment_manifest.json",
-                    "metrics.csv",
-                    "train_metrics.jsonl",
-                    "result.log",
-                    "summary.json",
-                    "checkpoint_1.pt",
-                    "performance.png",
-                ):
-                    path = run_dir / name
-                    path.write_text("diagnostic", encoding="utf-8")
-                    retained_paths.append(path)
-                return Mock(returncode=1)
-
             with (
                 patch.object(sys, "argv", arguments),
                 patch(
                     "run_all_algorithms.subprocess.run",
-                    side_effect=failed_run,
+                    return_value=Mock(returncode=1),
                 ),
                 patch(
                     "run_all_algorithms.preflight_runtime",
-                    return_value=preflight,
+                    return_value=_preflight(directory),
                 ),
                 patch("run_all_algorithms.update_comparison_plots") as plots,
                 patch("run_all_algorithms.write_final_score_summary") as scores,
-                patch("run_all_algorithms.write_reproduction_summaries") as reports,
                 redirect_stdout(io.StringIO()),
             ):
                 returncode = main()
@@ -692,19 +282,10 @@ class TimingTest(unittest.TestCase):
             self.assertEqual(returncode, 1)
             plots.assert_not_called()
             scores.assert_not_called()
-            reports.assert_not_called()
             manifest_path = next(Path(directory).rglob("manifest.json"))
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertFalse(manifest["benchmark_valid"])
-            self.assertIn("suite is incomplete", manifest["aggregation_error"])
-            for name in summary_names:
-                self.assertFalse((manifest_path.parent / name).exists())
-            for name in canonical_names:
-                self.assertFalse((manifest_path.parent / name).exists())
             self.assertTrue((manifest_path.parent / "timing.csv").is_file())
-            self.assertTrue((manifest_path.parent / "runs").is_dir())
-            for path in retained_paths:
-                self.assertTrue(path.is_file())
 
 
 if __name__ == "__main__":

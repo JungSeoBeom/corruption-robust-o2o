@@ -18,7 +18,7 @@ from robust_o2o.calql_online import (
     dynamic_batch_counts,
     episodic_return_to_go,
 )
-from robust_o2o.config import ExperimentConfig, LEGACY_PROTOCOL
+from robust_o2o.config import DEFAULT_PROTOCOL, ExperimentConfig
 
 
 def calql_config(**overrides):
@@ -67,7 +67,7 @@ class CalQLMainConfigTest(unittest.TestCase):
             "run_purpose": "research_benchmark",
             "suite_profile": "research_benchmark",
             "implementation_profile": "research_benchmark",
-            "protocol": LEGACY_PROTOCOL,
+            "protocol": DEFAULT_PROTOCOL,
         }
         values.update(overrides)
         return ExperimentConfig(**values)

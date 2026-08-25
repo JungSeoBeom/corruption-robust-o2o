@@ -40,7 +40,7 @@ def _dataset(
     }
 
 
-class _LegacyEnv:
+class _GymnasiumEnv:
     def __init__(
         self,
         *,
@@ -59,12 +59,11 @@ class _LegacyEnv:
         self.events: list[tuple[str, int]] = []
         self.seed_value: int | None = None
 
-    def seed(self, seed: int) -> None:
-        self.seed_value = int(seed)
-
-    def reset(self) -> np.ndarray:
+    def reset(self, *, seed: int | None = None, options=None):
+        del options
+        self.seed_value = None if seed is None else int(seed)
         self.episode_step = 0
-        return np.asarray([0.0, 0.5], dtype=np.float32)
+        return np.asarray([0.0, 0.5], dtype=np.float32), {}
 
     def step(self, action: np.ndarray):
         self.episode_step += 1
@@ -79,6 +78,7 @@ class _LegacyEnv:
             ),
             float(self.episode_step),
             terminated,
+            False,
             {},
         )
 
@@ -206,7 +206,7 @@ class MainControllerContractTest(unittest.TestCase):
                         super().__init__(*args, **kwargs)
                         replay_instances.append(self)
 
-                env = _LegacyEnv(terminal_at=1)
+                env = _GymnasiumEnv(terminal_at=1)
 
                 class RecordingAgent:
                     def __init__(self) -> None:
@@ -280,7 +280,7 @@ class MainControllerContractTest(unittest.TestCase):
 
     def test_calql_holds_pending_episode_then_flushes_exact_rtg_and_utd_updates(self):
         replay_instances: list[ReplayBuffer] = []
-        env = _LegacyEnv(terminal_at=3)
+        env = _GymnasiumEnv(terminal_at=3)
 
         class CapturingReplay(ReplayBuffer):
             def __init__(self, *args, **kwargs):
@@ -439,7 +439,7 @@ class MainControllerContractTest(unittest.TestCase):
         config = _controller_config("cal_ql", online_steps=2)
         config.max_episode_steps = 3
         config.batch_size = 2
-        env = _LegacyEnv(terminal_at=99)
+        env = _GymnasiumEnv(terminal_at=99)
         agent = CountingAgent()
 
         with tempfile.TemporaryDirectory() as directory:
@@ -480,7 +480,7 @@ class MainControllerContractTest(unittest.TestCase):
 
     def test_pqe_updates_only_full_1000_step_blocks_and_records_block_ledger(self):
         replay_instances: list[ReplayBuffer] = []
-        env = _LegacyEnv(terminal_at=1)
+        env = _GymnasiumEnv(terminal_at=1)
         counters = {"sample": 0, "priority": 0}
 
         class CapturingReplay(ReplayBuffer):
@@ -767,7 +767,7 @@ class MainControllerContractTest(unittest.TestCase):
 
         config = _controller_config("wsrl", online_steps=3)
         config.replay_size = 16
-        env = _LegacyEnv(terminal_at=1)
+        env = _GymnasiumEnv(terminal_at=1)
         agent = NoWarmupUpdateAgent()
         offline = OfflineDataset(_dataset(), seed=11)
 

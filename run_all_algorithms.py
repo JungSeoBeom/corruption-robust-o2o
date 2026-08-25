@@ -6,8 +6,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
-import os
 import shlex
 import subprocess
 import sys
@@ -20,7 +18,6 @@ from typing import Iterable
 from plot_results import (
     update_comparison_plots,
     write_final_score_summary,
-    write_reproduction_summaries,
 )
 from robust_o2o.config import (
     ALGORITHM_ALIASES,
@@ -29,26 +26,19 @@ from robust_o2o.config import (
     CORRUPTION_MODES,
     CORRUPTION_TARGETS,
     DEFAULT_PROTOCOL,
-    LOCAL_PROTOCOL,
-    LEGACY_LOCAL_PROTOCOL_ALIAS,
-    PROTOCOLS,
-    RESEARCH_BENCHMARK_PROTOCOL_ERROR,
-    is_inflight_pre_gate_run55_descendant,
     normalize_env_name,
 )
 from robust_o2o.fidelity import (
     IMPLEMENTATION_PROFILES,
     MAIN_BASELINES,
     ONLINE_CORRUPTION_SCALE_PROFILES,
-    RUN_PURPOSES,
-    STRICT_FINAL_SEEDS,
     SUITE_PROFILES,
-    STRICT_FINAL_TASKS,
 )
 from robust_o2o.environment import preflight_runtime
 from robust_o2o.logging_utils import format_duration, format_timestamp
 from robust_o2o.launcher_utils import (
     CHILD_IDENTITY_OPTIONS,
+    REMOVED_LAUNCH_OPTIONS,
     canonical_algorithms,
     flatten_cli_values,
     passthrough_conflicts,
@@ -78,6 +68,7 @@ TIMING_FIELDS = (
     "end_time",
     "elapsed_hms",
     "elapsed_seconds",
+    "command",
     "returncode",
 )
 
@@ -106,25 +97,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="algorithm names separated by commas, spaces, or both",
     )
     parser.add_argument("--seeds", nargs="+", default=["0"])
-    parser.add_argument(
-        "--benchmark-seed-set",
-        type=int,
-        nargs="+",
-        help="controller-declared strict cohort propagated to child runs",
-    )
     parser.add_argument("--stage", choices=("offline", "both"), default="both")
-    parser.add_argument("--protocol", choices=PROTOCOLS, default=DEFAULT_PROTOCOL)
     parser.add_argument("--implementation-profile", choices=IMPLEMENTATION_PROFILES)
     parser.add_argument(
         "--suite-profile", choices=SUITE_PROFILES,
         default="common_budget_robustness",
     )
-    parser.add_argument("--run-purpose", choices=RUN_PURPOSES, default="diagnostic")
     parser.add_argument(
         "--online-corruption-scale-profile",
         choices=ONLINE_CORRUPTION_SCALE_PROFILES,
     )
-    parser.add_argument("--allow-diagnostic-protocol", action="store_true")
     parser.add_argument("--output-root", default="results")
     parser.add_argument("--dataset-dir")
     parser.add_argument("--comparison-name")
@@ -139,12 +121,14 @@ def _validate_args(
     passthrough: Iterable[str] = (),
 ) -> None:
     if args.algorithms is None:
-        args.algorithms = list(MAIN_BASELINES)
+        args.algorithms = list(
+            MAIN_BASELINES
+            if args.suite_profile == "research_benchmark"
+            else ALGORITHMS
+        )
     else:
         args.algorithms = canonical_algorithms(args.algorithms, ALGORITHM_ALIASES)
     args.seeds = flatten_cli_values(args.seeds)
-    if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
-        args.protocol = LOCAL_PROTOCOL
     original_env_name = args.env_name
     args.env_name = normalize_env_name(args.env_name)
     if args.env_name != original_env_name:
@@ -166,12 +150,7 @@ def _validate_args(
         parser.error(
             "algorithm selections cannot contain duplicates after alias normalization"
         )
-    if args.run_purpose == "research_benchmark":
-        if args.suite_profile != "research_benchmark":
-            parser.error(
-                "--run-purpose research_benchmark requires "
-                "--suite-profile research_benchmark"
-            )
+    if args.suite_profile == "research_benchmark":
         if args.implementation_profile is None:
             args.implementation_profile = "research_benchmark"
         elif args.implementation_profile != "research_benchmark":
@@ -201,87 +180,9 @@ def _validate_args(
             "these child identity/provenance options cannot be overridden: "
             + ", ".join(conflicts)
         )
-    if (
-        args.run_purpose in ("paper_reproduction", "final_benchmark")
-        or args.suite_profile == "primary_research_benchmark"
-    ):
-        from robust_o2o.final_gate import (
-            ResearchLabelContractError,
-            validate_research_label_contract,
-        )
-
-        try:
-            validate_research_label_contract(
-                args.run_purpose,
-                args.suite_profile,
-                args.algorithms,
-            )
-        except ResearchLabelContractError as exc:
-            parser.error(str(exc))
-    if args.run_purpose == "final_benchmark":
-        required = {str(seed) for seed in STRICT_FINAL_SEEDS}
-        if set(args.seeds) != required or len(args.seeds) != len(required):
-            parser.error(
-                "final_benchmark requires exactly seeds 0,1,2,3,4; "
-                "single-seed runs are smoke/diagnostic only"
-            )
-        declared_seed_set = tuple(
-            args.benchmark_seed_set
-            if args.benchmark_seed_set is not None
-            else (int(seed) for seed in args.seeds)
-        )
-        if declared_seed_set != STRICT_FINAL_SEEDS:
-            parser.error(
-                "final_benchmark requires --benchmark-seed-set 0 1 2 3 4 "
-                "(it is inferred from --seeds when omitted)"
-            )
-        args.benchmark_seed_set = list(STRICT_FINAL_SEEDS)
-        if args.protocol != DEFAULT_PROTOCOL:
-            parser.error(
-                "final_benchmark requires rpex_d4rl_v2_legacy; no local fallback"
-            )
-        if args.stage != "both":
-            parser.error("final_benchmark requires --stage both")
-        if args.env_name not in STRICT_FINAL_TASKS:
-            parser.error(
-                "final_benchmark permits only hopper/halfcheetah/walker2d "
-                "medium-replay-v2 tasks"
-            )
-        if args.implementation_profile not in (None, "official_code_reference"):
-            parser.error(
-                "final_benchmark requires --implementation-profile "
-                "official_code_reference"
-            )
-        if args.online_corruption_scale_profile not in (
-            None,
-            "rpex_official_code",
-        ):
-            parser.error(
-                "final_benchmark requires --online-corruption-scale-profile "
-                "rpex_official_code"
-            )
-        if args.corruption not in ("clean", "random", "adversarial"):
-            parser.error(
-                "final_benchmark permits only clean, random, or certified "
-                "adversarial corruption"
-            )
-        if (
-            args.corruption == "adversarial"
-            and args.corruption_target != "observations"
-        ):
-            parser.error(
-                "final_benchmark adversarial corruption is certified only for "
-                "the observations target"
-            )
-        if (
-            args.corruption == "adversarial"
-            and args.env_name != "hopper-medium-replay-v2"
-        ):
-            parser.error(
-                "final_benchmark adversarial observations currently require "
-                "hopper-medium-replay-v2: the registered optimizer-core "
-                "fixture is bound to the Hopper EDAC checkpoint"
-            )
+    removed = passthrough_conflicts(passthrough, REMOVED_LAUNCH_OPTIONS)
+    if removed:
+        parser.error("these options were removed: " + ", ".join(removed))
     if args.online_corruption_scale_profile is None:
         args.online_corruption_scale_profile = (
             "rpex_official_code"
@@ -306,17 +207,6 @@ def _validate_args(
                 "--comparison-name may contain only letters, digits, '.', '_', "
                 "and '-', and must start with a letter or digit"
             )
-    if (
-        args.run_purpose == "research_benchmark"
-        and args.protocol == LOCAL_PROTOCOL
-        and not is_inflight_pre_gate_run55_descendant()
-    ):
-        parser.error(RESEARCH_BENCHMARK_PROTOCOL_ERROR)
-    if args.protocol == LOCAL_PROTOCOL and not args.allow_diagnostic_protocol:
-        parser.error(
-            "the local Gymnasium protocol is diagnostic-only; pass "
-            "--allow-diagnostic-protocol to acknowledge this"
-        )
 
 
 def _comparison_directory(args: argparse.Namespace) -> Path:
@@ -364,12 +254,8 @@ def commands(
                 seed,
                 "--stage",
                 args.stage,
-                "--protocol",
-                args.protocol,
                 "--suite-profile",
                 args.suite_profile,
-                "--run-purpose",
-                args.run_purpose,
                 "--online-corruption-scale-profile",
                 scale_profile,
                 "--output-dir",
@@ -379,20 +265,8 @@ def commands(
                 command.extend(
                     ("--implementation-profile", args.implementation_profile)
                 )
-            if args.allow_diagnostic_protocol:
-                command.append("--allow-diagnostic-protocol")
             if args.dataset_dir:
                 command.extend(("--dataset-dir", args.dataset_dir))
-            if args.run_purpose == "final_benchmark":
-                declared_seed_set = (
-                    args.benchmark_seed_set or list(STRICT_FINAL_SEEDS)
-                )
-                command.extend(
-                    (
-                        "--benchmark-seed-set",
-                        *(str(seed) for seed in declared_seed_set),
-                    )
-                )
             command.extend(passthrough)
             yield command
 
@@ -431,7 +305,7 @@ def write_timing_csv(path: Path, records: list[dict]) -> Path:
         writer = csv.DictWriter(stream, fieldnames=TIMING_FIELDS)
         writer.writeheader()
         for record in records:
-            writer.writerow({field: record[field] for field in TIMING_FIELDS})
+            writer.writerow({field: record.get(field, "") for field in TIMING_FIELDS})
     return path
 
 
@@ -457,100 +331,14 @@ def _remove_invalid_summary_artifacts(comparison_dir: Path) -> None:
         "comparison_online.png",
         "comparison_online.csv",
         "final_scores.csv",
-        "per_seed_final_scores.csv",
-        "paper_reproduction_summary.csv",
-        "common_per_seed_final_scores.csv",
-        "common_benchmark_summary.csv",
-        "seed_run_status.csv",
-        "research_per_seed_final_scores.csv",
-        "research_summary.csv",
-        "adapted_baselines_per_seed_final_scores.csv",
-        "adapted_baselines_summary.csv",
-        "diagnostic_per_seed_final_scores.csv",
-        "diagnostic_summary.csv",
     }
     for name in names:
         (comparison_dir / name).unlink(missing_ok=True)
-
-
-def _validate_research_seed_cohort(
-    research_summary: Path,
-    algorithms: Iterable[str],
-    expected_seeds: Iterable[int],
-) -> None:
-    """Fail closed before publishing plots for an incomplete research cohort."""
-
-    if not research_summary.is_file():
-        raise RuntimeError(
-            f"research seed cohort validation missing {research_summary.name}"
-        )
-    with research_summary.open(newline="", encoding="utf-8") as stream:
-        rows = list(csv.DictReader(stream))
-
-    expected_seed_values = tuple(int(seed) for seed in expected_seeds)
-    expected = {
-        (str(algorithm), int(seed))
-        for algorithm in algorithms
-        for seed in expected_seed_values
-    }
-    observed: list[tuple[str, int]] = []
-    incomplete: list[str] = []
-    for row in rows:
-        try:
-            pair = (str(row["algorithm"]), int(row["seed"]))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "research seed cohort summary has an invalid algorithm/seed row"
-            ) from exc
-        observed.append(pair)
-        try:
-            finite_scores = all(
-                math.isfinite(float(row[field])) for field in ("mean", "std")
-            )
-        except (KeyError, TypeError, ValueError):
-            finite_scores = False
-        if row.get("status") != "completed" or not finite_scores:
-            incomplete.append(f"{pair[0]}:{pair[1]}")
-
-    observed_set = set(observed)
-    missing = sorted(expected - observed_set)
-    unexpected = sorted(observed_set - expected)
-    duplicates = sorted(
-        pair for pair in observed_set if observed.count(pair) != 1
-    )
-
-    def format_pairs(pairs: Iterable[tuple[str, int]]) -> list[str]:
-        return [f"{algorithm}:{seed}" for algorithm, seed in pairs]
-
-    if missing or unexpected or duplicates or incomplete:
-        raise RuntimeError(
-            "research seed cohort incomplete: "
-            f"missing={format_pairs(missing)}, "
-            f"unexpected={format_pairs(unexpected)}, "
-            f"duplicates={format_pairs(duplicates)}, "
-            f"incomplete={sorted(incomplete)}"
-        )
-
 
 def main() -> int:
     parser = build_parser()
     args, passthrough = parser.parse_known_args()
     _validate_args(parser, args, passthrough)
-    audit_receipt = None
-    if args.run_purpose == "final_benchmark":
-        from robust_o2o.final_gate import (
-            FinalAuditGateError,
-            require_final_benchmark_audit,
-        )
-
-        try:
-            audit_receipt = require_final_benchmark_audit(
-                args.run_purpose,
-                dry_run=args.dry_run,
-            )
-        except FinalAuditGateError as exc:
-            print(f"FINAL_BENCHMARK_AUDIT_GATE_FAILED: {exc}", file=sys.stderr)
-            return 2
     comparison_dir = _comparison_directory(args)
     runs_dir = comparison_dir / "runs"
     generated_commands = list(commands(args, passthrough, runs_dir))
@@ -558,7 +346,7 @@ def main() -> int:
     if not args.dry_run:
         try:
             preflight_metadata = preflight_runtime(
-                args.env_name, args.dataset_dir, args.protocol
+                args.env_name, args.dataset_dir, DEFAULT_PROTOCOL
             )
         except Exception as exc:
             print(
@@ -566,16 +354,10 @@ def main() -> int:
                 file=sys.stderr,
                 flush=True,
             )
-            if args.protocol == LOCAL_PROTOCOL:
-                guidance = (
-                    "Activate the `corruption` Conda environment and verify the "
-                    "D4RL-v2 HDF5 dataset under ~/.d4rl/datasets."
-                )
-            else:
-                guidance = (
-                    "Create the pinned environment with `conda env create -f "
-                    "environment-rpex-v2.yml` and retry."
-                )
+            guidance = (
+                "Activate the project Conda environment and verify the D4RL-v2 "
+                "HDF5 dataset directory."
+            )
             print(guidance, file=sys.stderr, flush=True)
             return 2
         print(
@@ -583,7 +365,8 @@ def main() -> int:
             flush=True,
         )
         print(
-            f"D4RL_ENV_ID: {preflight_metadata['d4rl_env_id']}",
+            "ENVIRONMENT_ID: "
+            f"{preflight_metadata.get('environment_id', preflight_metadata.get('d4rl_env_id', args.env_name))}",
             flush=True,
         )
         print(
@@ -592,27 +375,12 @@ def main() -> int:
         )
 
     print(f"COMPARISON_DIR: {comparison_dir}", flush=True)
-    if args.run_purpose in ("smoke", "diagnostic"):
-        print("NOT A PAPER REPRODUCTION RUN", flush=True)
-        print("NOT PUBLICATION-ELIGIBLE", flush=True)
-    elif args.run_purpose == "research_benchmark":
-        print(
-            "CUSTOM RESEARCH BENCHMARK (NOT OFFICIAL PAPER REPRODUCTION)",
-            flush=True,
-        )
     for index, command in enumerate(generated_commands, start=1):
         print(f"[{index}/{len(generated_commands)}] {shlex.join(command)}", flush=True)
     if args.dry_run:
         return 0
 
     comparison_dir.mkdir(parents=True, exist_ok=False)
-    audit_evidence_path = None
-    if audit_receipt is not None:
-        from robust_o2o.final_gate import write_final_audit_evidence
-
-        audit_evidence_path = write_final_audit_evidence(
-            comparison_dir, audit_receipt
-        )
     start_wall = datetime.now().astimezone()
     start_monotonic = time.perf_counter()
     run_records = []
@@ -638,7 +406,7 @@ def main() -> int:
                 "end_time": format_timestamp(run_end_wall),
                 "elapsed_seconds": run_elapsed,
                 "elapsed_hms": format_duration(run_elapsed),
-                "command": command,
+                "command": shlex.join(command),
                 "returncode": result.returncode,
             }
         )
@@ -674,34 +442,6 @@ def main() -> int:
         )
     else:
         try:
-            # Validate reporting first. In strict mode this catches missing or
-            # duplicate seeds/evaluations before canonical plots or the common
-            # final_scores alias are published.
-            expected_seeds = (
-                [int(seed) for seed in args.seeds]
-                if args.run_purpose
-                in ("research_benchmark", "final_benchmark")
-                else None
-            )
-            reporting_paths = write_reproduction_summaries(
-                runs_dir,
-                comparison_dir,
-                args.env_name,
-                args.corruption,
-                args.corruption_target,
-                strict=args.run_purpose == "final_benchmark",
-                expected_seeds=expected_seeds,
-                phase=phase,
-            )
-            if (
-                args.run_purpose == "research_benchmark"
-                and args.protocol == DEFAULT_PROTOCOL
-            ):
-                _validate_research_seed_cohort(
-                    Path(reporting_paths["research_summary"]),
-                    args.algorithms,
-                    expected_seeds or (),
-                )
             plot_paths = update_comparison_plots(
                 comparison_dir,
                 args.env_name,
@@ -725,9 +465,6 @@ def main() -> int:
                     for name, path in plot_paths.items()
                 },
                 "final_scores_csv": str(final_scores_path),
-                "reporting_csvs": {
-                    name: str(path) for name, path in reporting_paths.items()
-                },
             }
         except Exception as exc:
             aggregation_error = f"{type(exc).__name__}: {exc}"
@@ -738,11 +475,9 @@ def main() -> int:
     end_wall = datetime.now().astimezone()
     elapsed = time.perf_counter() - start_monotonic
     manifest = {
-        "protocol": args.protocol,
+        "protocol": preflight_metadata.get("protocol", DEFAULT_PROTOCOL),
         "implementation_profile": args.implementation_profile or "auto",
         "suite_profile": args.suite_profile,
-        "run_purpose": args.run_purpose,
-        "final_audit": None,
         "online_corruption_scale_profile": args.online_corruption_scale_profile,
         "environment": args.env_name,
         "corruption": args.corruption,
@@ -766,20 +501,6 @@ def main() -> int:
         "aggregation_error": aggregation_error,
         "benchmark_valid": not failures and aggregation_error is None,
     }
-    if audit_receipt is not None:
-        from robust_o2o.final_gate import (
-            AUDIT_RECEIPT_ENV,
-            AUDIT_RECEIPT_SHA256_ENV,
-        )
-
-        manifest["final_audit"] = {
-            "context_token": audit_receipt["context_token"],
-            "issued_at_utc": audit_receipt["issued_at_utc"],
-            "receipt_source": os.environ.get(AUDIT_RECEIPT_ENV),
-            "receipt_sha256": os.environ.get(AUDIT_RECEIPT_SHA256_ENV),
-            "evidence_path": str(audit_evidence_path),
-            "audit_result": audit_receipt["audit_result"],
-        }
     with (comparison_dir / "manifest.json").open("w", encoding="utf-8") as stream:
         json.dump(manifest, stream, indent=2, ensure_ascii=False)
 

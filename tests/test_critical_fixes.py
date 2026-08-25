@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from robust_o2o.agents.registry import build_agent
-from robust_o2o.config import ExperimentConfig, LOCAL_PROTOCOL
+from robust_o2o.config import DEFAULT_PROTOCOL, ExperimentConfig
 from robust_o2o.corruption import (
     _apply_mc_return_semantics,
     mc_returns_from_reward_deltas,
@@ -179,7 +179,7 @@ class EvaluationSeedRegressionTest(unittest.TestCase):
             "robust_o2o.experiment.make_env",
             side_effect=lambda *_: RngConsumingEvalEnv(),
         ):
-            env = _make_evaluation_env("hopper-medium-replay-v2", LOCAL_PROTOCOL, 77)
+            env = _make_evaluation_env("hopper-medium-replay-v2", DEFAULT_PROTOCOL, 77)
         actual = (random.random(), np.random.random(), torch.rand(4))
         self.assertEqual(expected[0], actual[0])
         self.assertEqual(expected[1], actual[1])
@@ -295,7 +295,7 @@ class EvaluationSeedRegressionTest(unittest.TestCase):
             episodes=2,
             max_episode_steps=1,
             seed=4,
-            protocol=LOCAL_PROTOCOL,
+            protocol=DEFAULT_PROTOCOL,
             evaluation_mode="method_faithful",
         )
         actual_random = (random.random(), np.random.random())

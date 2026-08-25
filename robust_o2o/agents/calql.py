@@ -213,7 +213,7 @@ class CalQLAgent(BaseAgent):
         self,
         state: torch.Tensor,
         evaluate: bool = False,
-        evaluation_mode: str = "deterministic_diagnostic",
+        evaluation_mode: str = "deterministic",
     ) -> torch.Tensor:
         del evaluation_mode
         single = state.ndim == 1

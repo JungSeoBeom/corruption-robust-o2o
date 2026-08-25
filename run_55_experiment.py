@@ -15,21 +15,16 @@ from typing import Iterable
 from robust_o2o.config import (
     ALGORITHM_ALIASES,
     BENCHMARK_ENVS,
-    DEFAULT_PROTOCOL,
-    LEGACY_LOCAL_PROTOCOL_ALIAS,
-    LOCAL_PROTOCOL,
-    PROTOCOLS,
-    RESEARCH_BENCHMARK_PROTOCOL_ERROR,
 )
 from robust_o2o.corruption import SUPPORTED_ADVERSARIAL_TARGETS
 from robust_o2o.fidelity import (
     IMPLEMENTATION_PROFILES,
     MAIN_BASELINES,
     ONLINE_CORRUPTION_SCALE_PROFILES,
-    RUN_PURPOSES,
     SUITE_PROFILES,
 )
 from robust_o2o.launcher_utils import (
+    REMOVED_LAUNCH_OPTIONS,
     RUN55_FIXED_OPTIONS,
     canonical_algorithms,
     flatten_cli_values,
@@ -92,7 +87,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=10,
     )
     parser.add_argument("--final-window-size", type=int, default=3)
-    parser.add_argument("--protocol", choices=PROTOCOLS, default=DEFAULT_PROTOCOL)
     parser.add_argument(
         "--implementation-profile", choices=IMPLEMENTATION_PROFILES
     )
@@ -101,13 +95,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="research_benchmark",
     )
     parser.add_argument(
-        "--run-purpose", choices=RUN_PURPOSES, default="research_benchmark"
-    )
-    parser.add_argument(
         "--online-corruption-scale-profile",
         choices=ONLINE_CORRUPTION_SCALE_PROFILES,
     )
-    parser.add_argument("--allow-diagnostic-protocol", action="store_true")
     parser.add_argument("--output-root", default="results")
     parser.add_argument("--dataset-dir")
     parser.add_argument(
@@ -128,10 +118,6 @@ def _validate_args(
     args: argparse.Namespace,
     passthrough: Iterable[str],
 ) -> None:
-    if args.protocol == LEGACY_LOCAL_PROTOCOL_ALIAS:
-        args.protocol = LOCAL_PROTOCOL
-    if args.run_purpose == "research_benchmark" and args.protocol == LOCAL_PROTOCOL:
-        parser.error(RESEARCH_BENCHMARK_PROTOCOL_ERROR)
     args.algorithms = canonical_algorithms(args.algorithms, ALGORITHM_ALIASES)
     args.seeds = flatten_cli_values(args.seeds)
     if not args.seeds:
@@ -152,17 +138,7 @@ def _validate_args(
         parser.error("--algorithms cannot be empty for a research benchmark")
     if len(requested) != len(set(requested)):
         parser.error("algorithm selections cannot contain duplicates")
-    if args.run_purpose == "research_benchmark" and args.suite_profile != "research_benchmark":
-        parser.error(
-            "--run-purpose research_benchmark requires "
-            "--suite-profile research_benchmark"
-        )
-    if args.suite_profile == "research_benchmark" and args.run_purpose != "research_benchmark":
-        parser.error(
-            "--suite-profile research_benchmark requires "
-            "--run-purpose research_benchmark"
-        )
-    if args.run_purpose == "research_benchmark":
+    if args.suite_profile == "research_benchmark":
         if args.implementation_profile is None:
             args.implementation_profile = "research_benchmark"
         elif args.implementation_profile != "research_benchmark":
@@ -170,15 +146,6 @@ def _validate_args(
                 "research_benchmark requires "
                 "--implementation-profile research_benchmark"
             )
-    if (
-        args.run_purpose in ("paper_reproduction", "final_benchmark")
-        or args.suite_profile == "primary_research_benchmark"
-    ):
-        parser.error(
-            "the fixed nine-condition suite is a custom research/diagnostic "
-            "benchmark; its adversarial conditions are not certified for "
-            "paper_reproduction or final_benchmark"
-        )
     if args.offline_steps < 0 or args.online_steps < 0:
         parser.error("--offline-steps and --online-steps cannot be negative")
     for name in ("eval_period", "eval_episodes", "final_window_size"):
@@ -189,19 +156,13 @@ def _validate_args(
             "method_fidelity is unavailable for the fixed suite: canonical "
             "Cal-QL is a frozen "
             "locomotion adaptation and canonical PQE is a D4RL-v2 port. Use "
-            "--suite-profile common_budget_diagnostic; no run will be mislabeled "
-            "as paper reproduction."
+            "--suite-profile common_budget_robustness."
         )
     if args.online_corruption_scale_profile is None:
         args.online_corruption_scale_profile = (
             "rpex_official_code"
             if args.suite_profile == "research_benchmark"
             else "dataset_std_scaled_extension"
-        )
-    if args.protocol == LOCAL_PROTOCOL and not args.allow_diagnostic_protocol:
-        parser.error(
-            "the local Gymnasium protocol is diagnostic-only; pass "
-            "--allow-diagnostic-protocol to acknowledge this"
         )
     if args.experiment_name and not valid_comparison_name(args.experiment_name):
         parser.error(
@@ -215,6 +176,9 @@ def _validate_args(
             "be overridden: "
             + ", ".join(conflicts)
         )
+    removed = passthrough_conflicts(passthrough, REMOVED_LAUNCH_OPTIONS)
+    if removed:
+        parser.error("these options were removed: " + ", ".join(removed))
 
 
 def commands(
@@ -246,12 +210,8 @@ def commands(
             seed_csv,
             "--stage",
             "both",
-            "--protocol",
-            args.protocol,
             "--suite-profile",
             args.suite_profile,
-            "--run-purpose",
-            args.run_purpose,
             "--online-corruption-scale-profile",
             scale_profile,
             "--output-root",
@@ -275,8 +235,6 @@ def commands(
         )
         if args.implementation_profile:
             command.extend(("--implementation-profile", args.implementation_profile))
-        if args.allow_diagnostic_protocol:
-            command.append("--allow-diagnostic-protocol")
         if args.dataset_dir:
             command.extend(("--dataset-dir", args.dataset_dir))
         if args.keep_going:
@@ -311,12 +269,6 @@ def main() -> int:
         flush=True,
     )
     print(f"SUITE_PROFILE: {args.suite_profile}", flush=True)
-    print(f"RUN_PURPOSE: {args.run_purpose}", flush=True)
-    if args.run_purpose in ("smoke", "diagnostic"):
-        print("NOT A PAPER REPRODUCTION RUN", flush=True)
-        print("NOT PUBLICATION-ELIGIBLE", flush=True)
-    elif args.run_purpose == "research_benchmark":
-        print("CUSTOM RESEARCH BENCHMARK (NOT OFFICIAL PAPER REPRODUCTION)", flush=True)
     print(
         f"ONLINE_CORRUPTION_SCALE_PROFILE: {args.online_corruption_scale_profile}",
         flush=True,

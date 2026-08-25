@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=rpex-cpu
+#SBATCH --job-name=cro2o-cpu
 #SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -13,9 +13,9 @@
 
 set -euo pipefail
 
-repo_root="${RPEX_REPO_ROOT:-${SLURM_SUBMIT_DIR:-}}"
+repo_root="${CRO2O_REPO_ROOT:-${SLURM_SUBMIT_DIR:-}}"
 if [[ -z "$repo_root" || ! -f "$repo_root/run_experiment.py" ]]; then
-    echo "Submit this job from the repository root, or export RPEX_REPO_ROOT." >&2
+    echo "Submit this job from the repository root, or export CRO2O_REPO_ROOT." >&2
     exit 2
 fi
 repo_root="$(cd "$repo_root" && pwd -P)"
@@ -23,7 +23,7 @@ cd "$repo_root"
 
 # shellcheck source=cpu_env.sh
 source "$repo_root/slurm/cpu_env.sh"
-rpex_activate_cpu_environment
+cro2o_activate_cpu_environment
 
 if (( $# == 0 )); then
     set -- \
@@ -40,11 +40,8 @@ echo "JOB_ID=${SLURM_JOB_ID:-none}"
 echo "HOST=$(hostname)"
 echo "PARTITION=${SLURM_JOB_PARTITION:-none}"
 echo "CPUS=${SLURM_CPUS_PER_TASK:-1}"
-echo "COMMAND=python run_experiment.py $* --protocol rpex_d4rl_v2_legacy --device cpu --dataset-dir $RPEX_DATASET_DIR"
+echo "COMMAND=python run_experiment.py $* --device cpu --dataset-dir $CRO2O_DATASET_DIR"
 
-# Put the enforced options last so a submitted job cannot accidentally select a
-# GPU device or the non-reproduction Gymnasium protocol.
 exec python run_experiment.py "$@" \
-    --protocol rpex_d4rl_v2_legacy \
     --device cpu \
-    --dataset-dir "$RPEX_DATASET_DIR"
+    --dataset-dir "$CRO2O_DATASET_DIR"

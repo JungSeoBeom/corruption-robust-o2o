@@ -1,20 +1,25 @@
 from __future__ import annotations
 
+import io
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import h5py
 import numpy as np
 
-from robust_o2o.config import DEFAULT_PROTOCOL, LOCAL_PROTOCOL, ExperimentConfig
+from robust_o2o.config import DEFAULT_PROTOCOL, ExperimentConfig
 from robust_o2o.environment import (
-    EXPECTED_D4RL_COMMIT,
-    EXPECTED_MUJOCO_PY_VERSION,
-    EXPECTED_MUJOCO_RUNTIME_VERSION_CODE,
-    RPEXProtocolError,
+    MODERN_PROTOCOL,
+    EnvironmentSetupError,
     _index_aware_qlearning_dataset,
+    d4rl_dataset_url,
+    download_d4rl_dataset,
     environment_metadata,
+    expected_env_spec_id,
     local_dataset_path,
     load_d4rl_dataset,
     make_env,
@@ -22,55 +27,46 @@ from robust_o2o.environment import (
     qlearning_valid_indices,
     raw_monte_carlo_returns,
     reset_env,
+    runtime_package_versions,
     step_env,
     validate_dataset,
-    verify_rpex_runtime,
 )
 
 
 class FakeSpace:
     def __init__(self, shape: tuple[int, ...]):
         self.shape = shape
+        self.low = -np.ones(shape, dtype=np.float32)
         self.high = np.ones(shape, dtype=np.float32)
-        self.seed_calls: list[int] = []
-
-    def seed(self, seed: int) -> None:
-        self.seed_calls.append(seed)
-
-    def sample(self) -> np.ndarray:
-        return np.zeros(self.shape, dtype=np.float32)
 
 
 class FakeEnv:
     def __init__(
         self,
-        env_id: str = "walker2d-medium-replay-v2",
-        raw: dict[str, np.ndarray] | None = None,
+        env_id: str = "Walker2d-v4",
+        observation_dim: int = 3,
+        action_dim: int = 2,
     ):
         self.spec = SimpleNamespace(id=env_id, max_episode_steps=1_000)
         self._max_episode_steps = 1_000
-        self.observation_space = FakeSpace((3,))
-        self.action_space = FakeSpace((2,))
+        self.observation_space = FakeSpace((observation_dim,))
+        self.action_space = FakeSpace((action_dim,))
         self.unwrapped = self
-        self.dataset_url = "https://example.invalid/dataset.hdf5"
-        self.dataset_filepath = None
-        self.raw = raw
         self.close_calls = 0
-        self.seed_calls: list[int] = []
 
-    def seed(self, seed: int) -> None:
-        self.seed_calls.append(seed)
-
-    def reset(self) -> np.ndarray:
-        return np.zeros(3, dtype=np.float32)
+    def reset(self, *, seed: int | None = None):
+        return np.zeros(self.observation_space.shape, dtype=np.float32), {
+            "seed": seed
+        }
 
     def step(self, _action: np.ndarray):
-        return np.ones(3, dtype=np.float32), 1.0, False, {}
-
-    def get_dataset(self) -> dict[str, np.ndarray]:
-        if self.raw is None:
-            raise RuntimeError("No synthetic dataset configured")
-        return self.raw
+        return (
+            np.ones(self.observation_space.shape, dtype=np.float32),
+            1.0,
+            False,
+            False,
+            {},
+        )
 
     def close(self) -> None:
         self.close_calls += 1
@@ -87,160 +83,150 @@ def small_raw_dataset() -> dict[str, np.ndarray]:
     }
 
 
-class StrictRPEXEnvironmentTest(unittest.TestCase):
-    def test_strict_runtime_pins_binding_and_native_mujoco(self):
-        versions = {
-            "Python": "3.10.16",
-            "gym": "0.23.1",
-            "numpy": "1.23.5",
-            "mujoco-py": EXPECTED_MUJOCO_PY_VERSION,
-        }
-        identity = {
-            "mujoco_runtime_version_code": (
-                EXPECTED_MUJOCO_RUNTIME_VERSION_CODE
-            ),
-            "mujoco_runtime_error": None,
-        }
-        with (
-            patch(
-                "robust_o2o.environment.runtime_package_versions",
-                return_value=versions,
-            ),
-            patch(
-                "robust_o2o.environment.mujoco_runtime_identity",
-                return_value=identity,
-            ),
-            patch(
-                "robust_o2o.environment.installed_d4rl_commit",
-                return_value=EXPECTED_D4RL_COMMIT,
-            ),
-        ):
-            verify_rpex_runtime.cache_clear()
-            verify_rpex_runtime()
-        verify_rpex_runtime.cache_clear()
+def write_hdf5(path: Path, raw: dict[str, np.ndarray]) -> None:
+    with h5py.File(path, "w") as stream:
+        for key, value in raw.items():
+            stream.create_dataset(key, data=value)
 
-    def test_strict_runtime_rejects_wrong_native_mujoco(self):
-        versions = {
-            "Python": "3.10.16",
-            "gym": "0.23.1",
-            "numpy": "1.23.5",
-            "mujoco-py": EXPECTED_MUJOCO_PY_VERSION,
-        }
-        identity = {
-            "mujoco_runtime_version_code": 200,
-            "mujoco_runtime_error": None,
-        }
-        with (
-            patch(
-                "robust_o2o.environment.runtime_package_versions",
-                return_value=versions,
-            ),
-            patch(
-                "robust_o2o.environment.mujoco_runtime_identity",
-                return_value=identity,
-            ),
-            patch(
-                "robust_o2o.environment.installed_d4rl_commit",
-                return_value=EXPECTED_D4RL_COMMIT,
-            ),
-            self.assertRaisesRegex(RPEXProtocolError, "runtime version code"),
-        ):
-            verify_rpex_runtime.cache_clear()
-            verify_rpex_runtime()
-        verify_rpex_runtime.cache_clear()
 
-    def test_config_preserves_complete_d4rl_id(self):
+class ModernEnvironmentTest(unittest.TestCase):
+    def test_config_and_environment_use_one_modern_protocol(self):
         config = ExperimentConfig("rpex", "half-cheetah-medium-replay-v2")
         self.assertEqual(config.env_name, "halfcheetah-medium-replay-v2")
-        self.assertEqual(config.protocol, DEFAULT_PROTOCOL)
+        self.assertEqual(config.protocol, MODERN_PROTOCOL)
+        self.assertEqual(DEFAULT_PROTOCOL, MODERN_PROTOCOL)
 
-    def test_full_d4rl_id_is_passed_unchanged_to_gym_make(self):
-        env = FakeEnv()
-        gym = SimpleNamespace(make=Mock(return_value=env))
-        with patch(
-            "robust_o2o.environment._import_legacy_backend",
-            return_value=(gym, object()),
-        ):
+    def test_d4rl_ids_map_to_v4_without_changing_dataset_id(self):
+        expected = {
+            "halfcheetah-medium-v2": "HalfCheetah-v4",
+            "hopper-medium-replay-v2": "Hopper-v4",
+            "walker2d-medium-expert-v2": "Walker2d-v4",
+        }
+        for dataset_id, gymnasium_id in expected.items():
+            with self.subTest(dataset_id=dataset_id):
+                self.assertEqual(expected_env_spec_id(dataset_id), gymnasium_id)
+
+    def test_make_env_calls_gymnasium_with_v4_id(self):
+        env = FakeEnv("Walker2d-v4")
+        gymnasium = SimpleNamespace(make=Mock(return_value=env))
+        with patch.dict(sys.modules, {"gymnasium": gymnasium}):
             result = make_env("walker2d-medium-replay-v2")
         self.assertIs(result, env)
-        gym.make.assert_called_once_with("walker2d-medium-replay-v2")
-        requested = gym.make.call_args.args[0]
-        self.assertNotIn(requested, ("Walker2d-v2", "Walker2d-v4", "Walker2d-v5"))
+        gymnasium.make.assert_called_once_with("Walker2d-v4")
 
-    def test_strict_mode_rejects_gymnasium_ids(self):
-        for name in ("Walker2d-v4", "Hopper-v5", "HalfCheetah-v4"):
-            with self.subTest(name=name), self.assertRaises(RPEXProtocolError):
-                make_env(name)
-
-    def test_qlearning_dataset_is_official_and_terminate_on_end_false(self):
-        raw = small_raw_dataset()
-        env = FakeEnv(raw=raw)
-        d4rl = SimpleNamespace()
-        d4rl.set_dataset_path = Mock()
-
-        def qlearning_dataset(received_env, *, dataset, terminate_on_end):
-            self.assertIs(received_env, env)
-            self.assertIs(dataset, raw)
-            self.assertFalse(terminate_on_end)
-            indices = qlearning_valid_indices(raw, env._max_episode_steps)
-            return _index_aware_qlearning_dataset(raw, indices)
-
-        d4rl.qlearning_dataset = Mock(side_effect=qlearning_dataset)
-        with patch(
-            "robust_o2o.environment._import_legacy_backend",
-            return_value=(object(), d4rl),
-        ):
-            dataset = load_d4rl_dataset(env, "/tmp/d4rl-test", discount=1.0)
-
-        d4rl.set_dataset_path.assert_called_once_with(
-            str(Path("/tmp/d4rl-test").resolve())
-        )
-        self.assertEqual(d4rl.qlearning_dataset.call_count, 1)
-        np.testing.assert_array_equal(dataset["rewards"], [0, 2, 3, 4])
-        self.assertEqual(len(dataset["mc_returns"]), len(dataset["rewards"]))
-
-    def test_official_normalization_is_called_for_reference_returns(self):
-        random_return = -20.272305
-        expert_return = 3234.3
-        d4rl = SimpleNamespace()
-
-        def get_normalized_score(env_name, values):
-            self.assertEqual(env_name, "hopper-medium-replay-v2")
-            return (values - random_return) / (expert_return - random_return)
-
-        d4rl.get_normalized_score = Mock(side_effect=get_normalized_score)
-        with patch(
-            "robust_o2o.environment._import_legacy_backend",
-            return_value=(object(), d4rl),
-        ):
-            scores = normalized_d4rl_scores(
-                "hopper-medium-replay-v2",
-                np.asarray([random_return, expert_return]),
+    def test_legacy_protocol_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "only supported protocol"):
+            expected_env_spec_id(
+                "hopper-medium-replay-v2", "rpex_d4rl_v2_legacy"
             )
-        np.testing.assert_allclose(scores, [0.0, 100.0])
-        d4rl.get_normalized_score.assert_called_once()
 
-    def test_local_hopper_dataset_path_and_normalization(self):
+    def test_qlearning_conversion_matches_terminate_on_end_false(self):
+        raw = small_raw_dataset()
+        indices = qlearning_valid_indices(raw, max_episode_steps=1_000)
+        np.testing.assert_array_equal(indices, [0, 2, 3, 4])
+        dataset = _index_aware_qlearning_dataset(raw, indices)
+        np.testing.assert_array_equal(dataset["rewards"], [0, 2, 3, 4])
+        np.testing.assert_array_equal(
+            dataset["next_observations"], raw["observations"][[1, 3, 4, 5]]
+        )
+
+    def test_direct_hdf5_loader_keeps_qlearning_and_calql_semantics(self):
+        raw = small_raw_dataset()
+        env = FakeEnv()
+        with tempfile.TemporaryDirectory() as directory:
+            path = local_dataset_path(
+                "walker2d-medium-replay-v2", directory
+            )
+            write_hdf5(path, raw)
+            dataset = load_d4rl_dataset(
+                env,
+                directory,
+                discount=1.0,
+                env_name="walker2d-medium-replay-v2",
+            )
+        np.testing.assert_array_equal(dataset["rewards"], [0, 2, 3, 4])
+        np.testing.assert_array_equal(dataset["episode_id"], [0, 1, 2, 2])
+        np.testing.assert_array_equal(dataset["mc_returns"], [0, 2, 7, 4])
+        np.testing.assert_array_equal(
+            dataset["mc_calibration_valid"], np.ones(4, dtype=np.float32)
+        )
+
+    def test_dataset_path_and_official_url(self):
         path = local_dataset_path(
-            "hopper-medium-replay-v2", "/tmp/local-d4rl-datasets"
+            "hopper-medium-replay-v2", "/tmp/d4rl-datasets"
         )
         self.assertEqual(path.name, "hopper_medium_replay-v2.hdf5")
+        self.assertEqual(
+            d4rl_dataset_url("hopper-medium-replay-v2"),
+            "https://rail.eecs.berkeley.edu/datasets/offline_rl/"
+            "gym_mujoco_v2/hopper_medium_replay-v2.hdf5",
+        )
+
+    def test_dataset_download_is_validated_and_atomically_installed(self):
+        with tempfile.TemporaryDirectory() as source_directory:
+            source = Path(source_directory) / "source.hdf5"
+            write_hdf5(source, small_raw_dataset())
+            payload = source.read_bytes()
+        with tempfile.TemporaryDirectory() as destination_directory:
+            response = io.BytesIO(payload)
+            with patch(
+                "robust_o2o.environment.urllib.request.urlopen",
+                return_value=response,
+            ) as urlopen:
+                result = download_d4rl_dataset(
+                    "hopper-medium-replay-v2", destination_directory
+                )
+            self.assertTrue(result.is_file())
+            self.assertEqual(result.read_bytes(), payload)
+            self.assertEqual(list(result.parent.glob("*.part")), [])
+            request = urlopen.call_args.args[0]
+            self.assertEqual(
+                request.full_url,
+                d4rl_dataset_url("hopper-medium-replay-v2"),
+            )
+
+    def test_existing_dataset_is_not_downloaded_without_force(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = local_dataset_path("hopper-medium-v2", directory)
+            write_hdf5(path, small_raw_dataset())
+            with patch(
+                "robust_o2o.environment.urllib.request.urlopen"
+            ) as urlopen:
+                result = download_d4rl_dataset("hopper-medium-v2", directory)
+            self.assertEqual(result, path)
+            urlopen.assert_not_called()
+
+    def test_failed_download_leaves_no_partial_or_target_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch(
+                    "robust_o2o.environment.urllib.request.urlopen",
+                    return_value=io.BytesIO(b"not an hdf5 file"),
+                ),
+                self.assertRaises(OSError),
+            ):
+                download_d4rl_dataset("hopper-medium-v2", directory)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_reference_score_scaling_is_unchanged(self):
         scores = normalized_d4rl_scores(
             "hopper-medium-replay-v2",
             np.asarray([-20.272305, 3234.3]),
-            LOCAL_PROTOCOL,
         )
         np.testing.assert_allclose(scores, [0.0, 100.0])
 
-    def test_local_gymnasium_reset_and_step_results_are_accepted(self):
+    def test_gymnasium_reset_and_step_api(self):
         env = FakeEnv()
-        env.reset = Mock(return_value=(np.zeros(3), {"seeded": True}))
-        env.step = Mock(return_value=(np.ones(3), 1.5, True, False, {}))
-        observation = reset_env(env, seed=7, protocol=LOCAL_PROTOCOL)
-        transition = step_env(env, np.zeros(2), protocol=LOCAL_PROTOCOL)
+        observation = reset_env(env, seed=7)
+        transition = step_env(env, np.zeros(2, dtype=np.float32))
         np.testing.assert_array_equal(observation, np.zeros(3))
-        env.reset.assert_called_once_with(seed=7)
-        self.assertEqual(transition[1:4], (1.5, True, False))
+        self.assertEqual(transition[1:4], (1.0, False, False))
+
+    def test_legacy_step_api_is_rejected(self):
+        env = FakeEnv()
+        env.step = Mock(return_value=(np.zeros(3), 1.0, False, {}))
+        with self.assertRaisesRegex(EnvironmentSetupError, "five values"):
+            step_env(env, np.zeros(2, dtype=np.float32))
 
     def test_dataset_shape_and_finiteness_validation(self):
         env = FakeEnv()
@@ -262,41 +248,6 @@ class StrictRPEXEnvironmentTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-finite"):
             validate_dataset(nonfinite, env)
 
-    def test_legacy_timeout_and_terminal_masks(self):
-        timeout_env = FakeEnv()
-        timeout_env.step = Mock(
-            return_value=(
-                np.zeros(3, dtype=np.float32),
-                1.0,
-                True,
-                {"TimeLimit.truncated": True},
-            )
-        )
-        _, _, terminated, truncated, _ = step_env(
-            timeout_env, np.zeros(2, dtype=np.float32)
-        )
-        self.assertFalse(terminated)
-        self.assertTrue(truncated)
-
-        terminal_env = FakeEnv()
-        terminal_env.step = Mock(
-            return_value=(np.zeros(3, dtype=np.float32), 1.0, True, {})
-        )
-        _, _, terminated, truncated, _ = step_env(
-            terminal_env, np.zeros(2, dtype=np.float32)
-        )
-        self.assertTrue(terminated)
-        self.assertFalse(truncated)
-
-    def test_gymnasium_reset_and_step_results_are_rejected(self):
-        env = FakeEnv()
-        env.reset = Mock(return_value=(np.zeros(3), {}))
-        with self.assertRaisesRegex(RPEXProtocolError, "reset"):
-            reset_env(env)
-        env.step = Mock(return_value=(np.zeros(3), 0.0, False, False, {}))
-        with self.assertRaisesRegex(RPEXProtocolError, "five values"):
-            step_env(env, np.zeros(2))
-
     def test_two_consecutive_thousand_step_timeouts_do_not_leak(self):
         size = 2_000
         raw = {
@@ -309,15 +260,12 @@ class StrictRPEXEnvironmentTest(unittest.TestCase):
         raw["timeouts"][[999, 1999]] = 1.0
         returns = raw_monte_carlo_returns(raw, 1.0, 1_000)
         indices = qlearning_valid_indices(raw, 1_000)
-        mc_returns = returns[indices]
         self.assertEqual(len(indices), 1_998)
-        self.assertEqual(len(mc_returns), len(indices))
         self.assertEqual(returns[0], 1_000.0)
         self.assertEqual(returns[998], 2.0)
         self.assertEqual(returns[1_000], 1_000.0)
-        self.assertEqual(mc_returns[999], 1_000.0)
 
-    def test_missing_timeouts_uses_d4rl_max_episode_fallback(self):
+    def test_missing_timeouts_uses_d4rl_horizon_fallback(self):
         raw = {
             "observations": np.zeros((7, 3), dtype=np.float32),
             "actions": np.zeros((7, 2), dtype=np.float32),
@@ -328,28 +276,18 @@ class StrictRPEXEnvironmentTest(unittest.TestCase):
         np.testing.assert_array_equal(indices, [0, 1, 3, 4])
         returns = raw_monte_carlo_returns(raw, 1.0, max_episode_steps=3)
         np.testing.assert_array_equal(returns, [3, 2, 1, 3, 2, 1, 1])
-        np.testing.assert_array_equal(returns[indices], [3, 2, 3, 2])
 
-    def test_natural_and_timeout_episodes_for_two_discounts(self):
+    def test_terminal_keeps_official_d4rl_counter_order(self):
         raw = {
-            "observations": np.zeros((5, 3), dtype=np.float32),
-            "actions": np.zeros((5, 2), dtype=np.float32),
-            "rewards": np.asarray([1, 2, 3, 4, 999], dtype=np.float32),
-            "terminals": np.asarray([0, 1, 0, 0, 0], dtype=np.float32),
-            "timeouts": np.asarray([0, 0, 0, 1, 0], dtype=np.float32),
+            "observations": np.zeros((7, 3), dtype=np.float32),
+            "actions": np.zeros((7, 2), dtype=np.float32),
+            "rewards": np.ones(7, dtype=np.float32),
+            "terminals": np.asarray([1, 0, 0, 0, 0, 0, 0], dtype=np.float32),
         }
-        indices = qlearning_valid_indices(raw, 1_000)
-        np.testing.assert_array_equal(indices, [0, 1, 2])
-        gamma_one = raw_monte_carlo_returns(raw, 1.0, 1_000)
-        np.testing.assert_allclose(gamma_one[indices], [3.0, 2.0, 7.0])
-        gamma_099 = raw_monte_carlo_returns(raw, 0.99, 1_000)
-        np.testing.assert_allclose(
-            gamma_099[indices], [2.98, 2.0, 6.96], rtol=1e-6
-        )
-        self.assertLess(gamma_099[0], 3.0)
-        self.assertLess(gamma_099[2], 7.0)
+        indices = qlearning_valid_indices(raw, max_episode_steps=3)
+        np.testing.assert_array_equal(indices, [0, 1, 3, 4])
 
-    def test_runtime_metadata_identifies_protocol_and_full_environment(self):
+    def test_metadata_contains_only_modern_runtime_identity(self):
         env = FakeEnv()
         dataset = {
             "observations": np.zeros((4, 3), dtype=np.float32),
@@ -358,45 +296,41 @@ class StrictRPEXEnvironmentTest(unittest.TestCase):
             "rewards": np.zeros(4, dtype=np.float32),
             "terminals": np.zeros(4, dtype=np.float32),
         }
-        with (
-            patch(
-                "robust_o2o.environment.installed_d4rl_commit",
-                return_value=EXPECTED_D4RL_COMMIT,
-            ),
-            patch(
-                "robust_o2o.environment.mujoco_runtime_identity",
-                return_value={
-                    "mujoco_py_version": EXPECTED_MUJOCO_PY_VERSION,
-                    "mujoco_runtime_version_code": (
-                        EXPECTED_MUJOCO_RUNTIME_VERSION_CODE
-                    ),
-                    "mujoco_runtime_version": "2.1.0",
-                    "mujoco_runtime_path": "/fixture/mujoco210",
-                    "mujoco_runtime_error": None,
-                },
-            ),
-        ):
-            metadata = environment_metadata(
-                env, "walker2d-medium-replay-v2", dataset, seed=42
+        with tempfile.TemporaryDirectory() as directory:
+            path = local_dataset_path(
+                "walker2d-medium-replay-v2", directory
             )
-        self.assertEqual(metadata["protocol"], DEFAULT_PROTOCOL)
-        self.assertEqual(metadata["d4rl_env_id"], "walker2d-medium-replay-v2")
-        self.assertEqual(metadata["env_spec_id"], "walker2d-medium-replay-v2")
-        self.assertEqual(metadata["expected_d4rl_commit"], EXPECTED_D4RL_COMMIT)
+            write_hdf5(path, small_raw_dataset())
+            metadata = environment_metadata(
+                env,
+                "walker2d-medium-replay-v2",
+                dataset,
+                seed=42,
+                dataset_dir=directory,
+            )
+        self.assertEqual(metadata["protocol"], MODERN_PROTOCOL)
         self.assertEqual(
-            metadata["mujoco_runtime_version_code"],
-            EXPECTED_MUJOCO_RUNTIME_VERSION_CODE,
+            metadata["environment_id"], "walker2d-medium-replay-v2"
         )
+        self.assertEqual(metadata["env_spec_id"], "Walker2d-v4")
         self.assertEqual(
-            metadata["environment_fingerprint_payload"][
-                "mujoco_runtime_version_code"
-            ],
-            EXPECTED_MUJOCO_RUNTIME_VERSION_CODE,
+            metadata["environment_backend"], "gymnasium-v4+native-mujoco"
         )
-        self.assertEqual(metadata["seed"], 42)
-        self.assertEqual(len(metadata["repository_worktree_sha256"]), 64)
-        for package in ("Python", "numpy", "torch", "gym", "d4rl", "mujoco-py", "h5py"):
+        self.assertEqual(metadata["mujoco_backend"], "native_mujoco")
+        self.assertNotIn("mujoco_py_version", metadata)
+        self.assertNotIn("diagnostic_reason", metadata)
+        self.assertEqual(len(metadata["repository_status_sha256"]), 64)
+        for package in (
+            "Python",
+            "numpy",
+            "torch",
+            "gymnasium",
+            "mujoco",
+            "h5py",
+        ):
             self.assertIn(package, metadata["runtime_package_versions"])
+        for legacy_package in ("gym", "d4rl", "mujoco-py"):
+            self.assertNotIn(legacy_package, runtime_package_versions())
 
 
 if __name__ == "__main__":

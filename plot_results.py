@@ -77,15 +77,15 @@ def _concat_nonempty_frames(frames):
 def _score_plot_labels(metadata):
     """Return labels from declared protocol metadata, never numeric values."""
 
-    from robust_o2o.config import LEGACY_SCORE_SEMANTICS
+    from robust_o2o.config import SCORE_SEMANTICS
     from robust_o2o.reporting import (
         DIAGNOSTIC_SCORE_SEMANTICS,
         classify_score_semantics,
     )
 
     semantics, _ = classify_score_semantics(metadata)
-    if semantics == LEGACY_SCORE_SEMANTICS:
-        return "D4RL normalized return", None
+    if semantics in (SCORE_SEMANTICS, "d4rl_normalized_return"):
+        return "D4RL-reference normalized return", None
     if semantics in DIAGNOSTIC_SCORE_SEMANTICS:
         return (
             "Diagnostic D4RL-reference-scaled return "
@@ -299,7 +299,7 @@ def _load_runs(root: Path):
                 "upstream_commit",
                 "repository_commit",
                 "repository_dirty",
-                "repository_worktree_sha256",
+                "repository_status_sha256",
                 "suite_profile",
                 "run_purpose",
                 "condition_status",
@@ -308,16 +308,11 @@ def _load_runs(root: Path):
                 "evaluation_corruption",
                 "reporting_rule",
                 "reporting_rule_verified",
-                "publication_eligible",
-                "paper_reproduction_eligible",
                 "score_semantics",
                 "evaluation_env_id",
                 "online_env_id",
                 "dataset_sha256",
                 "environment_fingerprint",
-                "benchmark_seed_set",
-                "controller_seed_cohort_attested",
-                "final_audit_context_token",
                 "corruption_rate",
                 "corruption_range",
                 "final_window_size",
@@ -828,6 +823,7 @@ def write_final_score_summary(
     phase: str = "online",
 ) -> Path:
     """Write the declared common last-three metric (never a paper metric)."""
+    from robust_o2o.config import SCORE_SEMANTICS
     from robust_o2o.reporting import (
         aggregate_seed_scores,
         common_reporting_rule,
@@ -878,18 +874,20 @@ def write_final_score_summary(
         how="left",
     )
     result["runs"] = result["num_seeds"]
-    legacy_scores = result["score_semantics"] == "d4rl_normalized_return"
+    normalized_scores = result["score_semantics"].isin(
+        (SCORE_SEMANTICS, "d4rl_normalized_return")
+    )
     result["final_normalized_return_mean"] = result["mean"].where(
-        legacy_scores
+        normalized_scores
     )
     result["final_normalized_return_std"] = result["std"].where(
-        legacy_scores
+        normalized_scores
     )
     result["final_diagnostic_scaled_return_mean"] = result["mean"].where(
-        ~legacy_scores
+        ~normalized_scores
     )
     result["final_diagnostic_scaled_return_std"] = result["std"].where(
-        ~legacy_scores
+        ~normalized_scores
     )
     result["final_raw_return_mean"] = float("nan")
     result["final_raw_return_std"] = float("nan")
@@ -1158,9 +1156,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--single-run")
     parser.add_argument(
-        "--include-running-diagnostic",
+        "--include-running",
         action="store_true",
-        help="include running/legacy-unknown runs in a diagnostic-only plot",
+        help="include running and legacy runs in addition to completed runs",
     )
     return parser
 
@@ -1178,7 +1176,7 @@ def main() -> None:
         args.corruption,
         args.target,
         args.phase,
-        include_running=args.include_running_diagnostic,
+        include_running=args.include_running,
     )
     print(output)
 

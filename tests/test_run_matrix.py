@@ -1,48 +1,20 @@
 from __future__ import annotations
 
-import io
 import unittest
-from contextlib import redirect_stderr
 
-from robust_o2o.config import LOCAL_PROTOCOL
 from run_matrix import _validate_args, build_parser, commands
 
 
 class RunMatrixTest(unittest.TestCase):
-    def test_research_matrix_rejects_local_protocol(self):
+    def test_legacy_protocol_controls_are_not_public_options(self):
         parser = build_parser()
-        args = parser.parse_args(
-            [
-                "--run-purpose",
-                "research_benchmark",
-                "--suite-profile",
-                "research_benchmark",
-                "--protocol",
-                LOCAL_PROTOCOL,
-                "--allow-diagnostic-protocol",
-            ]
-        )
-        stderr = io.StringIO()
-        with redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
-            _validate_args(parser, args, [])
-        self.assertEqual(raised.exception.code, 2)
-        self.assertIn("ResearchBenchmarkProtocolError", stderr.getvalue())
-
-    def test_diagnostic_matrix_allows_local_protocol(self):
-        parser = build_parser()
-        args = parser.parse_args(
-            [
-                "--run-purpose",
-                "diagnostic",
-                "--suite-profile",
-                "common_budget_diagnostic",
-                "--protocol",
-                LOCAL_PROTOCOL,
-                "--allow-diagnostic-protocol",
-            ]
-        )
-        _validate_args(parser, args, [])
-        self.assertEqual(args.protocol, LOCAL_PROTOCOL)
+        help_text = parser.format_help()
+        self.assertNotIn("--protocol", help_text)
+        self.assertNotIn("--run-purpose", help_text)
+        self.assertNotIn("--allow-diagnostic-protocol", help_text)
+        args, passthrough = parser.parse_known_args(["--run-purpose", "diagnostic"])
+        with self.assertRaises(SystemExit):
+            _validate_args(parser, args, passthrough)
 
     def test_non_clean_matrix_rejects_empty_corruption_ranges(self):
         parser = build_parser()
@@ -59,7 +31,7 @@ class RunMatrixTest(unittest.TestCase):
                 "--corruption-ranges",
                 ",",
                 "--suite-profile",
-                "common_budget_diagnostic",
+                "common_budget_robustness",
             ]
         )
         with self.assertRaises(SystemExit):
@@ -82,9 +54,10 @@ class RunMatrixTest(unittest.TestCase):
                 "--corruption-ranges",
                 "0,0.5,1,2",
                 "--suite-profile",
-                "common_budget_diagnostic",
+                "common_budget_robustness",
             ]
         )
+        _validate_args(parser, args, [])
         generated = list(commands(args, [], "severity"))
         self.assertEqual(len(generated), 4)
         self.assertEqual(
@@ -98,6 +71,8 @@ class RunMatrixTest(unittest.TestCase):
                 for command in generated
             )
         )
+        self.assertTrue(all("--protocol" not in command for command in generated))
+        self.assertTrue(all("--run-purpose" not in command for command in generated))
 
 
 if __name__ == "__main__":

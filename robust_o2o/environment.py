@@ -2,38 +2,27 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import random
 import subprocess
+import tempfile
+import urllib.request
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import lru_cache
-from importlib.metadata import PackageNotFoundError, distribution, version
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Dict, Mapping, Tuple
 
 import numpy as np
 import torch
 
-from .config import (
-    BENCHMARK_ENVS,
-    DEFAULT_PROTOCOL,
-    LEGACY_PROTOCOL,
-    LOCAL_PROTOCOL,
-    normalize_env_name,
-)
+from .config import BENCHMARK_ENVS, DEFAULT_PROTOCOL, normalize_env_name
 
 
 Dataset = Dict[str, np.ndarray]
-EXPECTED_D4RL_COMMIT = "d842aa194b416e564e54b0730d9f934e3e32f854"
-EXPECTED_GYM_VERSION = "0.23.1"
-EXPECTED_NUMPY_VERSION = "1.23.5"
-EXPECTED_PYTHON_SERIES = "3.10"
-EXPECTED_MUJOCO_PY_VERSION = "2.1.2.14"
-# ``mujoco_py`` reports the linked MuJoCo C library as an integer.  The
-# official 2.1 binary is 210; checking the binding package alone cannot detect
-# a mismatched simulator installation.
-EXPECTED_MUJOCO_RUNTIME_VERSION_CODE = 210
+MODERN_PROTOCOL = DEFAULT_PROTOCOL
 STANDARD_DATASET_KEYS = (
     "observations",
     "actions",
@@ -41,7 +30,7 @@ STANDARD_DATASET_KEYS = (
     "rewards",
     "terminals",
 )
-LOCAL_GYMNASIUM_ENV_IDS = {
+GYMNASIUM_ENV_IDS = {
     "halfcheetah": "HalfCheetah-v4",
     "hopper": "Hopper-v4",
     "walker2d": "Walker2d-v4",
@@ -51,16 +40,29 @@ EXPECTED_LOCOMOTION_DIMS = {
     "hopper": (11, 3),
     "walker2d": (17, 6),
 }
-# D4RL v2 reference returns used by d4rl.get_normalized_score().
-LOCAL_D4RL_REFERENCE_SCORES = {
+# Reference returns copied from D4RL's v2 score table. Keeping these constants
+# preserves the original normalized-return definition without importing the
+# unmaintained D4RL package at runtime.
+D4RL_REFERENCE_SCORES = {
     "halfcheetah": (-280.178953, 12_135.0),
     "hopper": (-20.272305, 3_234.3),
     "walker2d": (1.629008, 4_592.3),
 }
+D4RL_DATASET_BASE_URL = (
+    "https://rail.eecs.berkeley.edu/datasets/offline_rl/gym_mujoco_v2"
+)
 
 
-class RPEXProtocolError(RuntimeError):
-    """Raised when the strict RPEX/D4RL-v2 runtime cannot be reproduced."""
+class EnvironmentSetupError(RuntimeError):
+    """Raised when the Gymnasium/MuJoCo environment cannot be constructed."""
+
+
+def _validate_protocol(protocol: str) -> None:
+    if protocol != MODERN_PROTOCOL:
+        raise ValueError(
+            f"Unknown environment protocol {protocol!r}; "
+            f"the only supported protocol is {MODERN_PROTOCOL!r}"
+        )
 
 
 def runtime_package_versions() -> Dict[str, str]:
@@ -68,12 +70,9 @@ def runtime_package_versions() -> Dict[str, str]:
     for label, package in (
         ("numpy", "numpy"),
         ("torch", "torch"),
-        ("gym", "gym"),
-        ("d4rl", "d4rl"),
-        ("mujoco-py", "mujoco-py"),
-        ("h5py", "h5py"),
         ("gymnasium", "gymnasium"),
         ("mujoco", "mujoco"),
+        ("h5py", "h5py"),
     ):
         try:
             versions[label] = version(package)
@@ -83,12 +82,7 @@ def runtime_package_versions() -> Dict[str, str]:
 
 
 def repository_state_metadata() -> Dict[str, Any]:
-    """Return lightweight run provenance without invoking strict audit code.
-
-    Research runs only need the current commit, whether the tree is dirty, and
-    a stable digest that distinguishes two dirty trees.  The publication-only
-    certificate/audit machinery deliberately stays out of this execution path.
-    """
+    """Return cheap repository provenance for a run manifest."""
 
     repository_root = Path(__file__).resolve().parents[1]
 
@@ -103,237 +97,80 @@ def repository_state_metadata() -> Dict[str, Any]:
 
     commit = git("rev-parse", "HEAD").decode("ascii").strip()
     status = git(
-        "status", "--porcelain=v1", "--untracked-files=all", "-z"
+        "status", "--porcelain=v1", "--untracked-files=normal", "-z"
     )
-    diff = git("diff", "--binary", "HEAD", "--", ".")
-    digest = hashlib.sha256()
-    digest.update(status)
-    digest.update(diff)
-    untracked = git("ls-files", "--others", "--exclude-standard", "-z")
-    for raw_name in untracked.split(b"\0"):
-        if not raw_name:
-            continue
-        relative = raw_name.decode("utf-8", errors="surrogateescape")
-        path = repository_root / relative
-        digest.update(raw_name)
-        if path.is_symlink():
-            digest.update(path.readlink().as_posix().encode("utf-8"))
-        elif path.is_file():
-            digest.update(path.read_bytes())
-        else:
-            digest.update(b"missing-or-special")
     return {
         "git_commit": commit,
         "repository_commit": commit,
         "repository_dirty": bool(status),
-        "repository_worktree_sha256": digest.hexdigest(),
+        "repository_status_sha256": hashlib.sha256(status).hexdigest(),
     }
 
 
-def installed_d4rl_commit() -> str | None:
-    """Read the immutable VCS commit recorded by pip's direct_url metadata."""
-    try:
-        metadata = distribution("d4rl").read_text("direct_url.json")
-    except PackageNotFoundError:
-        return None
-    if not metadata:
-        return None
-    try:
-        payload = json.loads(metadata)
-    except json.JSONDecodeError:
-        return None
-    vcs = payload.get("vcs_info", {})
-    return vcs.get("commit_id") or vcs.get("requested_revision")
-
-
-def mujoco_runtime_identity() -> Dict[str, Any]:
-    """Return both Python-binding and linked native MuJoCo identities."""
-
-    identity: Dict[str, Any] = {
-        "mujoco_py_version": runtime_package_versions()["mujoco-py"],
-        "mujoco_runtime_version_code": None,
-        "mujoco_runtime_version": None,
-        "mujoco_runtime_path": None,
-        "mujoco_runtime_error": None,
-    }
-    try:
-        import mujoco_py
-
-        version_code = int(mujoco_py.functions.mj_version())
-        identity["mujoco_runtime_version_code"] = version_code
-        identity["mujoco_runtime_version"] = (
-            f"{version_code // 100}.{(version_code // 10) % 10}."
-            f"{version_code % 10}"
-        )
-        discover = getattr(
-            getattr(mujoco_py, "utils", None), "discover_mujoco", None
-        )
-        if discover is not None:
-            identity["mujoco_runtime_path"] = str(Path(discover()).resolve())
-    except BaseException as exc:
-        identity["mujoco_runtime_error"] = f"{type(exc).__name__}: {exc}"
-    return identity
-
-
-@lru_cache(maxsize=1)
-def verify_rpex_runtime() -> None:
-    versions = runtime_package_versions()
-    errors = []
-    if not versions["Python"].startswith(f"{EXPECTED_PYTHON_SERIES}."):
-        errors.append(
-            f"Python {EXPECTED_PYTHON_SERIES} is required, found {versions['Python']}"
-        )
-    if versions["gym"] != EXPECTED_GYM_VERSION:
-        errors.append(
-            f"gym=={EXPECTED_GYM_VERSION} is required, found {versions['gym']}"
-        )
-    if versions["numpy"] != EXPECTED_NUMPY_VERSION:
-        errors.append(
-            f"numpy=={EXPECTED_NUMPY_VERSION} is required, found {versions['numpy']}"
-        )
-    if versions["mujoco-py"] != EXPECTED_MUJOCO_PY_VERSION:
-        errors.append(
-            f"mujoco-py=={EXPECTED_MUJOCO_PY_VERSION} is required, "
-            f"found {versions['mujoco-py']}"
-        )
-    mujoco_identity = mujoco_runtime_identity()
-    if (
-        mujoco_identity["mujoco_runtime_version_code"]
-        != EXPECTED_MUJOCO_RUNTIME_VERSION_CODE
-    ):
-        found = (
-            mujoco_identity["mujoco_runtime_version_code"]
-            if mujoco_identity["mujoco_runtime_version_code"] is not None
-            else mujoco_identity["mujoco_runtime_error"] or "unavailable"
-        )
-        errors.append(
-            "linked MuJoCo runtime version code "
-            f"{EXPECTED_MUJOCO_RUNTIME_VERSION_CODE} (2.1.0) is required, "
-            f"found {found}"
-        )
-    commit = installed_d4rl_commit()
-    if commit != EXPECTED_D4RL_COMMIT:
-        found = commit or "unavailable (direct_url.json missing)"
-        errors.append(
-            "D4RL must be installed from commit "
-            f"{EXPECTED_D4RL_COMMIT}, found {found}"
-        )
-    if errors:
-        raise RPEXProtocolError(
-            f"{DEFAULT_PROTOCOL} reproducibility check failed:\n- "
-            + "\n- ".join(errors)
-            + "\nCreate the pinned environment from environment-rpex-v2.yml. "
-            "Do not substitute Gymnasium v4/v5."
-        )
-
-
-def _import_legacy_backend() -> Tuple[object, object]:
-    try:
-        import gym
-    except ImportError as exc:
-        raise RPEXProtocolError(
-            "The strict RPEX protocol requires legacy gym==0.23.1. "
-            "Create the environment from environment-rpex-v2.yml."
-        ) from exc
-    try:
-        import d4rl
-    except BaseException as exc:
-        raise RPEXProtocolError(
-            "D4RL or its mujoco_py backend could not be imported. Exact RPEX "
-            "reproduction generally requires Linux x86_64, MuJoCo 2.1, and "
-            "the dependencies in requirements-rpex-v2.txt; no Gymnasium "
-            "fallback will be used."
-        ) from exc
-    verify_rpex_runtime()
-    return gym, d4rl
-
-
-def _strict_env_name(env_name: str) -> str:
+def _benchmark_env_name(env_name: str) -> str:
     normalized = normalize_env_name(env_name)
     if normalized not in BENCHMARK_ENVS:
-        if normalized.endswith(("-v4", "-v5")):
-            raise RPEXProtocolError(
-                f"{env_name!r} is a Gymnasium ID. {DEFAULT_PROTOCOL} requires "
-                "a complete D4RL-v2 ID such as 'walker2d-medium-replay-v2'."
-            )
         raise ValueError(
-            f"Unsupported RPEX benchmark environment {normalized!r}; "
+            f"Unsupported benchmark environment {normalized!r}; "
             f"choose from {BENCHMARK_ENVS}"
-        )
-    if not normalized.endswith("-v2"):
-        raise RPEXProtocolError(
-            f"Strict RPEX environments must end in '-v2', got {normalized!r}"
         )
     return normalized
 
 
-def _set_dataset_path(d4rl: object, dataset_dir: str | None) -> None:
-    if dataset_dir is None:
-        return
-    setter = getattr(d4rl, "set_dataset_path", None)
-    if setter is None:
-        raise RPEXProtocolError(
-            "Pinned D4RL does not expose d4rl.set_dataset_path(); the installed "
-            "package does not match the required commit."
-        )
-    setter(str(Path(dataset_dir).expanduser().resolve()))
-
-
-def local_gymnasium_env_id(env_name: str) -> str:
-    full_env_name = _strict_env_name(env_name)
+def gymnasium_env_id(env_name: str) -> str:
+    full_env_name = _benchmark_env_name(env_name)
     domain = full_env_name.split("-", 1)[0]
-    return LOCAL_GYMNASIUM_ENV_IDS[domain]
+    return GYMNASIUM_ENV_IDS[domain]
 
 
 def expected_env_spec_id(
     env_name: str,
     protocol: str = DEFAULT_PROTOCOL,
 ) -> str:
-    if protocol == LOCAL_PROTOCOL:
-        return local_gymnasium_env_id(env_name)
-    return _strict_env_name(env_name)
+    _validate_protocol(protocol)
+    return gymnasium_env_id(env_name)
 
 
 def make_env(
     env_name: str,
     protocol: str = DEFAULT_PROTOCOL,
 ) -> object:
-    full_env_name = _strict_env_name(env_name)
-    if protocol == LOCAL_PROTOCOL:
-        try:
-            import gymnasium as gym
-        except ImportError as exc:
-            raise RPEXProtocolError(
-                "The local protocol requires Gymnasium. Activate the "
-                "'corruption' Conda environment."
-            ) from exc
-        gymnasium_id = local_gymnasium_env_id(full_env_name)
-        try:
-            return gym.make(gymnasium_id)
-        except BaseException as exc:
-            raise RPEXProtocolError(
-                f"Failed to create local Gymnasium environment {gymnasium_id!r}."
-            ) from exc
-    if protocol != LEGACY_PROTOCOL:
-        raise ValueError(f"Unknown environment protocol {protocol!r}")
-    gym, _ = _import_legacy_backend()
+    _validate_protocol(protocol)
+    full_env_name = _benchmark_env_name(env_name)
     try:
-        env = gym.make(full_env_name)
-    except BaseException as exc:
-        raise RPEXProtocolError(
-            f"Failed to create registered D4RL environment {full_env_name!r}. "
-            "Verify the pinned D4RL commit, mujoco_py, and MuJoCo 2.1. "
-            "The ID will not be translated to a Gymnasium v4/v5 task."
+        import gymnasium as gym
+    except ImportError as exc:
+        raise EnvironmentSetupError(
+            "Gymnasium is required. Create the Conda environment from "
+            "environment.yml."
+        ) from exc
+    gymnasium_id = gymnasium_env_id(full_env_name)
+    try:
+        # Gymnasium recommends v5 globally, but this project intentionally
+        # retains v4 because v5 changes the benchmark MDP. Avoid repeating the
+        # same migration warning for every train/evaluation environment.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r".*environment .* is out of date.*",
+                category=DeprecationWarning,
+            )
+            env = gym.make(gymnasium_id)
+    except Exception as exc:
+        raise EnvironmentSetupError(
+            f"Failed to create Gymnasium environment {gymnasium_id!r}. "
+            "Install gymnasium[mujoco] and mujoco from requirements.txt."
         ) from exc
     spec_id = getattr(getattr(env, "spec", None), "id", None)
-    if spec_id != full_env_name:
+    if spec_id != gymnasium_id:
         try:
             env.close()
         finally:
-            raise RPEXProtocolError(
-                f"Environment registration mismatch: requested {full_env_name!r}, "
+            raise EnvironmentSetupError(
+                f"Environment registration mismatch: requested {gymnasium_id!r}, "
                 f"but env.spec.id is {spec_id!r}."
             )
+    setattr(env, "_robust_o2o_dataset_id", full_env_name)
     return env
 
 
@@ -381,6 +218,9 @@ def qlearning_valid_indices(
         if final_timestep:
             episode_step = 0
             continue
+        # Preserve D4RL's original qlearning_dataset ordering exactly: a
+        # terminal resets the counter before the retained transition and the
+        # unconditional increment happens afterwards.
         if bool(terminals[index]):
             episode_step = 0
         indices.append(index)
@@ -510,25 +350,6 @@ def raw_episode_ids(
     return ids
 
 
-def _assert_official_dataset_matches(
-    official: Mapping[str, np.ndarray],
-    converted: Mapping[str, np.ndarray],
-) -> None:
-    missing = [key for key in STANDARD_DATASET_KEYS if key not in official]
-    if missing:
-        raise AssertionError(f"d4rl.qlearning_dataset omitted keys: {missing}")
-    for key in STANDARD_DATASET_KEYS:
-        actual = np.asarray(official[key])
-        expected = np.asarray(converted[key])
-        if actual.shape != expected.shape or not np.allclose(
-            actual, expected, rtol=1e-6, atol=1e-6
-        ):
-            raise AssertionError(
-                "Pinned d4rl.qlearning_dataset disagrees with the index-aware "
-                f"conversion for {key}: {actual.shape} vs {expected.shape}"
-            )
-
-
 def validate_dataset(dataset: Mapping[str, np.ndarray], env: object) -> Dataset:
     missing = [key for key in STANDARD_DATASET_KEYS if key not in dataset]
     if missing:
@@ -577,13 +398,13 @@ def local_dataset_path(
     env_name: str,
     dataset_dir: str | None = None,
 ) -> Path:
-    full_env_name = _strict_env_name(env_name)
+    full_env_name = _benchmark_env_name(env_name)
     root = (
         Path(dataset_dir).expanduser().resolve()
         if dataset_dir
         else Path.home() / ".d4rl" / "datasets"
     )
-    if root.is_file():
+    if root.is_file() or root.suffix.lower() in {".h5", ".hdf5"}:
         return root
     domain, dataset_and_version = full_env_name.split("-", 1)
     dataset, version = dataset_and_version.rsplit("-", 1)
@@ -591,17 +412,66 @@ def local_dataset_path(
     return root / filename
 
 
+def d4rl_dataset_url(env_name: str) -> str:
+    """Return the official D4RL-v2 HDF5 URL for a benchmark task."""
+
+    return f"{D4RL_DATASET_BASE_URL}/{local_dataset_path(env_name).name}"
+
+
+def download_d4rl_dataset(
+    env_name: str,
+    dataset_dir: str | None = None,
+    force: bool = False,
+) -> Path:
+    """Download one official D4RL-v2 HDF5 file atomically.
+
+    A unique temporary file in the destination directory prevents interrupted
+    downloads from being mistaken for complete datasets. The destination is
+    replaced only after the HDF5 structure has been validated.
+    """
+
+    target = local_dataset_path(env_name, dataset_dir)
+    if target.is_file() and not force:
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(
+        d4rl_dataset_url(env_name),
+        headers={"User-Agent": "corruption-robust-o2o/1"},
+    )
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=target.parent,
+        prefix=f".{target.name}.",
+        suffix=".part",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output, urllib.request.urlopen(
+            request, timeout=60
+        ) as response:
+            while chunk := response.read(1024 * 1024):
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        _load_local_raw_dataset(temporary_path)
+        os.replace(temporary_path, target)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return target
+
+
 def _load_local_raw_dataset(path: Path) -> Dataset:
     try:
         import h5py
     except ImportError as exc:
-        raise RPEXProtocolError(
-            "The local protocol requires h5py in the 'corruption' environment."
+        raise EnvironmentSetupError(
+            "Reading D4RL datasets requires h5py from requirements.txt."
         ) from exc
     if not path.is_file():
         raise FileNotFoundError(
-            f"Local D4RL dataset not found: {path}. Place the v2 HDF5 file in "
-            "~/.d4rl/datasets or pass --dataset-dir."
+            f"D4RL-v2 dataset not found: {path}. Run "
+            "'python scripts/download_d4rl_datasets.py' first, or pass "
+            "--dataset-dir."
         )
     with h5py.File(path, "r") as stream:
         required = ("observations", "actions", "rewards", "terminals")
@@ -621,41 +491,17 @@ def load_d4rl_dataset(
     protocol: str = DEFAULT_PROTOCOL,
     env_name: str | None = None,
 ) -> Dataset:
-    if protocol == LOCAL_PROTOCOL:
-        if env_name is None:
-            raise ValueError("env_name is required when loading a local D4RL dataset")
-        raw = _load_local_raw_dataset(local_dataset_path(env_name, dataset_dir))
-        max_episode_steps = _max_episode_steps(env)
-        valid_indices = qlearning_valid_indices(raw, max_episode_steps)
-        dataset = _index_aware_qlearning_dataset(raw, valid_indices)
-        dataset["episode_id"] = raw_episode_ids(raw, max_episode_steps)[
-            valid_indices
-        ].astype(np.float32, copy=True)
-        dataset["mc_returns"] = converted_monte_carlo_returns(
-            dataset, discount
+    _validate_protocol(protocol)
+    if env_name is None:
+        env_name = getattr(env, "_robust_o2o_dataset_id", None)
+    if env_name is None:
+        raise ValueError(
+            "env_name is required when the environment was not created by make_env()"
         )
-        dataset["mc_calibration_valid"] = np.ones(
-            len(valid_indices), dtype=np.float32
-        )
-        return validate_dataset(dataset, env)
-    if protocol != LEGACY_PROTOCOL:
-        raise ValueError(f"Unknown dataset protocol {protocol!r}")
-    _, d4rl = _import_legacy_backend()
-    _set_dataset_path(d4rl, dataset_dir)
-    raw = env.get_dataset()
+    raw = _load_local_raw_dataset(local_dataset_path(env_name, dataset_dir))
     max_episode_steps = _max_episode_steps(env)
     valid_indices = qlearning_valid_indices(raw, max_episode_steps)
-    official = d4rl.qlearning_dataset(
-        env,
-        dataset=raw,
-        terminate_on_end=False,
-    )
-    converted = _index_aware_qlearning_dataset(raw, valid_indices)
-    _assert_official_dataset_matches(official, converted)
-    dataset = {
-        key: np.asarray(official[key], dtype=np.float32).copy()
-        for key in STANDARD_DATASET_KEYS
-    }
+    dataset = _index_aware_qlearning_dataset(raw, valid_indices)
     dataset["episode_id"] = raw_episode_ids(raw, max_episode_steps)[
         valid_indices
     ].astype(np.float32, copy=True)
@@ -692,19 +538,12 @@ def normalized_d4rl_scores(
     returns: np.ndarray,
     protocol: str = DEFAULT_PROTOCOL,
 ) -> np.ndarray:
-    full_env_name = _strict_env_name(env_name)
-    if protocol == LOCAL_PROTOCOL:
-        domain = full_env_name.split("-", 1)[0]
-        random_return, expert_return = LOCAL_D4RL_REFERENCE_SCORES[domain]
-        values = np.asarray(returns, dtype=np.float64)
-        return (values - random_return) / (expert_return - random_return) * 100.0
-    if protocol != LEGACY_PROTOCOL:
-        raise ValueError(f"Unknown score protocol {protocol!r}")
-    _, d4rl = _import_legacy_backend()
+    _validate_protocol(protocol)
+    full_env_name = _benchmark_env_name(env_name)
+    domain = full_env_name.split("-", 1)[0]
+    random_return, expert_return = D4RL_REFERENCE_SCORES[domain]
     values = np.asarray(returns, dtype=np.float64)
-    return np.asarray(
-        d4rl.get_normalized_score(full_env_name, values), dtype=np.float64
-    ) * 100.0
+    return (values - random_return) / (expert_return - random_return) * 100.0
 
 
 def _sha256(path: Path) -> str:
@@ -723,41 +562,13 @@ def environment_metadata(
     protocol: str = DEFAULT_PROTOCOL,
     dataset_dir: str | None = None,
 ) -> Dict[str, Any]:
-    full_env_name = _strict_env_name(env_name)
+    _validate_protocol(protocol)
+    full_env_name = _benchmark_env_name(env_name)
     unwrapped = getattr(env, "unwrapped", env)
-    if protocol == LOCAL_PROTOCOL:
-        dataset_url = None
-        dataset_path = local_dataset_path(full_env_name, dataset_dir)
-        environment_backend = "gymnasium-v4+native-mujoco"
-        dataset_backend = "local-d4rl-v2-hdf5+index-aware-qlearning-conversion"
-        expected_commit = None
-        installed_commit = None
-    elif protocol == LEGACY_PROTOCOL:
-        dataset_url = getattr(unwrapped, "dataset_url", None)
-        dataset_path_value = getattr(unwrapped, "dataset_filepath", None)
-        dataset_path = (
-            Path(dataset_path_value).expanduser().resolve()
-            if dataset_path_value
-            else None
-        )
-        environment_backend = "gym-0.23.1+d4rl-v2+mujoco_py"
-        dataset_backend = "d4rl.qlearning_dataset(terminate_on_end=False)"
-        expected_commit = EXPECTED_D4RL_COMMIT
-        installed_commit = installed_d4rl_commit()
-    else:
-        raise ValueError(f"Unknown metadata protocol {protocol!r}")
+    source_path = local_dataset_path(full_env_name, dataset_dir)
+    environment_backend = "gymnasium-v4+native-mujoco"
+    dataset_backend = "d4rl-v2-hdf5+index-aware-qlearning-conversion"
     versions = runtime_package_versions()
-    mujoco_identity = (
-        mujoco_runtime_identity()
-        if protocol == LEGACY_PROTOCOL
-        else {
-            "mujoco_py_version": versions["mujoco-py"],
-            "mujoco_runtime_version_code": None,
-            "mujoco_runtime_version": versions["mujoco"],
-            "mujoco_runtime_path": None,
-            "mujoco_runtime_error": None,
-        }
-    )
     try:
         repository_metadata = repository_state_metadata()
     except (OSError, RuntimeError, subprocess.SubprocessError):
@@ -765,7 +576,7 @@ def environment_metadata(
             "git_commit": "unknown",
             "repository_commit": "unknown",
             "repository_dirty": None,
-            "repository_worktree_sha256": None,
+            "repository_status_sha256": None,
         }
     action_space = env.action_space
     action_low = np.asarray(
@@ -780,6 +591,7 @@ def environment_metadata(
     metadata = {
         "protocol": protocol,
         "environment_protocol": protocol,
+        "environment_id": full_env_name,
         "d4rl_env_id": full_env_name,
         "dataset_id": full_env_name,
         "env_spec_id": evaluation_env_id,
@@ -791,28 +603,18 @@ def environment_metadata(
         "dataset_backend": dataset_backend,
         "runtime_package_versions": versions,
         "python_version": versions["Python"],
-        "gym_version": versions["gym"],
         "gymnasium_version": versions["gymnasium"],
         "numpy_version": versions["numpy"],
-        "mujoco_backend": (
-            "mujoco_py" if protocol == LEGACY_PROTOCOL else "native_mujoco"
-        ),
-        **mujoco_identity,
-        "d4rl_version_or_commit": installed_commit or versions["d4rl"],
+        "torch_version": versions["torch"],
+        "h5py_version": versions["h5py"],
+        "mujoco_backend": "native_mujoco",
+        "mujoco_runtime_version": versions["mujoco"],
         **repository_metadata,
-        "benchmark_comparable": protocol == LEGACY_PROTOCOL,
-        "diagnostic_reason": (
-            None
-            if protocol == LEGACY_PROTOCOL
-            else "D4RL-v2 dataset evaluated on Gymnasium-v4 simulator"
-        ),
-        "expected_d4rl_commit": expected_commit,
-        "installed_d4rl_commit": installed_commit,
-        "dataset_url": dataset_url,
-        "dataset_path": str(dataset_path) if dataset_path else None,
+        "dataset_url": d4rl_dataset_url(full_env_name),
+        "dataset_path": str(source_path),
         "dataset_sha256": (
-            _sha256(dataset_path)
-            if dataset_path is not None and dataset_path.is_file()
+            _sha256(source_path)
+            if source_path.is_file()
             else None
         ),
         "observation_dim": int(dataset["observations"].shape[1]),
@@ -843,14 +645,12 @@ def environment_metadata(
             "action_low",
             "action_high",
             "python_version",
-            "gym_version",
             "gymnasium_version",
             "numpy_version",
+            "torch_version",
+            "h5py_version",
             "mujoco_backend",
-            "mujoco_py_version",
-            "mujoco_runtime_version_code",
             "mujoco_runtime_version",
-            "d4rl_version_or_commit",
         )
     }
     serialized = json.dumps(
@@ -866,7 +666,8 @@ def preflight_runtime(
     dataset_dir: str | None = None,
     protocol: str = DEFAULT_PROTOCOL,
 ) -> Dict[str, Any]:
-    """Validate the selected backend and materialize its D4RL dataset."""
+    """Validate the modern backend and load its D4RL-v2 dataset."""
+    _validate_protocol(protocol)
     env, dataset = make_env_and_dataset(
         env_name,
         dataset_dir,
@@ -874,18 +675,17 @@ def preflight_runtime(
     )
     try:
         reset_env(env, seed=0, protocol=protocol)
-        if protocol == LEGACY_PROTOCOL:
-            domain = normalize_env_name(env_name).split("-", 1)[0]
-            expected_state_dim, expected_action_dim = EXPECTED_LOCOMOTION_DIMS[domain]
-            actual = (
-                int(dataset["observations"].shape[1]),
-                int(dataset["actions"].shape[1]),
+        domain = normalize_env_name(env_name).split("-", 1)[0]
+        expected_state_dim, expected_action_dim = EXPECTED_LOCOMOTION_DIMS[domain]
+        actual = (
+            int(dataset["observations"].shape[1]),
+            int(dataset["actions"].shape[1]),
+        )
+        if actual != (expected_state_dim, expected_action_dim):
+            raise EnvironmentSetupError(
+                "D4RL-v2 observation/action dimensions mismatch: "
+                f"expected={(expected_state_dim, expected_action_dim)}, actual={actual}"
             )
-            if actual != (expected_state_dim, expected_action_dim):
-                raise RPEXProtocolError(
-                    "Strict D4RL-v2 observation/action dimensions mismatch: "
-                    f"expected={(expected_state_dim, expected_action_dim)}, actual={actual}"
-                )
         return environment_metadata(
             env,
             env_name,
@@ -983,27 +783,16 @@ def reset_env(
     seed: int | None = None,
     protocol: str = DEFAULT_PROTOCOL,
 ) -> np.ndarray:
-    if protocol == LOCAL_PROTOCOL:
-        result = env.reset(seed=seed) if seed is not None else env.reset()
-        observation = result[0] if isinstance(result, tuple) else result
-        return np.asarray(observation, dtype=np.float32)
-    if protocol != LEGACY_PROTOCOL:
-        raise ValueError(f"Unknown reset protocol {protocol!r}")
-    if seed is not None:
-        seed_method = getattr(env, "seed", None)
-        if seed_method is None:
-            raise RPEXProtocolError(
-                "Legacy RPEX environment does not expose env.seed(); the wrong "
-                "environment backend may be active."
-            )
-        seed_method(seed)
-    result = env.reset()
-    if isinstance(result, tuple):
-        raise RPEXProtocolError(
-            "env.reset() returned a tuple. The strict RPEX protocol expects the "
-            "legacy Gym API and will not accept a Gymnasium reset result."
+    _validate_protocol(protocol)
+    result = env.reset(seed=seed) if seed is not None else env.reset()
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise EnvironmentSetupError(
+            "Gymnasium env.reset() must return (observation, info)"
         )
-    return np.asarray(result, dtype=np.float32)
+    observation, info = result
+    if not isinstance(info, dict):
+        raise EnvironmentSetupError("Gymnasium env.reset() info must be a dict")
+    return np.asarray(observation, dtype=np.float32)
 
 
 def step_env(
@@ -1011,45 +800,21 @@ def step_env(
     action: np.ndarray,
     protocol: str = DEFAULT_PROTOCOL,
 ) -> Tuple[np.ndarray, float, bool, bool, dict]:
+    _validate_protocol(protocol)
     result = env.step(action)
-    if not isinstance(result, tuple):
-        raise RPEXProtocolError("env.step() must return a tuple")
-    if protocol == LOCAL_PROTOCOL:
-        if len(result) != 5:
-            raise RPEXProtocolError(
-                f"Local Gymnasium env.step() must return five values, got {len(result)}"
-            )
-        observation, reward, terminated, truncated, info = result
-        if not isinstance(info, dict):
-            raise RPEXProtocolError("Gymnasium env.step() info value must be a dict")
-        return (
-            np.asarray(observation, dtype=np.float32),
-            float(reward),
-            bool(terminated),
-            bool(truncated),
-            info,
+    if not isinstance(result, tuple) or len(result) != 5:
+        count = len(result) if isinstance(result, tuple) else "non-tuple"
+        raise EnvironmentSetupError(
+            f"Gymnasium env.step() must return five values, got {count}"
         )
-    if protocol != LEGACY_PROTOCOL:
-        raise ValueError(f"Unknown step protocol {protocol!r}")
-    if len(result) == 5:
-        raise RPEXProtocolError(
-            "env.step() returned five values. A Gymnasium backend was loaded, "
-            "but rpex_d4rl_v2_legacy requires Gym's four-value step API."
-        )
-    if len(result) != 4:
-        raise RPEXProtocolError(
-            f"Legacy env.step() must return four values, got {len(result)}"
-        )
-    observation, reward, done, info = result
+    observation, reward, terminated, truncated, info = result
     if not isinstance(info, dict):
-        raise RPEXProtocolError("Legacy env.step() info value must be a dict")
-    truncated = bool(info.get("TimeLimit.truncated", False))
-    terminated = bool(done and not truncated)
+        raise EnvironmentSetupError("Gymnasium env.step() info must be a dict")
     return (
         np.asarray(observation, dtype=np.float32),
         float(reward),
-        terminated,
-        truncated,
+        bool(terminated),
+        bool(truncated),
         info,
     )
 
@@ -1092,7 +857,7 @@ def evaluate_agent(
     max_episode_steps: int,
     seed: int,
     protocol: str = DEFAULT_PROTOCOL,
-    evaluation_mode: str = "deterministic_diagnostic",
+    evaluation_mode: str = "deterministic",
     action_execution_profile: str = "clip_to_action_space",
 ) -> Dict[str, float]:
     returns = []
@@ -1143,11 +908,4 @@ def evaluate_agent(
         "normalized_return_mean": float(np.nanmean(normalized)),
         "normalized_return_std": float(np.nanstd(normalized)),
     }
-    if protocol == LOCAL_PROTOCOL:
-        result["diagnostic_d4rl_reference_scaled_return_mean"] = result[
-            "normalized_return_mean"
-        ]
-        result["diagnostic_d4rl_reference_scaled_return_std"] = result[
-            "normalized_return_std"
-        ]
     return result

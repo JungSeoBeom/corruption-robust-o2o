@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from .config import LEGACY_PROTOCOL, LEGACY_SCORE_SEMANTICS
+from .config import DEFAULT_PROTOCOL, SCORE_SEMANTICS
 from .fidelity import BASELINE_REPRODUCTION_REGISTRY, canonical_json_sha256
 
 
@@ -36,16 +36,10 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
     protocol = resolved.get("protocol") or resolved.get("environment_protocol")
     environment_protocol = resolved.get("environment_protocol") or protocol
     score_semantics = resolved.get("score_semantics")
-    # Fail closed on contradictory or incomplete runtime metadata.  The
-    # manifest's benchmark_eligible value is derived here instead of trusting
-    # a caller-provided boolean, so local diagnostic results cannot be
-    # relabelled by a stale config dictionary.
     benchmark_eligible = bool(
-        resolved.get("run_purpose")
-        in ("research_benchmark", "final_benchmark")
-        and protocol == LEGACY_PROTOCOL
-        and environment_protocol == LEGACY_PROTOCOL
-        and score_semantics == LEGACY_SCORE_SEMANTICS
+        protocol == DEFAULT_PROTOCOL
+        and environment_protocol == DEFAULT_PROTOCOL
+        and score_semantics == SCORE_SEMANTICS
     )
     policy_distribution = str(resolved.get("action_distribution"))
     implementation_type, benchmark_role = _benchmark_classification(
@@ -220,26 +214,13 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "mc_return_source",
     )
     manifest = {
-        "manifest_schema_version": 2,
+        "manifest_schema_version": 3,
         "repository_commit": resolved.get(
             "repository_commit", resolved.get("git_commit")
         ),
         "repository_dirty": resolved.get("repository_dirty"),
-        "repository_worktree_sha256": resolved.get(
-            "repository_worktree_sha256"
-        ),
-        "benchmark_seed_set": resolved.get("benchmark_seed_set"),
-        "controller_seed_cohort_attested": resolved.get(
-            "controller_seed_cohort_attested", False
-        ),
-        "final_audit_context_token": resolved.get("final_audit_context_token"),
-        "final_audit_receipt_sha256": resolved.get(
-            "final_audit_receipt_sha256"
-        ),
-        "publication_scope": (
-            "individual_seed_member_requires_complete_cohort_aggregation"
-            if resolved.get("run_purpose") == "final_benchmark"
-            else "non_publication_run"
+        "repository_status_sha256": resolved.get(
+            "repository_status_sha256"
         ),
         "algorithm": algorithm,
         "display_name": display_name,
@@ -270,10 +251,6 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "corruption_protocol_source": resolved.get(
             "corruption_protocol_source"
         ),
-        "corruption_fixture_id": resolved.get("corruption_fixture_id"),
-        "corruption_fixture_verified": resolved.get(
-            "corruption_fixture_verified"
-        ),
         "upstream_repository": (
             reproduction_record.upstream_repository
             if reproduction_record is not None
@@ -288,7 +265,6 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "run_purpose": resolved.get("run_purpose"),
         "protocol": protocol,
         "budget_profile": resolved.get("budget_profile"),
-        "not_paper_reproduction": resolved.get("not_paper_reproduction"),
         "environment_protocol": environment_protocol,
         "score_semantics": score_semantics,
         "benchmark_eligible": benchmark_eligible,
@@ -300,10 +276,6 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "environment_horizon": resolved.get("environment_max_episode_steps"),
         "dataset_sha256": resolved.get("dataset_sha256"),
         "environment_versions": resolved.get("runtime_package_versions"),
-        "mujoco_py_version": resolved.get("mujoco_py_version"),
-        "mujoco_runtime_version_code": resolved.get(
-            "mujoco_runtime_version_code"
-        ),
         "mujoco_runtime_version": resolved.get("mujoco_runtime_version"),
         "requested_device": resolved.get("device"),
         "resolved_device": resolved.get("resolved_device"),
@@ -451,9 +423,6 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "evaluation_env_strategy": resolved.get("evaluation_env_strategy"),
         "evaluation_seed_schedule": resolved.get("evaluation_seed_schedule"),
-        "evaluation_protocol_parity_verified": resolved.get(
-            "evaluation_protocol_parity_verified"
-        ),
         "train_env_seed": resolved.get("train_env_seed"),
         "eval_seed": resolved.get("eval_seed"),
         "offline_updates": resolved.get("offline_update_budget"),
@@ -489,16 +458,6 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "actual_utd": resolved.get("actual_utd"),
         "reporting_rule": resolved.get("reporting_rule"),
         "reporting_rule_verified": resolved.get("reporting_rule_verified"),
-        "learner_parity_verified": resolved.get(
-            "learner_parity_verified", False
-        ),
-        "condition_certificate_verified": resolved.get(
-            "condition_certificate_verified", False
-        ),
-        "publication_eligible": resolved.get("publication_eligible", False),
-        "paper_reproduction_eligible": resolved.get(
-            "paper_reproduction_eligible", False
-        ),
         "utd_ratio": resolved.get("utd_ratio"),
         "per_condition_hyperparameter_row": resolved.get("riql_config_row"),
         "per_condition_hyperparameter_extension": resolved.get(
@@ -550,12 +509,7 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def verify_experiment_manifest(manifest: Mapping[str, Any]) -> str:
-    """Verify and return the full immutable launch-artifact digest.
-
-    The launch digest deliberately covers provenance such as the exact audit
-    receipt consumed at launch.  That receipt is immutable evidence, but its
-    issuance timestamp/PID make it unsuitable as a behavioral resume key.
-    """
+    """Verify and return the digest covering the complete launch identity."""
 
     recorded = manifest.get("manifest_sha256")
     if not isinstance(recorded, str) or not recorded:
@@ -574,11 +528,6 @@ def verify_experiment_manifest(manifest: Mapping[str, Any]) -> str:
 
 _RESUME_TRANSIENT_PROVENANCE_FIELDS = {
     "manifest_sha256",
-    # A fresh PASS/READY audit receipt is issued when a stopped controller is
-    # restarted.  Its digest changes because the receipt records issuance time
-    # and origin PID; the covered context token remains the stable provenance
-    # identity and is intentionally *not* excluded here.
-    "final_audit_receipt_sha256",
 }
 
 
@@ -622,9 +571,6 @@ SEED_FIELDS = {
     "completed_online_transitions",
     "pending_episode_length",
     "effective_calql_training_transitions",
-    # Audit receipts are per-controller issuance evidence, not an algorithmic
-    # setting.  The stable audit context token remains in the aggregation key.
-    "final_audit_receipt_sha256",
 }
 
 

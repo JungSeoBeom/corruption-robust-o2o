@@ -804,20 +804,16 @@ class FidelityProfileTest(unittest.TestCase):
         config = ExperimentConfig("wsrl", "hopper-medium-replay-v2").to_dict()
         config.update(
             algorithm="wsrl",
-            environment_protocol="rpex_d4rl_v2_legacy",
+            environment_protocol=config["protocol"],
             dataset_id="hopper-medium-replay-v2",
-            evaluation_env_id="hopper-medium-replay-v2",
-            online_env_id="hopper-medium-replay-v2",
+            evaluation_env_id="Hopper-v4",
+            online_env_id="Hopper-v4",
             dataset_sha256="abc",
             normalizer_sha256="def",
-            corruption_fixture_id="rpex_random_corruption_v1",
-            corruption_fixture_verified=True,
         )
         first = build_experiment_manifest(config)
-        self.assertEqual(
-            first["corruption_fixture_id"], "rpex_random_corruption_v1"
-        )
-        self.assertTrue(first["corruption_fixture_verified"])
+        self.assertEqual(first["manifest_schema_version"], 3)
+        self.assertEqual(first["environment_protocol"], config["protocol"])
         second = json.loads(json.dumps(first))
         second["learner_seed"] = 99
         second["manifest_sha256"] = canonical_json_sha256(
