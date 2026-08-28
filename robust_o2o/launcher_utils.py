@@ -8,6 +8,7 @@ REMOVED_LAUNCH_OPTIONS = frozenset(
     {
         "--allow-diagnostic-protocol",
         "--benchmark-seed-set",
+        "--evaluation-mode",
         "--protocol",
         "--run-purpose",
     }

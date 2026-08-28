@@ -42,6 +42,7 @@ class ResumeIdentityTest(unittest.TestCase):
         self.assertNotIn("--run-purpose", help_text)
         self.assertNotIn("--allow-diagnostic-protocol", help_text)
         self.assertNotIn("--benchmark-seed-set", help_text)
+        self.assertNotIn("--evaluation-mode", help_text)
 
     def test_foreign_or_legacy_exact_resume_checkpoint_is_read_only(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -12,7 +12,14 @@ class RunMatrixTest(unittest.TestCase):
         self.assertNotIn("--protocol", help_text)
         self.assertNotIn("--run-purpose", help_text)
         self.assertNotIn("--allow-diagnostic-protocol", help_text)
+        self.assertNotIn("--evaluation-mode", help_text)
         args, passthrough = parser.parse_known_args(["--run-purpose", "diagnostic"])
+        with self.assertRaises(SystemExit):
+            _validate_args(parser, args, passthrough)
+
+        args, passthrough = parser.parse_known_args(
+            ["--evaluation-mode", "deterministic"]
+        )
         with self.assertRaises(SystemExit):
             _validate_args(parser, args, passthrough)
 

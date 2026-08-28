@@ -193,6 +193,9 @@ class ExperimentConfig:
     state_normalization: str = "standard"
     deterministic_policy: bool = False
     action_distribution: str = "tanh_gaussian"
+    # Resolved internally from the suite/implementation profile. It is not a
+    # public CLI control, so one comparison cannot mix evaluation policies by
+    # accident.
     evaluation_mode: Optional[str] = None
     online_replay_profile: str = "official_code_online_only"
     evaluation_policy_profile: str = "official_code_epsilon_switching"
@@ -220,7 +223,7 @@ class ExperimentConfig:
     riql_config_extension: bool = False
 
     # SAC ensemble / UWMSG / RO2O / Pessimistic Q Ensemble
-    sac_num_critics: int = 10
+    sac_num_critics: int = 5
     lcb_ratio: float = 4.0
     uncertainty_ratio: float = 0.7
     uncertainty_basic: float = 0.0
@@ -1162,14 +1165,14 @@ class ExperimentConfig:
             self.balanced_replay_temperature = self.pqe_priority_temperature
         if self.algorithm == "wsrl":
             if self.wsrl_num_critics is None:
-                self.wsrl_num_critics = 10 if reference else self.sac_num_critics
+                self.wsrl_num_critics = 5 if reference else self.sac_num_critics
             self.sac_num_critics = self.wsrl_num_critics
             if self.wsrl_target_critic_subsample_size is None:
                 self.wsrl_target_critic_subsample_size = 2 if reference else self.sac_num_critics
             if self.wsrl_layer_norm is None:
                 self.wsrl_layer_norm = reference
             if self.wsrl_utd_ratio is None:
-                self.wsrl_utd_ratio = 4 if reference else self.updates_per_step
+                self.wsrl_utd_ratio = 1 if reference else self.updates_per_step
             action_dim = ACTION_DIMS[self.env_name.split("-", 1)[0]]
             resolved_target_entropy = (
                 -float(action_dim)
@@ -1680,10 +1683,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         default="tanh_gaussian",
         help="bounded default, or unsafe reproduction-only PEX/RPEX Gaussian",
-    )
-    parser.add_argument(
-        "--evaluation-mode",
-        choices=("deterministic", "method_faithful", "both"),
     )
     parser.add_argument(
         "--online-replay-profile", choices=ONLINE_REPLAY_PROFILES,

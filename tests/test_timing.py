@@ -68,6 +68,7 @@ class TimingTest(unittest.TestCase):
         self.assertNotIn("--protocol", help_text)
         self.assertNotIn("--run-purpose", help_text)
         self.assertNotIn("--allow-diagnostic-protocol", help_text)
+        self.assertNotIn("--evaluation-mode", help_text)
         args, passthrough = parser.parse_known_args(
             [
                 "--env-name",
@@ -76,6 +77,19 @@ class TimingTest(unittest.TestCase):
                 "clean",
                 "--protocol",
                 "legacy",
+            ]
+        )
+        with self.assertRaises(SystemExit):
+            validate_run_all_args(parser, args, passthrough)
+
+        args, passthrough = parser.parse_known_args(
+            [
+                "--env-name",
+                "hopper-medium-replay-v2",
+                "--corruption",
+                "clean",
+                "--evaluation-mode",
+                "deterministic",
             ]
         )
         with self.assertRaises(SystemExit):
