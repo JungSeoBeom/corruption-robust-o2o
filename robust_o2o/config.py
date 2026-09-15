@@ -37,6 +37,9 @@ from .fidelity import (
 )
 
 
+PQE_NUMERICS_VERSION = "centered_moments_strict_priorities_v1"
+CANDIDATE_ALGORITHMS = ("care_o2o", "arw_o2o", "rg_o2o")
+
 ALGORITHMS = (
     "rpex",
     "riql_pex",
@@ -47,6 +50,7 @@ ALGORITHMS = (
     "wsrl",
     "ro2o",
     "pessimistic_q_ensemble",
+    *CANDIDATE_ALGORITHMS,
 )
 
 DEFAULT_PROTOCOL = "gymnasium_mujoco_v4_d4rl_v2"
@@ -62,6 +66,9 @@ ACTION_DIMS = {
 
 
 ALGORITHM_TITLES = {
+    "care_o2o": "CARE-O2O",
+    "arw_o2o": "ARW-O2O",
+    "rg_o2o": "RG-O2O",
     "rpex": "RPEX: Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption",
     "riql_pex": "RPEX ablation: RIQL + Policy Expansion",
     "riql_naive": "Towards Robust Offline Reinforcement Learning under Diverse Data Corruption",
@@ -74,6 +81,7 @@ ALGORITHM_TITLES = {
 }
 
 ALGORITHM_ALIASES = {
+    "care-o2o": "care_o2o", "arw-o2o": "arw_o2o", "rg-o2o": "rg_o2o",
     "riql+pex": "riql_pex",
     "riql-pex": "riql_pex",
     "riql_naive": "riql_naive",
@@ -151,6 +159,7 @@ class ExperimentConfig:
     replay_seed: Optional[int] = None
     train_env_seed: Optional[int] = None
     eval_seed: Optional[int] = None
+    evaluation_seed_role: str = "final"
     output_dir: str = "results"
     dataset_dir: Optional[str] = None
     checkpoint: Optional[str] = None
@@ -167,7 +176,10 @@ class ExperimentConfig:
     online_steps: int = 500_000
     initial_collection_steps: int = 5_000
     warmup_steps: int = 5_000
-    updates_per_step: int = 1
+    # ``None`` means "use the selected source-profile row".  Keeping the
+    # unresolved value distinct is important: an explicitly supplied value
+    # must never be silently overwritten by a table lookup.
+    updates_per_step: Optional[int] = None
     batch_size: int = 256
     replay_size: int = 1_000_000
     eval_period: int = 10_000
@@ -181,6 +193,28 @@ class ExperimentConfig:
     max_episode_steps: int = 1_000
 
     hidden_dim: int = 256
+    # PDF working candidates: declared implementation defaults, not paper-tuned.
+    candidate_audit_folds: int = 2
+    candidate_audit_steps: Optional[int] = None
+    candidate_recalibration_steps: int = 1000
+    candidate_generator_steps: Optional[int] = None
+    candidate_candidates: int = 10
+    candidate_diffusion_steps: int = 20
+    candidate_check_probability: float = 0.05
+    candidate_optimism: float = 1.0
+    candidate_mad_multiplier: float = 1.4826
+    candidate_trust_min: float = 0.05
+    candidate_trust_temperature: float = 1.0
+    candidate_uncertainty_allowance: float = 1.0
+    candidate_residual_threshold: float = 2.0
+    candidate_scale_floor: float = 1.0
+    candidate_scale_window: int = 2048
+    candidate_bootstrap_probability: float = 0.8
+    candidate_retention_period: int = 100
+    candidate_retention_mode: str = "adaptive"
+    candidate_retention_smoothing: float = 0.1
+    candidate_bias_scale: float = 1.0
+    candidate_advantage_clip: float = 5.0
     hidden_layers: int = 2
     learning_rate: float = 3e-4
     actor_learning_rate: Optional[float] = None
@@ -204,6 +238,7 @@ class ExperimentConfig:
     mixed_corruption_profile: str = "generic_partitioned_mixed"
     action_execution_profile: str = "clip_to_action_space"
     policy_extraction: Optional[str] = None
+    online_policy_extraction: Optional[str] = None
     task_profile: Optional[str] = None
     adversarial_attack_profile: Optional[str] = None
     allow_experimental_adversarial_attack: bool = False
@@ -214,11 +249,11 @@ class ExperimentConfig:
     # IQL / RIQL / PEX / RPEX
     expectile: float = 0.7
     beta: float = 3.0
-    riql_sigma: float = 3.0
-    riql_quantile: float = 0.1
-    num_critics: int = 5
-    inv_temperature: float = 3.0
-    kappa: float = 0.1
+    riql_sigma: Optional[float] = None
+    riql_quantile: Optional[float] = None
+    num_critics: Optional[int] = None
+    inv_temperature: Optional[float] = None
+    kappa: Optional[float] = None
     riql_config_row: Optional[str] = None
     riql_config_extension: bool = False
 
@@ -316,6 +351,36 @@ class ExperimentConfig:
                 "select canonical algorithm='cal_ql' for new runs"
             )
         self.algorithm = ALGORITHM_ALIASES.get(requested_algorithm, requested_algorithm)
+        if self.algorithm in CANDIDATE_ALGORITHMS:
+            if self.candidate_retention_mode not in ("adaptive", "fixed", "none"):
+                raise ValueError("candidate_retention_mode must be adaptive, fixed, or none")
+            if self.implementation_profile not in (None, "common_budget_robustness"):
+                raise ValueError("CRO2O candidates are unverified working proposals; use common_budget_robustness")
+            if self.action_distribution != "tanh_gaussian" or self.deterministic_policy:
+                raise ValueError("CRO2O candidates require matched bounded stochastic initializers")
+            if self.candidate_audit_steps is None:
+                self.candidate_audit_steps = self.offline_steps
+            if self.candidate_generator_steps is None:
+                self.candidate_generator_steps = self.offline_steps
+            for name in ("candidate_audit_folds", "candidate_candidates", "candidate_diffusion_steps", "candidate_scale_window", "candidate_retention_period"):
+                if getattr(self, name) < (2 if name in ("candidate_audit_folds", "candidate_diffusion_steps") else 1):
+                    raise ValueError(f"invalid {name}")
+            for name in ("candidate_audit_steps", "candidate_generator_steps", "candidate_recalibration_steps"):
+                if getattr(self, name) < 0:
+                    raise ValueError(f"invalid {name}")
+            for name in ("candidate_trust_min", "candidate_bootstrap_probability"):
+                if not 0 < getattr(self, name) < 1:
+                    raise ValueError(f"{name} must be in (0,1)")
+            if not 0 < self.candidate_retention_smoothing <= 1:
+                raise ValueError("candidate_retention_smoothing must be in (0,1]")
+            for name in ("candidate_scale_floor", "candidate_trust_temperature", "candidate_mad_multiplier", "candidate_bias_scale", "candidate_advantage_clip"):
+                if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                    raise ValueError(f"{name} must be finite and positive")
+            if not 0 <= self.candidate_check_probability <= 1:
+                raise ValueError("candidate_check_probability must be in [0,1]")
+            for name in ("candidate_optimism", "candidate_uncertainty_allowance", "candidate_residual_threshold"):
+                if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                    raise ValueError(f"{name} must be finite and non-negative")
         self.env_name = normalize_env_name(self.env_name)
         self.corruption = self.corruption.lower()
         self.corruption_target = self.corruption_target.lower()
@@ -327,8 +392,16 @@ class ExperimentConfig:
             self.algorithm_profile = self.algorithm_profile.lower()
         self.suite_profile = self.suite_profile.lower()
         self.run_purpose = self.run_purpose.lower()
+        if self.suite_profile == "research_benchmark":
+            if self.run_purpose not in ("experiment", "research_benchmark"):
+                raise ValueError(
+                    "suite_profile=research_benchmark cannot be labeled as "
+                    f"run_purpose={self.run_purpose!r}"
+                )
+            self.run_purpose = "research_benchmark"
         self.state_normalization = self.state_normalization.lower()
         self.action_distribution = self.action_distribution.lower()
+        self.evaluation_seed_role = self.evaluation_seed_role.lower()
         self.evaluation_mode = (
             self.evaluation_mode.lower() if self.evaluation_mode else None
         )
@@ -342,6 +415,11 @@ class ExperimentConfig:
         )
         self.policy_extraction = (
             self.policy_extraction.lower() if self.policy_extraction else None
+        )
+        self.online_policy_extraction = (
+            self.online_policy_extraction.lower()
+            if self.online_policy_extraction
+            else None
         )
         self.task_profile = self.task_profile.lower() if self.task_profile else None
         self.adversarial_attack_profile = (
@@ -439,15 +517,11 @@ class ExperimentConfig:
                 else "deterministic"
             )
         if self.is_research_suite:
-            # RPEX's reported policy is the upstream epsilon/Q policy-expansion
-            # rule.  Its deterministic argmax is kept as a secondary diagnostic.
-            # The remaining methods report their deterministic clean policy.
-            if self.algorithm == "rpex":
-                self.evaluation_mode = "both"
-                self.evaluation_policy_profile = "official_code_epsilon_switching"
-            else:
-                self.evaluation_mode = "deterministic"
-                self.evaluation_policy_profile = "deterministic"
+            # The primary comparison is deterministic for every baseline.
+            # Upstream stochastic/epsilon policies remain available only in
+            # explicitly selected diagnostic profiles.
+            self.evaluation_mode = "deterministic"
+            self.evaluation_policy_profile = "deterministic"
 
         if not self.normalize_states:
             self.state_normalization = "none"
@@ -489,6 +563,11 @@ class ExperimentConfig:
             (self.mixed_corruption_profile, MIXED_CORRUPTION_PROFILES, "mixed_corruption_profile"),
             (self.action_execution_profile, ACTION_EXECUTION_PROFILES, "action_execution_profile"),
             (self.policy_extraction, POLICY_EXTRACTIONS, "policy_extraction"),
+            (
+                self.online_policy_extraction,
+                POLICY_EXTRACTIONS,
+                "online_policy_extraction",
+            ),
             (self.task_profile, TASK_PROFILES, "task_profile"),
             (self.adversarial_attack_profile, ADVERSARIAL_ATTACK_PROFILES, "adversarial_attack_profile"),
             (
@@ -565,6 +644,8 @@ class ExperimentConfig:
                 "evaluation_mode must be deterministic, "
                 "method_faithful, or both"
             )
+        if self.evaluation_seed_role not in ("tuning", "final"):
+            raise ValueError("evaluation_seed_role must be tuning or final")
         if self.mc_return_source not in (
             "post_corruption",
             "legacy_pre_corruption",
@@ -730,12 +811,8 @@ class ExperimentConfig:
                 "research_benchmark forbids oracle_exclude_corrupted: "
                 "corruption masks/labels must not be passed to the learner"
             )
-        expected_evaluation_mode = "both" if self.algorithm == "rpex" else "deterministic"
-        expected_evaluation_policy = (
-            "official_code_epsilon_switching"
-            if self.algorithm == "rpex"
-            else "deterministic"
-        )
+        expected_evaluation_mode = "deterministic"
+        expected_evaluation_policy = "deterministic"
         if self.evaluation_mode != expected_evaluation_mode:
             raise ValueError(
                 f"research_benchmark {self.algorithm} requires "
@@ -745,6 +822,11 @@ class ExperimentConfig:
             raise ValueError(
                 f"research_benchmark {self.algorithm} requires "
                 f"evaluation_policy_profile={expected_evaluation_policy}"
+            )
+        if self.action_execution_profile != "clip_to_action_space":
+            raise ValueError(
+                "research_benchmark requires action_execution_profile="
+                "clip_to_action_space"
             )
         if self.attack_timing != "official_code_post_transition_replay_poisoning":
             raise ValueError(
@@ -756,11 +838,6 @@ class ExperimentConfig:
                 "research_benchmark requires post_transition_replay_poisoning"
             )
         if self.corruption == "adversarial":
-            if self.corruption_target == "mixed":
-                raise ValueError(
-                    "research_benchmark adversarial conditions select one "
-                    "explicit supported target; mixed is unsupported"
-                )
             # Imported lazily to avoid the config <-> corruption module cycle.
             # Resolution verifies existence and the environment-bound SHA before
             # any environment or training state is created.
@@ -770,7 +847,16 @@ class ExperimentConfig:
             )
 
             validate_adversarial_target(self)
-            if self.corruption_target != "rewards":
+            needs_oracle = self.corruption_target != "rewards" and not (
+                self.corruption_target == "mixed"
+                and all(
+                    target == "rewards" or ratio == 0.0
+                    for target, ratio in zip(
+                        INDIVIDUAL_CORRUPTION_TARGETS, self.mixed_ratios
+                    )
+                )
+            )
+            if needs_oracle:
                 resolve_attack_checkpoint(self)
         if self.algorithm == "wsrl" and not math.isclose(
             self.effective_offline_ratio, 0.0
@@ -779,6 +865,27 @@ class ExperimentConfig:
                 "WSRL main results require offline_ratio=0 during online "
                 "training; a nonzero ratio must use a separately named adaptation"
             )
+        if self.algorithm == "wsrl":
+            required = {
+                "wsrl_num_critics": (self.wsrl_num_critics, 10),
+                "wsrl_target_critic_subsample_size": (
+                    self.wsrl_target_critic_subsample_size,
+                    2,
+                ),
+                "wsrl_layer_norm": (self.wsrl_layer_norm, True),
+                "wsrl_utd_ratio": (self.wsrl_utd_ratio, 4),
+                "wsrl_per_critic_batch_size": (
+                    self.wsrl_per_critic_batch_size,
+                    256,
+                ),
+            }
+            mismatches = {
+                name: {"actual": actual, "required": expected}
+                for name, (actual, expected) in required.items()
+                if actual != expected
+            }
+            if mismatches:
+                raise ValueError(f"WSRL native research config mismatch: {mismatches}")
         if self.algorithm == "cal_ql":
             required = {
                 "hidden_dim": (self.hidden_dim, 256),
@@ -1016,11 +1123,10 @@ class ExperimentConfig:
             self.action_execution_profile = "official_algorithm_behavior"
             if self.corruption == "adversarial":
                 self.adversarial_attack_profile = "rpex_official_adam"
-        elif (
-            self.implementation_profile == "research_benchmark"
-            and self.algorithm in ("rpex", "riql_naive", "riql_pex")
-        ):
-            self.action_execution_profile = "official_algorithm_behavior"
+        elif self.implementation_profile == "research_benchmark":
+            # The environment always receives a finite action clipped to its
+            # declared action space in the common benchmark.
+            self.action_execution_profile = "clip_to_action_space"
         elif self.implementation_profile == "paper_reference":
             if (
                 self.algorithm in ("rpex", "riql_naive", "riql_pex")
@@ -1049,17 +1155,7 @@ class ExperimentConfig:
         elif self.task_profile is None:
             self.task_profile = "official_supported_task"
         if self.policy_extraction is None:
-            self.policy_extraction = (
-                "awr"
-                if self.implementation_profile
-                in ("official_code_reference", "research_benchmark")
-                else (
-                    "align_iql"
-                    if self.algorithm in ("rpex", "riql_naive", "riql_pex")
-                    and self.corruption_target == "observations"
-                    else "awr"
-                )
-            )
+            self.policy_extraction = "awr"
         if (
             self.algorithm in ("rpex", "riql_naive", "riql_pex")
             and self.implementation_profile
@@ -1067,9 +1163,25 @@ class ExperimentConfig:
             and self.policy_extraction != "awr"
         ):
             raise ValueError(
-                "official_code_reference uses RIQL AWR policy extraction for "
-                "every corruption target; ALIGN-IQL is diagnostic-only"
+                "source-aligned RIQL uses AWR policy extraction for every "
+                "offline condition; use online_policy_extraction for the "
+                "isolated RPEX observation comparison"
             )
+        if self.online_policy_extraction is None:
+            self.online_policy_extraction = self.policy_extraction
+        if self.online_policy_extraction != "awr":
+            if not (
+                self.algorithm == "rpex"
+                and self.corruption_target == "observations"
+                and self.policy_extraction == "awr"
+                and self.stage in ("online", "both")
+            ):
+                raise ValueError(
+                    "ALIGN-IQL is supported only as an explicit online RPEX "
+                    "observation-corruption comparison; offline and RIQL-naive "
+                    "policy extraction remain AWR"
+                )
+            self.implementation_variant = "rpex_online_align_iql_observation_variant"
 
         if self.algorithm in ("rpex", "riql_naive", "riql_pex"):
             try:
@@ -1083,18 +1195,39 @@ class ExperimentConfig:
                 raise
             self.riql_config_row = row_key
             self.riql_config_extension = row.extension
-            self.riql_sigma = row.sigma
-            self.riql_quantile = row.quantile
-            self.num_critics = row.num_critics
-            self.inv_temperature = row.inverse_temperature
-            self.kappa = row.kappa
-            if primary_suite:
+            if self.riql_sigma is None:
+                self.riql_sigma = row.sigma
+            if self.riql_quantile is None:
+                self.riql_quantile = row.quantile
+            if self.num_critics is None:
+                self.num_critics = row.num_critics
+            if self.inv_temperature is None:
+                self.inv_temperature = row.inverse_temperature
+            if self.kappa is None:
+                self.kappa = row.kappa
+            if self.updates_per_step is None:
                 self.updates_per_step = row.utd_ratio
+            if self.actor_learning_rate is None:
                 self.actor_learning_rate = row.actor_lr
+            if self.critic_learning_rate is None:
                 self.critic_learning_rate = row.critic_lr
         else:
             self.riql_config_row = None
             self.riql_config_extension = False
+            if self.updates_per_step is None:
+                self.updates_per_step = 1
+        # These fields are part of the serialized resolved configuration even
+        # for non-RIQL agents.
+        if self.riql_sigma is None:
+            self.riql_sigma = 3.0
+        if self.riql_quantile is None:
+            self.riql_quantile = 0.1
+        if self.num_critics is None:
+            self.num_critics = 5
+        if self.inv_temperature is None:
+            self.inv_temperature = 3.0
+        if self.kappa is None:
+            self.kappa = 0.1
 
     def _resolve_algorithm_profile(self) -> None:
         reference = self.implementation_profile in (
@@ -1188,6 +1321,23 @@ class ExperimentConfig:
                     f"expected {resolved_target_entropy}"
                 )
             self.target_entropy = resolved_target_entropy
+            native_wsrl = (
+                self.wsrl_num_critics == 10
+                and self.wsrl_target_critic_subsample_size == 2
+                and self.wsrl_layer_norm is True
+                and self.wsrl_utd_ratio == 4
+                and self.wsrl_per_critic_batch_size == 256
+            )
+            self.implementation_variant = (
+                "wsrl_native_redq10_subsample2_utd4_layernorm"
+                if native_wsrl
+                else (
+                    "wsrl_ablation_"
+                    f"critics{self.wsrl_num_critics}_"
+                    f"subsample{self.wsrl_target_critic_subsample_size}_"
+                    f"utd{self.wsrl_utd_ratio}_ln{int(bool(self.wsrl_layer_norm))}"
+                )
+            )
         else:
             self.wsrl_num_critics = self.sac_num_critics
             if self.wsrl_target_critic_subsample_size is None:
@@ -1261,6 +1411,8 @@ class ExperimentConfig:
     def effective_offline_ratio(self) -> float:
         if self.offline_ratio is not None:
             return self.offline_ratio
+        if self.algorithm in CANDIDATE_ALGORITHMS:
+            return 0.5
         if (
             self.algorithm in ("rpex", "riql_pex")
             and self.online_replay_profile == "paper_offline_online_mixture"
@@ -1289,6 +1441,20 @@ class ExperimentConfig:
         if self.is_research_suite:
             self._validate_research_benchmark()
         result = asdict(self)
+        if self.algorithm in CANDIDATE_ALGORITHMS:
+            result["candidate_spec"] = {
+                "version": "cro2o_working_notes_20260915_v1",
+                **{k: v for k, v in result.items() if k.startswith("candidate_")},
+                "evaluation": (
+                    "stochastic_diffusion_exploitation_reranking"
+                    if self.algorithm == "rg_o2o" else "deterministic_base_actor"
+                ),
+                "audit_unit": "trajectory_block",
+                "logged_action_contract": "existing_unclipped_replay_poisoning",
+            }
+        result["pqe_numerics_version"] = (
+            PQE_NUMERICS_VERSION if self.algorithm == "pessimistic_q_ensemble" else None
+        )
         result["effective_offline_ratio"] = self.effective_offline_ratio
         result["offline_ratio_rule"] = (
             "offline_size/(offline_size+completed_online_size)"
@@ -1345,18 +1511,25 @@ class ExperimentConfig:
         result["evaluation_action_sampling"] = (
             "rpex_epsilon_greedy_sample_then_cpu_mask"
             if self.algorithm == "rpex"
-            and self.implementation_profile
-            in ("official_code_reference", "research_benchmark")
+            and self.implementation_profile == "official_code_reference"
             else (
                 "deterministic_policy_mean"
                 if self.is_research_suite
                 else "algorithm_profile_default"
             )
         )
+        if self.algorithm in CANDIDATE_ALGORITHMS:
+            result["evaluation_action_sampling"] = result["candidate_spec"]["evaluation"]
+            result["online_replay_sampler"] = "private_numpy_choice_with_replacement"
+            result["offline_ratio_rule"] = (
+                f"separately_normalized_sources_{self.candidate_retention_mode}"
+                if self.algorithm == "arw_o2o" else "fixed_count_mixture_trust_weighted"
+            )
         result["evaluation_env_strategy"] = "separate_clean_environment"
         result["evaluation_seed_schedule"] = (
             "reseed_each_call_episode_as_seed_plus_10000_plus_episode"
         )
+        result["evaluation_seed_role"] = self.evaluation_seed_role
         result["evaluation_protocol_parity_verified"] = False
         result[
             "effective_offline_checkpoint_period"
@@ -1396,6 +1569,7 @@ class ExperimentConfig:
             and record is not None
             and record.main_table_eligible
             and self.calibration_mask_mode != "oracle_exclude_corrupted"
+            and self.evaluation_seed_role == "final"
         )
         result["task_scope"] = (
             record.task_scope if record is not None else self.task_profile
@@ -1425,6 +1599,15 @@ class ExperimentConfig:
             str(resolved_attack_checkpoint)
             if self.corruption == "adversarial"
             and self.corruption_target != "rewards"
+            and not (
+                self.corruption_target == "mixed"
+                and all(
+                    target == "rewards" or ratio == 0.0
+                    for target, ratio in zip(
+                        INDIVIDUAL_CORRUPTION_TARGETS, self.mixed_ratios
+                    )
+                )
+            )
             and resolved_attack_checkpoint is not None
             else None
         )
@@ -1436,6 +1619,15 @@ class ExperimentConfig:
             )
             if self.corruption == "adversarial"
             and self.corruption_target != "rewards"
+            and not (
+                self.corruption_target == "mixed"
+                and all(
+                    target == "rewards" or ratio == 0.0
+                    for target, ratio in zip(
+                        INDIVIDUAL_CORRUPTION_TARGETS, self.mixed_ratios
+                    )
+                )
+            )
             else None
         )
         result["reporting_rule"] = (
@@ -1450,7 +1642,17 @@ class ExperimentConfig:
         )
         result["upstream_commit"] = upstream_commit
         result["score_semantics"] = SCORE_SEMANTICS
-        result["benchmark_eligible"] = True
+        result["benchmark_eligible"] = self.evaluation_seed_role == "final"
+        result["attack_exact_upstream_parity"] = False
+        result["attack_parity_limitation"] = (
+            "checkpoint preprocessing is not established for the supplied "
+            "weights and no end-to-end RNG trajectory certificate is available"
+        )
+        result["attack_research_adaptation"] = (
+            "persistent_private_rng_and_single_std_scaling"
+            if self.implementation_profile == "research_benchmark"
+            else "none"
+        )
         if self.algorithm == "wsrl":
             result.update(
                 {
@@ -1617,12 +1819,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", default="auto", help="auto, cpu, mps, cuda, or cuda:N")
     parser.add_argument("--cuda-device", type=int, default=0)
+    parser.add_argument(
+        "--evaluation-seed-role",
+        choices=("tuning", "final"),
+        default="final",
+    )
 
     parser.add_argument("--offline-steps", type=int, default=500_000)
     parser.add_argument("--online-steps", type=int, default=500_000)
     parser.add_argument("--initial-collection-steps", type=int, default=5_000)
     parser.add_argument("--warmup-steps", type=int, default=5_000)
-    parser.add_argument("--updates-per-step", type=int, default=1)
+    parser.add_argument("--updates-per-step", type=int)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--replay-size", type=int, default=1_000_000)
     parser.add_argument("--eval-period", type=int, default=10_000)
@@ -1709,6 +1916,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="clip_to_action_space",
     )
     parser.add_argument("--policy-extraction", choices=POLICY_EXTRACTIONS)
+    parser.add_argument("--online-policy-extraction", choices=POLICY_EXTRACTIONS)
     parser.add_argument("--task-profile", choices=TASK_PROFILES)
     parser.add_argument(
         "--adversarial-attack-profile", choices=ADVERSARIAL_ATTACK_PROFILES,
@@ -1731,11 +1939,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--expectile", type=float, default=0.7)
     parser.add_argument("--beta", type=float, default=3.0)
-    parser.add_argument("--riql-sigma", type=float, default=3.0)
-    parser.add_argument("--riql-quantile", type=float, default=0.1)
-    parser.add_argument("--num-critics", type=int, default=5)
-    parser.add_argument("--inv-temperature", type=float, default=3.0)
-    parser.add_argument("--kappa", type=float, default=0.1)
+    parser.add_argument("--riql-sigma", type=float)
+    parser.add_argument("--riql-quantile", type=float)
+    parser.add_argument("--num-critics", type=int)
+    parser.add_argument("--inv-temperature", type=float)
+    parser.add_argument("--kappa", type=float)
 
     parser.add_argument("--sac-num-critics", type=int, default=10)
     parser.add_argument("--lcb-ratio", type=float, default=4.0)
@@ -1836,6 +2044,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--offline-ratio", type=float)
+    candidate_defaults = {
+        "audit-folds": (int, 2), "audit-steps": (int, None),
+        "recalibration-steps": (int, 1000), "generator-steps": (int, None),
+        "candidates": (int, 10), "diffusion-steps": (int, 20),
+        "check-probability": (float, .05), "optimism": (float, 1.),
+        "mad-multiplier": (float, 1.4826), "trust-min": (float, .05),
+        "trust-temperature": (float, 1.), "uncertainty-allowance": (float, 1.),
+        "residual-threshold": (float, 2.), "scale-floor": (float, 1.),
+        "scale-window": (int, 2048), "bootstrap-probability": (float, .8),
+        "retention-period": (int, 100), "retention-smoothing": (float, .1),
+        "bias-scale": (float, 1.), "advantage-clip": (float, 5.),
+    }
+    for name, (kind, default) in candidate_defaults.items():
+        parser.add_argument(f"--candidate-{name}", type=kind, default=default)
+    parser.add_argument("--candidate-retention-mode", choices=("adaptive", "fixed", "none"), default="adaptive")
     return parser
 
 

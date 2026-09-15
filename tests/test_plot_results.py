@@ -20,7 +20,7 @@ from plot_results import (
     write_final_score_summary,
     write_reproduction_summaries,
 )
-from robust_o2o.config import ExperimentConfig
+from robust_o2o.config import DEFAULT_PROTOCOL, SCORE_SEMANTICS, ExperimentConfig
 from robust_o2o.fidelity import canonical_json_sha256
 from robust_o2o.logging_utils import METRIC_FIELDS
 from robust_o2o.manifest import build_experiment_manifest
@@ -173,6 +173,11 @@ class AggregateResultsTest(unittest.TestCase):
             "eval_period": 100,
             "eval_episodes": 10,
             "final_window_size": 3,
+            "protocol": DEFAULT_PROTOCOL,
+            "environment_protocol": DEFAULT_PROTOCOL,
+            "score_semantics": SCORE_SEMANTICS,
+            "benchmark_eligible": True,
+            "run_purpose": "experiment",
         }
         (run_dir / "config.json").write_text(
             json.dumps(config), encoding="utf-8"
@@ -215,13 +220,13 @@ class AggregateResultsTest(unittest.TestCase):
         ).to_dict()
         config.update(
             dataset_id="hopper-medium-replay-v2",
-            evaluation_env_id="hopper-medium-replay-v2",
-            online_env_id="hopper-medium-replay-v2",
-            environment_protocol="rpex_d4rl_v2_legacy",
+            evaluation_env_id="Hopper-v4",
+            online_env_id="Hopper-v4",
+            environment_protocol=DEFAULT_PROTOCOL,
             environment_max_episode_steps=1_000,
             dataset_sha256="dataset",
             normalizer_sha256="normalizer",
-            score_semantics="d4rl_normalized_return",
+            score_semantics=SCORE_SEMANTICS,
         )
         (run_dir / "config.json").write_text(
             json.dumps(config), encoding="utf-8"
@@ -266,13 +271,13 @@ class AggregateResultsTest(unittest.TestCase):
         ).to_dict()
         config.update(
             dataset_id="hopper-medium-replay-v2",
-            evaluation_env_id="hopper-medium-replay-v2",
-            online_env_id="hopper-medium-replay-v2",
-            environment_protocol="rpex_d4rl_v2_legacy",
+            evaluation_env_id="Hopper-v4",
+            online_env_id="Hopper-v4",
+            environment_protocol=DEFAULT_PROTOCOL,
             environment_max_episode_steps=1_000,
             dataset_sha256="dataset",
             normalizer_sha256="normalizer",
-            score_semantics="d4rl_normalized_return",
+            score_semantics=SCORE_SEMANTICS,
         )
         (run_dir / "config.json").write_text(
             json.dumps(config), encoding="utf-8"
@@ -327,10 +332,10 @@ class AggregateResultsTest(unittest.TestCase):
                 rows = list(csv.DictReader(stream))
             self.assertEqual([row["algorithm"] for row in rows], ["rpex", "uwmsg"])
             self.assertEqual(float(rows[0]["elapsed_seconds_mean"]), 12.0)
-            self.assertEqual(rows[0]["final_normalized_return_mean"], "")
             self.assertEqual(
-                float(rows[0]["final_diagnostic_scaled_return_mean"]), 79.5
+                float(rows[0]["final_normalized_return_mean"]), 79.5
             )
+            self.assertEqual(rows[0]["final_diagnostic_scaled_return_mean"], "")
             self.assertEqual(
                 rows[0]["aggregation_rule"],
                 "common_mean_last_3_online_evaluations_per_seed_then_population_mean_std__partial_2_of_3",
@@ -388,7 +393,11 @@ class AggregateResultsTest(unittest.TestCase):
             metrics_path = run_dir / "metrics.csv"
             with metrics_path.open(newline="", encoding="utf-8") as stream:
                 reader = csv.DictReader(stream)
-                fieldnames = reader.fieldnames
+                fieldnames = [
+                    *(reader.fieldnames or []),
+                    "diagnostic_d4rl_reference_scaled_return_mean",
+                    "diagnostic_d4rl_reference_scaled_return_std",
+                ]
                 rows = list(reader)
             for row in rows:
                 row[
@@ -530,9 +539,7 @@ class AggregateResultsTest(unittest.TestCase):
             run_dir = self._make_manifested_run(root)
             completion_path = run_dir / "completed_experiment_manifest.json"
             completion = json.loads(completion_path.read_text())
-            completion["publication_eligible"] = not bool(
-                completion["publication_eligible"]
-            )
+            completion["environment_protocol"] = "tampered_protocol"
             completion.pop("completion_manifest_sha256")
             completion["completion_manifest_sha256"] = canonical_json_sha256(
                 completion

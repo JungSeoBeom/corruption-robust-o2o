@@ -12,10 +12,18 @@ import numpy as np
 import torch
 
 from .agents import build_agent
-from .config import ExperimentConfig
+from .config import (
+    ExperimentConfig,
+    INDIVIDUAL_CORRUPTION_TARGETS,
+    PQE_NUMERICS_VERSION,
+    CANDIDATE_ALGORITHMS,
+)
+from .agents.cro2o import register_offline_blocks
+from .cro2o_training import prepare_candidate, candidate_update
 from .calql_online import CalQLTrajectoryAccumulator, dynamic_batch_counts
 from .corruption import (
     AttackOracle,
+    ATTACK_RNG_SCHEMA,
     OnlineCorruptionAudit,
     corrupt_pre_action_value,
     corrupt_offline_dataset,
@@ -31,12 +39,14 @@ from .environment import (
     StateNormalizer,
     EXPECTED_LOCOMOTION_DIMS,
     apply_normalizer,
+    clip_action_to_space,
     environment_metadata,
     evaluate_agent,
     expected_env_spec_id,
     load_d4rl_dataset,
     make_env,
     preserve_training_rng_state,
+    require_finite_action,
     reset_env,
     step_env,
 )
@@ -458,7 +468,7 @@ def bounded_executed_action(
     action_low: np.ndarray,
     action_high: np.ndarray,
 ) -> np.ndarray:
-    return np.clip(raw_policy_action, action_low, action_high).astype(np.float32)
+    return clip_action_to_space(raw_policy_action, action_low, action_high)
 
 
 def _replay_transition_coordinates(
@@ -478,14 +488,15 @@ def _replay_transition_coordinates(
 
 
 def _poison_replay_in_learner_coordinates(config: ExperimentConfig) -> bool:
-    """Use the normalized replay coordinates expected by pinned RPEX attacks."""
+    """Keep corruption out of learner coordinates for every current profile.
 
-    return (
-        config.implementation_profile
-        in ("official_code_reference", "research_benchmark")
-        and config.attack_timing
-        == "official_code_post_transition_replay_poisoning"
-    )
+    The frozen oracle owns any checkpoint-declared state transform.  Returning
+    true here would incorrectly substitute the learner's corrupted-data
+    normalizer for EDAC preprocessing.
+    """
+
+    del config
+    return False
 
 
 def normalizer_sha256(normalizer: StateNormalizer) -> str:
@@ -522,11 +533,15 @@ def _parameter_snapshot(agent: object) -> Dict[str, list[torch.Tensor]]:
                 for parameter in module.parameters()
             ]
     critic_modules = []
+    proposal = getattr(agent, "proposal", None)
+    if proposal is not None:
+        groups["actor"].extend(parameter.detach().clone() for parameter in proposal.parameters())
     for name in ("critic", "critic2", "q1", "q2", "value"):
         module = getattr(agent, name, None)
         if module is not None:
             critic_modules.append(module)
     for name in (
+        "critics",
         "q1_members",
         "q2_members",
     ):
@@ -628,7 +643,7 @@ def capture_global_rng_state(
             else None
         ),
         "attack_rng": (
-            oracle.generator.get_state() if oracle is not None else None
+            oracle.rng_state_dict() if oracle is not None else None
         ),
     }
     if hasattr(torch, "mps") and hasattr(torch.mps, "get_rng_state"):
@@ -656,7 +671,7 @@ def restore_global_rng_state(
     if corruption_rng is not None and state.get("corruption_rng") is not None:
         restore_numpy_rng_state(corruption_rng, state["corruption_rng"])
     if oracle is not None and state.get("attack_rng") is not None:
-        oracle.generator.set_state(state["attack_rng"])
+        oracle.load_rng_state_dict(state["attack_rng"])
 
 
 def capture_environment_rng_state(env: object) -> Dict[str, Any]:
@@ -704,6 +719,14 @@ def save_checkpoint(
 ) -> None:
     payload = {
         "format_version": 4,
+        "attack_rng_schema": (
+            "upstream_single_torch"
+            if config.implementation_profile == "official_code_reference"
+            else ATTACK_RNG_SCHEMA
+        ),
+        "pqe_numerics_version": (
+            PQE_NUMERICS_VERSION if config.algorithm == "pessimistic_q_ensemble" else None
+        ),
         "algorithm": config.algorithm,
         "env_name": config.env_name,
         "protocol": config.protocol,
@@ -998,6 +1021,8 @@ def _validate_checkpoint(
     state_dim: int,
     action_dim: int,
 ) -> None:
+    if config.resume_run:
+        _validate_reliability_resume(payload, config)
     if payload.get("algorithm") != config.algorithm:
         raise ValueError(
             f"Checkpoint algorithm={payload.get('algorithm')!r}, "
@@ -1059,6 +1084,52 @@ def _validate_checkpoint(
                 "Checkpoint action_distribution="
                 f"{saved_distribution!r}, requested={config.action_distribution!r}"
             )
+
+
+def _validate_reliability_resume(payload: Dict[str, Any], config: ExperimentConfig) -> None:
+    """Reject changed training semantics before committing any run output."""
+    if (
+        config.algorithm == "pessimistic_q_ensemble"
+        and payload.get("pqe_numerics_version") != PQE_NUMERICS_VERSION
+    ):
+        raise ValueError(
+            "PQE exact resume requires current moment/priority numerics; "
+            "use initialization for older weights"
+        )
+    if (
+        config.corruption == "adversarial"
+        and (
+            config.corruption_target in ("observations", "actions", "dynamics")
+            or (
+                config.corruption_target == "mixed"
+                and any(
+                    ratio > 0 and target != "rewards"
+                    for target, ratio in zip(
+                        INDIVIDUAL_CORRUPTION_TARGETS, config.mixed_ratios
+                    )
+                )
+            )
+        )
+        and config.implementation_profile != "official_code_reference"
+    ):
+        if payload.get("attack_rng_schema") != ATTACK_RNG_SCHEMA:
+            raise ValueError(
+                "Research adversarial exact resume requires phase-private RNG "
+                "schema; legacy single-stream checkpoints support initialization only"
+            )
+        resume = payload.get("resume_state") or {}
+        if resume.get("phase") == "online":
+            state = resume.get("global_rng", {}).get("attack_rng")
+            if not isinstance(state, dict) or state.get("schema") != ATTACK_RNG_SCHEMA:
+                raise ValueError(
+                    "Online exact resume is missing phase-private attack RNG state"
+                )
+            for phase in ("offline", "online"):
+                if phase not in state:
+                    raise ValueError(
+                        f"Online exact resume is missing {phase} attack RNG state"
+                    )
+                torch.Generator().set_state(state[phase].cpu())
 
 
 def _restore_agent_config(config: ExperimentConfig, payload: Dict[str, Any]) -> None:
@@ -1168,13 +1239,7 @@ def _evaluate(
         )
         for mode in modes
     }
-    primary_mode = (
-        "method_faithful"
-        if config.algorithm == "rpex" and "method_faithful" in evaluations
-        else "deterministic"
-        if "deterministic" in evaluations
-        else modes[0]
-    )
+    primary_mode = "deterministic" if "deterministic" in evaluations else modes[0]
     metrics = dict(evaluations[primary_mode])
     for mode, values in evaluations.items():
         suffix = "deterministic" if mode == "deterministic" else "method_faithful"
@@ -1183,6 +1248,12 @@ def _evaluate(
             "normalized_return_mean"
         ]
     metrics["evaluation_mode"] = primary_mode
+    if config.algorithm == "rg_o2o":
+        # Sampling candidates remains stochastic even though selection is an
+        # argmax. Do not label this a deterministic base-actor evaluation.
+        metrics["evaluation_mode"] = "generative_exploitation"
+        metrics.pop("return_deterministic", None)
+        metrics.pop("normalized_return_deterministic", None)
     logger.log_evaluation(
         phase, step, env_steps, agent.total_updates, metrics
     )
@@ -1306,6 +1377,9 @@ def run_experiment(
         corrupted_dataset, corruption_stats = corrupt_offline_dataset(
             raw_dataset, config, oracle, cache_root
         )
+        config._corruption_scale_statistics = corruption_stats.get(
+            "corruption_scale_statistics"
+        )
 
         if checkpoint_payload is not None:
             normalizer = StateNormalizer.from_state_dict(
@@ -1371,6 +1445,10 @@ def run_experiment(
             )
         if resume_payload is not None:
             restore_global_rng_state(resume_payload["global_rng"], oracle=oracle)
+        if config.algorithm in CANDIDATE_ALGORITHMS:
+            register_offline_blocks(agent, corrupted_dataset)
+            if config.initialize_from_checkpoint and agent.online_phase:
+                raise ValueError("CRO2O new-run initialization requires an offline checkpoint; online state requires --resume-run")
 
         # RunLogger.write_config intentionally commits a resume by superseding
         # any completion marker and transitioning summary.json to `running`.
@@ -1474,8 +1552,11 @@ def run_experiment(
                     state_dim,
                     action_dim,
                     resume_state=resume_payload,
+                    candidate_dataset=corrupted_dataset if config.algorithm in CANDIDATE_ALGORITHMS else None,
                 )
         if config.stage in ("online", "both"):
+            if config.algorithm in CANDIDATE_ALGORITHMS:
+                prepare_candidate(agent, corrupted_dataset, offline)
             if not agent.online_phase:
                 agent.begin_online()
             _run_online(
@@ -1558,6 +1639,7 @@ def _run_offline(
     state_dim: int,
     action_dim: int,
     resume_state: Optional[Dict[str, Any]] = None,
+    candidate_dataset: Optional[Dict[str, np.ndarray]] = None,
 ) -> None:
     logger.logger.info("offline pre-training started")
     is_pqe = config.algorithm == "pessimistic_q_ensemble"
@@ -1643,7 +1725,7 @@ def _run_offline(
                     ),
                 },
             )
-        if step % config.eval_period == 0:
+        if step % config.eval_period == 0 and not (candidate_dataset is not None and step == offline_budget):
             _evaluate(
                 logger,
                 env,
@@ -1685,10 +1767,13 @@ def _run_offline(
                     "writer_append_position": _writer_positions(logger),
                 },
             )
+    if candidate_dataset is not None:
+        prepare_candidate(agent, candidate_dataset, offline)
     if (
         config.implementation_profile != "official_code_reference"
         and (
-            offline_budget == 0
+            candidate_dataset is not None
+            or offline_budget == 0
             or offline_budget % config.eval_period != 0
         )
     ):
@@ -1749,6 +1834,7 @@ def _run_online(
     is_pqe = config.algorithm == "pessimistic_q_ensemble"
     is_calql = config.algorithm == "cal_ql"
     is_wsrl = config.algorithm == "wsrl"
+    is_candidate = config.algorithm in CANDIDATE_ALGORITHMS
     replay = ReplayBuffer(
         state_dim,
         action_dim,
@@ -1842,7 +1928,34 @@ def _run_online(
                         start_env_step - config.online_steps, 0
                     ),
                     "resume_noop_already_complete": True,
+                    "selected_transition_count": int(
+                        resume_state.get("corrupted_online", 0)
+                    ),
+                    "selected_transition_fraction": (
+                        float(
+                            resume_state.get("corrupted_online", 0)
+                            / start_env_step
+                        )
+                        if start_env_step > 0
+                        else 0.0
+                    ),
+                    "actual_changed_transition_count": int(
+                        resume_state.get("changed_online", 0)
+                    ),
+                    "actual_changed_transition_fraction": (
+                        float(
+                            resume_state.get("changed_online", 0)
+                            / start_env_step
+                        )
+                        if start_env_step > 0
+                        else 0.0
+                    ),
                     "raw_action_oob_fraction": (
+                        float(resume_state.get("raw_oob", 0) / start_env_step)
+                        if start_env_step > 0
+                        else 0.0
+                    ),
+                    "policy_proposal_action_oob_fraction": (
                         float(resume_state.get("raw_oob", 0) / start_env_step)
                         if start_env_step > 0
                         else 0.0
@@ -1852,6 +1965,36 @@ def _run_online(
                     ),
                     "executed_action_abs_max": float(
                         resume_state.get("executed_action_abs_max", 0.0)
+                    ),
+                    "executed_action_oob_fraction": (
+                        float(
+                            resume_state.get("executed_oob", 0)
+                            / start_env_step
+                        )
+                        if start_env_step > 0
+                        else 0.0
+                    ),
+                    "executed_env_action_oob_fraction": (
+                        float(
+                            resume_state.get("executed_oob", 0)
+                            / start_env_step
+                        )
+                        if start_env_step > 0
+                        else 0.0
+                    ),
+                    "poisoned_replay_action_count": int(
+                        resume_state.get("poisoned_replay_action_count", 0)
+                    ),
+                    "poisoned_replay_action_oob_count": int(
+                        resume_state.get("poisoned_replay_action_oob", 0)
+                    ),
+                    "poisoned_replay_action_oob_fraction": (
+                        float(
+                            resume_state.get("poisoned_replay_action_oob", 0)
+                            / start_env_step
+                        )
+                        if start_env_step > 0
+                        else 0.0
                     ),
                 }
             )
@@ -1953,6 +2096,7 @@ def _run_online(
     episode_steps = 0
     episode_return = 0.0
     corrupted_online = int(resume_state.get("corrupted_online", 0)) if online_resume else 0
+    changed_online = int(resume_state.get("changed_online", 0)) if online_resume else 0
     corruption_audit = OnlineCorruptionAudit(
         resume_state.get("online_corruption_audit") if online_resume else None
     )
@@ -1973,7 +2117,7 @@ def _run_online(
         )
     warmup = (
         max(config.initial_collection_steps, config.warmup_steps)
-        if is_wsrl
+        if is_wsrl or is_candidate
         else config.pqe_first_online_block_steps
         if is_pqe
         else 0
@@ -1987,6 +2131,16 @@ def _run_online(
     raw_oob = int(resume_state.get("raw_oob", 0)) if online_resume else 0
     executed_oob = int(resume_state.get("executed_oob", 0)) if online_resume else 0
     replay_mismatch = int(resume_state.get("replay_mismatch", 0)) if online_resume else 0
+    poisoned_replay_action_count = (
+        int(resume_state.get("poisoned_replay_action_count", 0))
+        if online_resume
+        else 0
+    )
+    poisoned_replay_action_oob = (
+        int(resume_state.get("poisoned_replay_action_oob", 0))
+        if online_resume
+        else 0
+    )
     priority_metrics: Dict[str, float] = {}
     initial_online_priority = (
         agent.initial_online_priority(
@@ -2015,12 +2169,15 @@ def _run_online(
             "global_rng": capture_global_rng_state(rng, oracle),
             "environment_rng": capture_environment_rng_state(env),
             "corrupted_online": corrupted_online,
+            "changed_online": changed_online,
             "online_corruption_audit": corruption_audit.state_dict(),
             "raw_action_abs_max": raw_action_abs_max,
             "executed_action_abs_max": executed_action_abs_max,
             "raw_oob": raw_oob,
             "executed_oob": executed_oob,
             "replay_mismatch": replay_mismatch,
+            "poisoned_replay_action_count": poisoned_replay_action_count,
+            "poisoned_replay_action_oob": poisoned_replay_action_oob,
             "calql_trajectory": (
                 calql_trajectory.state_dict() if is_calql else None
             ),
@@ -2119,7 +2276,11 @@ def _run_online(
         if is_calql:
             # Cal-QL is updated only after a complete trajectory has exact RTG.
             return
-        if is_wsrl:
+        if is_candidate:
+            # Recalibrate immediately after K0, before the first optimistic
+            # action. Candidate replay samples with replacement.
+            can_update = not before_transition and replay.size > 0 and env_step >= warmup
+        elif is_wsrl:
             can_update = (
                 env_step >= wsrl_first_update_step
                 and replay.size >= required_online_samples
@@ -2146,6 +2307,17 @@ def _run_online(
                 and replay.size >= required_online_samples
             )
         if not can_update:
+            return
+
+        if is_candidate:
+            while agent.recalibration_updates < config.candidate_recalibration_steps:
+                last_metrics = candidate_update(agent, offline, replay, config, critic_only=True)
+                accumulator.add(last_metrics)
+            if env_step <= warmup:
+                return
+            for _ in range(config.updates_per_step):
+                last_metrics = candidate_update(agent, offline, replay, config)
+                accumulator.add(last_metrics)
             return
 
         if is_wsrl:
@@ -2302,7 +2474,9 @@ def _run_online(
         executed_action = (
             bounded_executed_action(raw_action_np, action_low, action_high)
             if config.action_execution_profile == "clip_to_action_space"
-            else raw_action_np.copy()
+            else require_finite_action(
+                raw_action_np, label="unbounded diagnostic action"
+            ).astype(np.float32, copy=True)
         )
         raw_action_abs_max = max(raw_action_abs_max, float(np.abs(raw_action_np).max()))
         raw_oob += int(
@@ -2370,6 +2544,29 @@ def _run_online(
                 selection_already_sampled=True,
             )
         corrupted_online += int(was_corrupted)
+        comparison_state = (
+            normalizer.transform(raw_state)
+            if normalized_replay_poisoning
+            else raw_state
+        )
+        comparison_next_state = (
+            normalizer.transform(raw_next_state)
+            if normalized_replay_poisoning
+            else raw_next_state
+        )
+        actually_changed = bool(
+            not np.array_equal(stored_state, comparison_state)
+            or not np.array_equal(stored_action, executed_action)
+            or stored_reward != float(reward)
+            or not np.array_equal(stored_next_state, comparison_next_state)
+        )
+        changed_online += int(was_corrupted and actually_changed)
+        if was_corrupted and selected_target == "actions":
+            poisoned_replay_action_count += 1
+            poisoned_replay_action_oob += int(
+                np.any(stored_action < action_low)
+                or np.any(stored_action > action_high)
+            )
         if was_corrupted and selected_target is not None:
             corruption_audit.update(
                 env_step,
@@ -2408,6 +2605,10 @@ def _run_online(
                 )
                 perform_calql_trajectory_updates(completed)
         else:
+            if is_candidate:
+                agent.observe_transition(replay_state, stored_action, stored_reward,
+                                         replay_next_state, float(terminated), replay.position,
+                                         episode_finished)
             replay.add(
                 replay_state,
                 stored_action,
@@ -2508,11 +2709,22 @@ def _run_online(
                     ),
                     **wsrl_update_metrics,
                     "online_corruption_fraction": corrupted_online / env_step,
+                    "online_selected_fraction": corrupted_online / env_step,
+                    "online_actual_changed_fraction": changed_online / env_step,
                     "raw_action_abs_max": raw_action_abs_max,
                     "executed_action_abs_max": executed_action_abs_max,
                     "raw_action_oob_fraction": raw_oob / env_step,
+                    "policy_proposal_action_oob_fraction": raw_oob / env_step,
                     "executed_action_oob_fraction": executed_oob / env_step,
+                    "executed_env_action_oob_fraction": executed_oob / env_step,
                     "replay_env_action_mismatch_fraction": replay_mismatch / env_step,
+                    "poisoned_replay_action_oob_fraction": (
+                        poisoned_replay_action_oob / env_step
+                    ),
+                    "poisoned_replay_action_oob_given_action_poison_fraction": (
+                        poisoned_replay_action_oob
+                        / max(poisoned_replay_action_count, 1)
+                    ),
                     **(
                         {
                             key: float(value)
@@ -2655,6 +2867,18 @@ def _run_online(
             "episode_boundary_overshoot": max(
                 actual_online_steps - config.online_steps, 0
             ),
+            "selected_transition_count": int(corrupted_online),
+            "selected_transition_fraction": (
+                float(corrupted_online / actual_online_steps)
+                if actual_online_steps > 0
+                else 0.0
+            ),
+            "actual_changed_transition_count": int(changed_online),
+            "actual_changed_transition_fraction": (
+                float(changed_online / actual_online_steps)
+                if actual_online_steps > 0
+                else 0.0
+            ),
         }
     )
     online_corruption_metadata.update(
@@ -2679,11 +2903,38 @@ def _run_online(
                 if actual_online_steps > 0
                 else 0.0
             ),
+            "policy_proposal_action_oob_fraction": (
+                float(raw_oob / actual_online_steps)
+                if actual_online_steps > 0
+                else 0.0
+            ),
             "raw_action_abs_max": raw_action_abs_max,
             "executed_action_abs_max": executed_action_abs_max,
             "executed_action_oob_fraction": (
                 float(executed_oob / actual_online_steps)
                 if actual_online_steps > 0
+                else 0.0
+            ),
+            "executed_env_action_oob_fraction": (
+                float(executed_oob / actual_online_steps)
+                if actual_online_steps > 0
+                else 0.0
+            ),
+            "poisoned_replay_action_count": int(poisoned_replay_action_count),
+            "poisoned_replay_action_oob_count": int(
+                poisoned_replay_action_oob
+            ),
+            "poisoned_replay_action_oob_fraction": (
+                float(poisoned_replay_action_oob / actual_online_steps)
+                if actual_online_steps > 0
+                else 0.0
+            ),
+            "poisoned_replay_action_oob_given_action_poison_fraction": (
+                float(
+                    poisoned_replay_action_oob
+                    / poisoned_replay_action_count
+                )
+                if poisoned_replay_action_count > 0
                 else 0.0
             ),
         }

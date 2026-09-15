@@ -14,7 +14,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from robust_o2o.config import ALGORITHMS, ExperimentConfig, LOCAL_PROTOCOL  # noqa: E402
+from robust_o2o.config import ALGORITHMS, ExperimentConfig  # noqa: E402
 from robust_o2o.experiment import run_experiment  # noqa: E402
 from robust_o2o.logging_utils import RunLogger  # noqa: E402
 
@@ -188,7 +188,6 @@ def main() -> int:
     config = ExperimentConfig(
         algorithm=args.algorithm,
         env_name=args.env,
-        protocol=LOCAL_PROTOCOL,
         corruption=corruption,
         corruption_target=args.corruption_target,
         stage="offline" if args.online_steps == 0 else "both",

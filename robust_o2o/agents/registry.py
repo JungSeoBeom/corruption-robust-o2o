@@ -2,77 +2,13 @@ from __future__ import annotations
 
 import torch
 
-from ..config import ExperimentConfig
+from ..config import ExperimentConfig, CANDIDATE_ALGORITHMS
+from .cro2o import CRO2OAgent
 from .base import BaseAgent
 from .calql import CalQLAgent
 from .iql_family import IQLFamilyAgent
 from .pessimistic_q_ensemble import PessimisticQEnsembleAgent
 from .sac_family import SACEnsembleAgent
-
-
-def _apply_rpex_riql_defaults(config: ExperimentConfig) -> None:
-    if config.algorithm not in ("rpex", "riql_pex", "riql_naive"):
-        return
-    # Explicit non-default CLI values win.
-    if (config.riql_sigma, config.riql_quantile, config.num_critics) != (3.0, 0.1, 5):
-        return
-    domain = config.env_name.split("-")[0]
-    target = config.corruption_target
-    mode = config.corruption if config.corruption != "clean" else "random"
-    tables = {
-        "random": {
-            "observations": {
-                "halfcheetah": (0.1, 0.1, 5),
-                "walker2d": (0.1, 0.25, 5),
-                "hopper": (0.1, 0.25, 3),
-            },
-            "actions": {
-                "halfcheetah": (0.5, 0.25, 3),
-                "walker2d": (0.5, 0.1, 5),
-                "hopper": (0.1, 0.25, 5),
-            },
-            "rewards": {
-                "halfcheetah": (3.0, 0.25, 5),
-                "walker2d": (3.0, 0.1, 5),
-                "hopper": (1.0, 0.25, 3),
-            },
-            "dynamics": {
-                "halfcheetah": (3.0, 0.25, 5),
-                "walker2d": (1.0, 0.25, 3),
-                "hopper": (1.0, 0.5, 5),
-            },
-        },
-        "adversarial": {
-            "observations": {
-                "halfcheetah": (0.1, 0.1, 5),
-                "walker2d": (1.0, 0.25, 5),
-                "hopper": (1.0, 0.25, 5),
-            },
-            "actions": {
-                "halfcheetah": (1.0, 0.1, 5),
-                "walker2d": (1.0, 0.1, 5),
-                "hopper": (1.0, 0.25, 5),
-            },
-            "rewards": {
-                "halfcheetah": (1.0, 0.1, 5),
-                "walker2d": (3.0, 0.1, 5),
-                "hopper": (0.1, 0.25, 5),
-            },
-            "dynamics": {
-                "halfcheetah": (1.0, 0.1, 5),
-                "walker2d": (1.0, 0.25, 5),
-                "hopper": (1.0, 0.5, 5),
-            },
-        },
-    }
-    # RPEX reports target-specific RIQL hyperparameters for the four
-    # single-target settings. Mixed corruption keeps the user-supplied/general
-    # defaults because there is no single target-specific row to select.
-    if target in ("none", "mixed"):
-        return
-    config.riql_sigma, config.riql_quantile, config.num_critics = tables[mode][target][
-        domain
-    ]
 
 
 def _apply_uwmsg_defaults(config: ExperimentConfig) -> None:
@@ -106,8 +42,11 @@ def build_agent(
     max_action: float,
     device: torch.device,
 ) -> BaseAgent:
-    _apply_rpex_riql_defaults(config)
+    # RIQL/RPEX table selection is resolved once by ExperimentConfig so CLI
+    # overrides and the serialized provenance cannot diverge at construction.
     _apply_uwmsg_defaults(config)
+    if config.algorithm in CANDIDATE_ALGORITHMS:
+        return CRO2OAgent(config, state_dim, action_dim, max_action, device)
     if config.algorithm in ("rpex", "riql_pex", "riql_naive", "pex"):
         return IQLFamilyAgent(config, state_dim, action_dim, max_action, device)
     if config.algorithm == "cal_ql":

@@ -11,7 +11,7 @@ import torch
 from plot_results import add_global_plot_steps
 from robust_o2o.agents.calql import calql_td_target
 from robust_o2o.agents.registry import build_agent
-from robust_o2o.config import ExperimentConfig, LOCAL_PROTOCOL
+from robust_o2o.config import DEFAULT_PROTOCOL, ExperimentConfig
 from robust_o2o.corruption import (
     corrupt_offline_dataset,
     corrupt_online_transition,
@@ -98,6 +98,16 @@ class TrainingInvariantTest(unittest.TestCase):
         low = np.array([-1.0, -2.0], dtype=np.float32)
         high = np.array([1.0, 0.5], dtype=np.float32)
         executed = bounded_executed_action(raw, low, high)
+        with self.assertRaisesRegex(FloatingPointError, "NaN or infinity"):
+            bounded_executed_action(
+                np.asarray([np.nan, 0.0], dtype=np.float32), low, high
+            )
+        with self.assertRaisesRegex(FloatingPointError, "NaN or infinity"):
+            bounded_executed_action(
+                raw,
+                np.asarray([-np.inf, -2.0], dtype=np.float32),
+                high,
+            )
         config = ExperimentConfig("rpex", "hopper-medium-replay-v2")
         _, stored_action, _, _, was_corrupted = corrupt_online_transition(
             np.zeros(3, dtype=np.float32),
@@ -385,13 +395,13 @@ class TrainingInvariantTest(unittest.TestCase):
             episodes=3,
             max_episode_steps=1,
             seed=0,
-            protocol=LOCAL_PROTOCOL,
+            protocol=DEFAULT_PROTOCOL,
             evaluation_mode="method_faithful",
         )
         actual_next = torch.rand(5)
         self.assertTrue(torch.equal(expected_next, actual_next))
 
-    def test_rpex_deterministic_diagnostic_is_repeatable(self):
+    def test_rpex_deterministic_evaluation_is_repeatable(self):
         torch.manual_seed(6)
         config = ExperimentConfig(
             "rpex",
@@ -404,10 +414,10 @@ class TrainingInvariantTest(unittest.TestCase):
         agent.begin_online()
         state = torch.tensor([0.1, -0.2, 0.3])
         first = agent.select_action(
-            state, evaluate=True, evaluation_mode="deterministic_diagnostic"
+            state, evaluate=True, evaluation_mode="deterministic"
         )
         second = agent.select_action(
-            state, evaluate=True, evaluation_mode="deterministic_diagnostic"
+            state, evaluate=True, evaluation_mode="deterministic"
         )
         self.assertTrue(torch.equal(first, second))
 

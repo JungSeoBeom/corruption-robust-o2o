@@ -25,6 +25,10 @@ env/
 # Jupyter temporary files
 .ipynb_checkpoints/
 
+# Local experiment entry points (keep on disk, not in commits)
+/comparison.ipynb
+/run_55_experiment.py
+
 # Experiment outputs, logs, and checkpoints
 results/
 logs/

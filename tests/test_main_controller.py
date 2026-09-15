@@ -40,7 +40,7 @@ def _dataset(
     }
 
 
-class _LegacyEnv:
+class _GymnasiumEnv:
     def __init__(
         self,
         *,
@@ -59,12 +59,11 @@ class _LegacyEnv:
         self.events: list[tuple[str, int]] = []
         self.seed_value: int | None = None
 
-    def seed(self, seed: int) -> None:
-        self.seed_value = int(seed)
-
-    def reset(self) -> np.ndarray:
+    def reset(self, *, seed: int | None = None, options=None):
+        del options
+        self.seed_value = None if seed is None else int(seed)
         self.episode_step = 0
-        return np.asarray([0.0, 0.5], dtype=np.float32)
+        return np.asarray([0.0, 0.5], dtype=np.float32), {}
 
     def step(self, action: np.ndarray):
         self.episode_step += 1
@@ -79,6 +78,7 @@ class _LegacyEnv:
             ),
             float(self.episode_step),
             terminated,
+            False,
             {},
         )
 
@@ -134,6 +134,80 @@ def _controller_config(
 
 
 class MainControllerContractTest(unittest.TestCase):
+    def test_action_poisoning_keeps_oob_replay_label_and_audits_all_actions(self):
+        replay_instances: list[ReplayBuffer] = []
+
+        class CapturingReplay(ReplayBuffer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                replay_instances.append(self)
+
+        class ProposalAgent:
+            total_updates = 0
+
+            def select_action(self, state, evaluate=False):
+                del state, evaluate
+                return torch.asarray([2.5], dtype=torch.float32)
+
+            def update(self, batch):
+                del batch
+                raise AssertionError("one-step collection should not update")
+
+        class PoisonOracle:
+            def __init__(self):
+                self.generator = torch.Generator().manual_seed(0)
+
+            def rng_state_dict(self):
+                return self.generator.get_state()
+
+            def attack(self, original, *args, **kwargs):
+                del args, kwargs
+                return np.full_like(original, -1.7, dtype=np.float32)
+
+        config = _controller_config(
+            "rpex",
+            online_steps=1,
+            corruption="adversarial",
+            corruption_target="actions",
+        )
+        config.online_corruption_rate = 1.0
+        env = _GymnasiumEnv(terminal_at=1)
+        with tempfile.TemporaryDirectory() as directory:
+            logger = _logger(directory, "action-poison-audit")
+            with (
+                patch("robust_o2o.experiment.ReplayBuffer", CapturingReplay),
+                patch("robust_o2o.experiment._evaluate"),
+                patch("robust_o2o.experiment._save_phase_checkpoint"),
+            ):
+                _run_online(
+                    env,
+                    object(),
+                    _dataset(),
+                    config,
+                    ProposalAgent(),
+                    OfflineDataset(_dataset(), seed=0),
+                    _normalizer(),
+                    PoisonOracle(),
+                    torch.device("cpu"),
+                    logger,
+                    state_dim=2,
+                    action_dim=1,
+                )
+            manifest = json.loads(
+                (Path(directory) / "online_corruption_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        np.testing.assert_array_equal(env.actions[0], np.asarray([1.0], dtype=np.float32))
+        np.testing.assert_array_equal(
+            replay_instances[0].actions[0], np.asarray([-1.7], dtype=np.float32)
+        )
+        self.assertEqual(manifest["policy_proposal_action_oob_fraction"], 1.0)
+        self.assertEqual(manifest["executed_env_action_oob_fraction"], 0.0)
+        self.assertEqual(manifest["poisoned_replay_action_oob_count"], 1)
+        self.assertEqual(manifest["poisoned_replay_action_oob_fraction"], 1.0)
+
     def test_stage_both_with_zero_online_steps_never_resets_or_updates(self):
         class NoInteractionEnv:
             def __init__(self) -> None:
@@ -196,7 +270,7 @@ class MainControllerContractTest(unittest.TestCase):
         save_checkpoint.assert_called_once()
         self.assertIsNotNone(save_checkpoint.call_args.kwargs["resume_state"])
 
-    def test_rpex_and_riql_research_update_before_transition_and_do_not_clip(self):
+    def test_rpex_and_riql_research_update_before_transition_and_clip_execution(self):
         for algorithm in ("rpex", "riql_naive"):
             with self.subTest(algorithm=algorithm), tempfile.TemporaryDirectory() as directory:
                 replay_instances: list[ReplayBuffer] = []
@@ -206,7 +280,7 @@ class MainControllerContractTest(unittest.TestCase):
                         super().__init__(*args, **kwargs)
                         replay_instances.append(self)
 
-                env = _LegacyEnv(terminal_at=1)
+                env = _GymnasiumEnv(terminal_at=1)
 
                 class RecordingAgent:
                     def __init__(self) -> None:
@@ -232,7 +306,7 @@ class MainControllerContractTest(unittest.TestCase):
                 config.initial_collection_steps = 0
                 config.batch_size = 1
                 self.assertEqual(
-                    config.action_execution_profile, "official_algorithm_behavior"
+                    config.action_execution_profile, "clip_to_action_space"
                 )
                 offline = OfflineDataset(_dataset(), seed=0)
                 logger = _logger(directory, f"{algorithm}-controller")
@@ -266,21 +340,21 @@ class MainControllerContractTest(unittest.TestCase):
                 self.assertEqual(agent.total_updates, 1)
                 np.testing.assert_array_equal(
                     np.stack(env.actions),
-                    np.full((2, 1), 2.5, dtype=np.float32),
+                    np.full((2, 1), 1.0, dtype=np.float32),
                 )
                 replay = replay_instances[0]
                 np.testing.assert_array_equal(
                     replay.actions[: replay.size],
-                    np.full((2, 1), 2.5, dtype=np.float32),
+                    np.full((2, 1), 1.0, dtype=np.float32),
                 )
                 np.testing.assert_array_equal(
                     agent.sampled_actions[0],
-                    np.asarray([[2.5]], dtype=np.float32),
+                    np.asarray([[1.0]], dtype=np.float32),
                 )
 
     def test_calql_holds_pending_episode_then_flushes_exact_rtg_and_utd_updates(self):
         replay_instances: list[ReplayBuffer] = []
-        env = _LegacyEnv(terminal_at=3)
+        env = _GymnasiumEnv(terminal_at=3)
 
         class CapturingReplay(ReplayBuffer):
             def __init__(self, *args, **kwargs):
@@ -439,7 +513,7 @@ class MainControllerContractTest(unittest.TestCase):
         config = _controller_config("cal_ql", online_steps=2)
         config.max_episode_steps = 3
         config.batch_size = 2
-        env = _LegacyEnv(terminal_at=99)
+        env = _GymnasiumEnv(terminal_at=99)
         agent = CountingAgent()
 
         with tempfile.TemporaryDirectory() as directory:
@@ -480,7 +554,7 @@ class MainControllerContractTest(unittest.TestCase):
 
     def test_pqe_updates_only_full_1000_step_blocks_and_records_block_ledger(self):
         replay_instances: list[ReplayBuffer] = []
-        env = _LegacyEnv(terminal_at=1)
+        env = _GymnasiumEnv(terminal_at=1)
         counters = {"sample": 0, "priority": 0}
 
         class CapturingReplay(ReplayBuffer):
@@ -767,7 +841,7 @@ class MainControllerContractTest(unittest.TestCase):
 
         config = _controller_config("wsrl", online_steps=3)
         config.replay_size = 16
-        env = _LegacyEnv(terminal_at=1)
+        env = _GymnasiumEnv(terminal_at=1)
         agent = NoWarmupUpdateAgent()
         offline = OfflineDataset(_dataset(), seed=11)
 

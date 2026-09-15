@@ -380,7 +380,12 @@ class IQLFamilyAgent(BaseAgent):
                 )
                 advantage = target_for_actor - self.value(states)
 
-        if self.config.policy_extraction == "align_iql":
+        policy_extraction = (
+            self.config.online_policy_extraction
+            if self.online_phase
+            else self.config.policy_extraction
+        )
+        if policy_extraction == "align_iql":
             weights = torch.exp(-self.config.beta * advantage.detach().square())
         else:
             weights = torch.exp(self.config.beta * advantage.detach()).clamp(max=100.0)
@@ -428,6 +433,9 @@ class IQLFamilyAgent(BaseAgent):
             "linear_regime_fraction": float((absolute_td >= threshold).float().mean().item()),
             "quadratic_regime_fraction": float((absolute_td < threshold).float().mean().item()),
             "expansion_online_fraction": float(expansion_online_fraction.item()),
+            "online_align_iql_active": float(
+                self.online_phase and policy_extraction == "align_iql"
+            ),
         }
         if policy_log_std is not None:
             metrics.update(

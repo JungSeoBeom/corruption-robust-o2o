@@ -1,502 +1,293 @@
-# Corruption-Robust Offline-to-Online RL Benchmark
+# Corruption-Robust Offline-to-Online RL
 
-This repository provides a custom-budget benchmark for corruption-robust
-offline-to-online RL under `clean`, `random`, and `adversarial` conditions. The
-default `research_benchmark` suite contains exactly five main baselines:
-`rpex`, `riql_naive`, `wsrl`, `cal_ql`, and `pessimistic_q_ensemble`. It uses
-one common clean evaluation rule and one RPEX-inspired
-replay-transition-poisoning contract across those baselines.
+This repository compares nine offline-to-online reinforcement-learning methods
+on the RPEX locomotion benchmark. All methods share the same D4RL-v2 offline
+datasets, corruption pipeline, online interaction environments, evaluation
+schedule, logging format, and configurable offline/online budgets.
 
-Cal-QL is a frozen, source-aligned D4RL locomotion adaptation because the
-pinned public release has no official locomotion recipe. Pessimistic
-Q-Ensemble uses five independently pretrained actor/twin-critic members and
-moment-matches their pre-tanh Gaussian policies. It ports the public D4RL-v0
-method to the benchmark's shared D4RL-v2 datasets. Both are main-table methods;
-their task/version scope remains explicit in every manifest. Historical result
-names `cal_ql_locomotion_adaptation` and `pqe_shared_actor_approx` may be read,
-but cannot launch a new run.
+The runtime has one modern backend: Gymnasium with the native MuJoCo Python
+package. Legacy Gym, D4RL's Python package, `mujoco_py`, PyBullet, and a local
+MuJoCo 2.1 installation are not required. The migration changes package and
+environment APIs only; it does not intentionally change an algorithm objective,
+corruption rule, replay rule, optimizer schedule, or training budget.
 
-The default protocol is explicitly `rpex_d4rl_v2_legacy`: Gym 0.23.1, the full
-D4RL-v2 environment ID, `mujoco_py`, and D4RL commit
-`d842aa194b416e564e54b0730d9f934e3e32f854`. See
-[RPEX_D4RL_V2_PROTOCOL.md](docs/RPEX_D4RL_V2_PROTOCOL.md) for the pinned protocol,
-installation, metadata, and platform limitations.
+## Algorithms
 
-Long training runs were not executed while preparing this repository. Use the
-commands below in the pinned legacy environment, which requires a Linux x86_64
-host rather than an Apple Silicon MacBook. Passing that environment check does
-not establish numerical parity of a learner implementation.
+| # | CLI name | Paper or configuration |
+|---:|---|---|
+| 1 | `rpex` | *Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption* |
+| 2 | `riql_pex` | RIQL+PEX ablation defined by RPEX |
+| 3 | `riql_naive` | *Towards Robust Offline Reinforcement Learning under Diverse Data Corruption* |
+| 4 | `uwmsg` | *Corruption-Robust Offline Reinforcement Learning with General Function Approximation* |
+| 5 | `pex` | *Policy Expansion for Bridging Offline-to-Online Reinforcement Learning* |
+| 6 | `cal_ql` | *Cal-QL: Calibrated Offline RL Pre-Training for Efficient Online Fine-Tuning* |
+| 7 | `wsrl` | *Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data* |
+| 8 | `ro2o` | *Towards Robust Offline-to-Online Reinforcement Learning via Uncertainty and Smoothness* |
+| 9 | `pessimistic_q_ensemble` | *Offline-to-Online Reinforcement Learning via Balanced Replay and Pessimistic Q-Ensemble* |
 
-**Strict reproduction decision: FINAL BENCHMARK NOT READY.** The strict-final algorithm set
-is empty. RPEX and RIQL-naive are handwritten `source_aligned_port`s with only
-partial fixed-batch evidence, so neither is strict-eligible. WSRL is an
-unverified cross-framework port and its source-primary reporting rule is also
-unverified; locomotion Cal-QL is a task adaptation; and PQE is a D4RL-v2 port
-of the upstream v0 method. The existing v1 corruption fixtures are diagnostic evidence:
-they were produced under a runtime different from the strict pins, and the
-adversarial fixture covers only an optimizer core. Upstream-executed learner,
-constructor/evaluation RNG, condition, save/resume, and strict Linux receipts
-are missing. A local macOS run is diagnostic-only. No final-run command is
-authorized or documented while these fail-closed blockers remain.
+`calql` and `cal-ql` are accepted aliases for `cal_ql`; `pqe` is an alias for
+`pessimistic_q_ensemble`.
 
-That strict decision does not block `run_purpose=research_benchmark`. The
-research path permits explicit budgets, seeds, and evaluation settings; records
-the implementation type and benchmark role; and does not require parity
-receipts, exact-RNG fixtures, or certificates. It is a custom research
-benchmark, not an official paper reproduction.
+PEX, RIQL+PEX, UWMSG, and RO2O have a separate
+[implementation audit](docs/optional-algorithm-audit.md). Their execution tests
+pass, but unresolved source differences and reproducibility issues mean that
+the nine executable names are not nine verified paper baselines.
 
-### KAIST RL Lab GCP Slurm (CPU only)
+RIQL-naive and UWMSG use replay-buffer-based offline reduction during online
+fine-tuning: online transitions are stored in replay and the same offline
+objective is applied to sampled online batches. The other methods keep their
+method-specific online behavior.
 
-The files under `slurm/` install and run the strict legacy environment entirely
-on the `cpu` partition. They do not request a GPU, and they enforce both
-`--device cpu` and `MUJOCO_PY_FORCE_CPU=1`. Submit them from the repository root
-on `slurm-login-001`:
+## Environment setup
+
+Run the following commands from this repository directory:
 
 ```bash
-# One-time setup per cluster user. This also runs the unit suite and the real
-# D4RL/MuJoCo smoke.
-sbatch --wait slurm/setup_cpu.sbatch
-
-# Short end-to-end Slurm smoke: dataset, offline update, online interaction,
-# online replay updates, evaluation, and checkpoints.
-sbatch --wait slurm/smoke_cpu.sbatch
-
-# Common-budget RPEX clean diagnostic (500k offline + 500k online).
-sbatch slurm/run_cpu.sbatch
+cd /path/to/corruption_robust_o2o
+conda env create -f environment.yml
+conda activate corruption-robust-o2o
+python -m pip check
 ```
 
-Pass normal `run_experiment.py` arguments after the batch script to select a
-different experiment. Slurm resource overrides go before the script:
+The environment is pinned to a mutually compatible modern stack:
+
+| Package | Version |
+|---|---:|
+| Python | 3.13 |
+| NumPy | 2.5.2 |
+| PyTorch | 2.13.0 |
+| Gymnasium | 1.3.0 |
+| MuJoCo | 3.11.0 |
+| h5py | 3.16.0 |
+| pandas | 3.0.5 |
+| Matplotlib | 3.11.1 |
+| JupyterLab | 4.6.3 |
+
+See [the modern runtime contract](docs/MODERN_RUNTIME.md) for the task mapping,
+dataset boundary handling, and research-interpretation details.
+
+To update an existing environment created from this file:
 
 ```bash
-sbatch --time=12:00:00 slurm/run_cpu.sbatch \
-  --algorithm uwmsg \
-  --env-name hopper-medium-replay-v2 \
-  --corruption random \
-  --corruption-target rewards \
-  --stage both \
-  --offline-steps 500000 \
-  --online-steps 500000 \
-  --seed 0
+conda env update --name corruption-robust-o2o --file environment.yml --prune
+conda activate corruption-robust-o2o
+python -m pip check
 ```
 
-The shared environment is stored under `~/.local/share/micromamba`, MuJoCo 2.1
-under `~/.mujoco/mujoco210`, and datasets under `~/.d4rl/datasets`. All are
-visible from the login and compute nodes through the shared home directory.
-Batch output is written to `slurm-*.out` in the submission directory. The CPU
-nodes are Spot VMs. Initialization and interruption recovery are deliberately
-separate: `--initialize-from-checkpoint` starts a new run, while `--resume-run`
-restores replay/RNG/optimizer state from an episode-boundary resume checkpoint.
-
-For local Apple Silicon execution, the separate
-`local_gymnasium_v4_diagnostic` protocol
-uses Gymnasium v4 with native MuJoCo and reads the cached D4RL-v2 HDF5 dataset
-directly. It is diagnostic-only, is not a D4RL-v2 benchmark result, and requires
-the explicit `--allow-diagnostic-protocol` acknowledgement. The old
-`local_gymnasium_v4` spelling is accepted only as an alias and is recorded under
-the canonical diagnostic name.
-
-The generic `reference` profile has been removed. Every run records an
-`implementation_profile`, an `implementation_fidelity`, a `suite_profile`, an
-`implementation_type`, and a `benchmark_role`. The default research suite is
-the 5×5 `research_benchmark`; it is always labelled as a custom benchmark and
-never as paper reproduction. The separate `primary_research_benchmark` and
-`final_benchmark` paths retain the conservative strict registry and certificate
-gate. They currently select no eligible algorithm and fail before creating a
-run directory. The old `common_budget_robustness`, `common_budget_diagnostic`,
-and `method_fidelity` names remain compatibility profiles for existing
-diagnostic commands and results. See
-[reproduction_matrix.md](docs/reproduction_matrix.md) for the strict/research
-distinction and
-[baseline_fidelity_manifest.yaml](docs/baseline_fidelity_manifest.yaml) for
-pinned source provenance.
-
-## 1. Algorithms
-
-The CLI names and reference papers or configurations are listed below.
-
-| # | `--algorithm` | Paper/configuration | Offline → online behavior |
-|---|---|---|---|
-| 1 | `rpex` | *RPEX: Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption* | RIQL pretraining followed by IPW-based robust policy expansion |
-| 2 | `riql_pex` | RIQL+PEX ablation from RPEX | RIQL pretraining followed by PEX without IPW |
-| 3 | `riql_naive` | *Towards Robust Offline Reinforcement Learning under Diverse Data Corruption* | Applies the RIQL objective directly to online replay |
-| 4 | `uwmsg` | *Corruption-Robust Offline Reinforcement Learning with General Function Approximation* | Applies the UWMSG objective directly to online replay |
-| 5 | `pex` | *Policy Expansion for Bridging Offline-to-Online Reinforcement Learning* | IQL pretraining followed by PEX |
-| 6 | `cal_ql` (`calql`, `cal-ql`) | *Cal-QL: Calibrated Offline RL Pre-Training for Efficient Online Fine-Tuning* | Main frozen locomotion adaptation; calibrated CQL pretraining and online fine-tuning |
-| 7 | `wsrl` | *Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data* | CQL pretraining, frozen-policy warmup, and online-only SAC |
-| 8 | `ro2o` | *Towards Robust Offline-to-Online Reinforcement Learning via Uncertainty and Smoothness* | Q-ensemble/smoothness pretraining followed by replay-based online reduction |
-| 9 | `pessimistic_q_ensemble` (`pqe`) | *Offline-to-Online Reinforcement Learning via Balanced Replay and Pessimistic Q-Ensemble* | Main five-member independent-policy/twin-critic ensemble with balanced priority replay |
-
-For `research_benchmark`, all five methods have `benchmark_role=main`. RPEX and
-RIQL-naive are recorded as `source_aligned_port`, WSRL as `framework_port`,
-Cal-QL as `source_aligned_locomotion_adaptation`, and PQE as
-`source_aligned_d4rl_v2_port`. None is labelled `exact_upstream_port`.
-
-As requested, the online stages of `riql_naive` and `uwmsg` store newly collected
-transitions in a replay buffer and train on mini-batches using the same objective
-as their offline updates. Following the default comparison protocol in the RPEX
-code, the RIQL variants, UWMSG, WSRL, and RO2O use online replay only by default.
-PEX uses its fixed offline/online mixture. Cal-QL dynamically recomputes
-`|D_offline| / (|D_offline| + |D_online-completed|)` and only admits complete
-online trajectories with valid post-corruption return-to-go. PQE learns a
-density ratio and samples from combined offline/online priority mass; its
-source-derived initial online fraction is `0.75`, not a fixed batch split.
-
-## 2. Reproducibility environment
-
-The RPEX environment protocol is a pinned legacy stack. Use Linux x86_64 for
-the strict environment path; `mujoco_py` and its transitive PyBullet dependency
-are often not buildable on Apple Silicon. The code intentionally does not fall
-back to Gymnasium v4/v5 on macOS. Environment fidelity and learner numerical
-parity are recorded and gated separately.
+For a notebook kernel:
 
 ```bash
-cd /Users/seobeom/programming/project/corruption_robust_o2o
-conda env create -f environment-rpex-v2.yml
-conda activate corruption-rpex-v2
+python -m ipykernel install --user \
+  --name corruption-robust-o2o \
+  --display-name "Python (corruption-robust-o2o)"
 ```
 
-Install MuJoCo 2.1 at `~/.mujoco/mujoco210` and configure its library path as
-described in [the protocol document](docs/RPEX_D4RL_V2_PROTOCOL.md). Then run:
+`--device auto` selects CUDA only when available, otherwise Apple MPS when
+available, and otherwise CPU. On macOS, use `--device mps` explicitly for MPS
+or `--device cpu` if an operation is unsupported by MPS.
 
-```bash
-python scripts/smoke_rpex_d4rl_v2.py \
-  --env-name hopper-medium-replay-v2 \
-  --seed 0
-```
+## Environments and datasets
 
-The smoke test verifies Gym 0.23.1, NumPy 1.23.5, the exact D4RL commit,
-`mujoco-py==2.1.2.14`, linked native MuJoCo version code `210`, the complete
-environment registration, dataset loading, and score normalization.
-`--dataset-dir /path/to/datasets` changes the D4RL cache through
-`d4rl.set_dataset_path()`.
-
-On a Linux x86_64 strict host, the bounded end-to-end preflight loads and hashes
-all three medium-replay-v2 datasets, checks the official qlearning conversion,
-then performs 10 offline updates, 20 online steps, evaluation, checkpoint
-reload, deterministic interrupted/resumed comparison, and corruption-cache
-miss/hit artifact comparison:
-
-```bash
-python scripts/preflight_strict.py
-```
-
-It fails on unsupported platforms or version mismatches. It never substitutes
-the local Gymnasium diagnostic and reports that substitution as strict success.
-The executable save/resume equivalence exercised by this preflight is narrowly
-scoped to RIQL-naive with random observation corruption under a diagnostic
-common-budget smoke configuration. It resumes an offline checkpoint and does
-not exercise online-checkpoint restore or compare every saved replay/RNG state.
-It is not a save/resume certificate. Strict eligibility requires validated
-external receipts for the complete eligible-baseline × certified-condition
-matrix, bound to the exact repository, runtime, command, and artifacts.
-
-The default device option is `--device auto`:
-
-1. `cuda:N` is selected and `torch.cuda.set_device` is called only when CUDA is
-   actually available.
-2. PyTorch MPS is selected when it is available on the Mac.
-3. The code falls back to the CPU when neither accelerator is available.
-
-There are no unconditional `.cuda()` calls. Use `--device cpu` if you encounter
-MPS operation compatibility issues or need stricter reproducibility.
-
-Do not interpret a Gymnasium-v4/v5 run as an RPEX reproduction. The D4RL `-v2`
-suffix is a D4RL registration/dataset revision, not a request to create the base
-Gym or Gymnasium `Walker2d-v2/v4/v5` task.
-
-## 3. Running one experiment
-
-The current **diagnostic/default CLI** schedule is:
-
-- Offline: `500,000` gradient updates
-- Online: `500,000` environment steps
-- Online updates: one gradient update per environment step by default; reference
-  WSRL uses four critic updates and one actor/temperature update per step
-
-Use `--offline-steps`, `--online-steps`, and `--updates-per-step` to change these
-values. A single command with `--stage both` runs offline pretraining and online
-fine-tuning sequentially with the same agent:
-
-These `500,000/500,000` defaults are for common-budget diagnostics. The dormant
-RPEX/RIQL strict contract records `2,000,001` offline updates, `1,000,001`
-requested online steps, and exact seeds `0,1,2,3,4`, but no current learner is
-eligible to launch that contract.
-
-### Clean
-
-```bash
-python run_experiment.py \
-  --algorithm rpex \
-  --env-name hopper-medium-replay-v2 \
-  --corruption clean \
-  --stage both \
-  --offline-steps 500000 \
-  --online-steps 500000 \
-  --seed 0
-```
-
-For `clean`, the corruption target is automatically set to `none`, so
-`--corruption-target` is not required.
-
-### Random corruption
-
-```bash
-python run_experiment.py \
-  --algorithm uwmsg \
-  --env-name hopper-medium-replay-v2 \
-  --corruption random \
-  --corruption-target dynamics \
-  --stage both \
-  --seed 0
-```
-
-### Adversarial corruption
-
-```bash
-python run_experiment.py \
-  --algorithm riql_naive \
-  --env-name hopper-medium-replay-v2 \
-  --corruption adversarial \
-  --corruption-target dynamics \
-  --stage both \
-  --seed 0
-```
-
-The command above is diagnostic-only because the target is `dynamics`. The v1
-adversarial fixture covers only the **Hopper observation-target optimizer
-core** and was generated under a runtime different from the strict pins. It is
-not an end-to-end condition certificate and authorizes no strict adversarial
-row. HalfCheetah/Walker2d observations and all adversarial `actions`, `rewards`,
-and `dynamics` are likewise diagnostic-only. The strict adversarial condition
-set is empty.
-
-The following corruption targets are supported:
-
-- `observations`: current observations stored in replay
-- `actions`: actions stored in replay
-- `rewards`: rewards stored in replay
-- `dynamics`: next observations stored in replay
-- `mixed`: allocate corrupted transitions across all four targets using
-  `--mixed-ratios`
-
-Corruption timing is explicit. `official_code_reference` uses
-`post_transition_replay_poisoning`: the clean observation selects the action,
-the clean action is executed, and the selected field is changed only before the
-transition enters replay. `paper_reference` uses the separate
-`paper_pre_action_sensor_actuator` path, where observation corruption precedes
-action selection and action corruption precedes `env.step()`. The two profiles
-have different manifest identities and cannot be aggregated.
-
-The default corruption parameters match RPEX:
-
-- Offline corruption rate: `0.3`
-- Online corruption rate: `0.5`
-- Corruption range: `1.0`
-- Random reward corruption: replace selected rewards with
-  `Uniform(-30 × range, 30 × range)`
-- Offline adversarial reward corruption: official `-range × reward` sign flip
-- Online adversarial reward corruption: official `Uniform(-1, 1)` replacement
-
-Official RPEX online observation/dynamics poisoning uses unit scale; actions
-use the offline action standard deviation. The historical dataset-standard-
-deviation behavior is available only as
-`--online-corruption-scale-profile dataset_std_scaled_extension` and has a
-separate manifest/plot identity.
-
-Example with custom corruption parameters:
-
-```bash
-python run_experiment.py \
-  --algorithm rpex \
-  --env-name walker2d-medium-replay-v2 \
-  --corruption random \
-  --corruption-target observations \
-  --offline-corruption-rate 0.2 \
-  --online-corruption-rate 0.4 \
-  --corruption-range 0.5
-```
-
-### Mixed corruption
-
-`mixed` is a corruption target and can be used with either `random` or
-`adversarial` corruption. The four `--mixed-ratios` values are ordered as
-`observations actions rewards dynamics` and must sum to `1.0`.
-
-```bash
-python run_experiment.py \
-  --algorithm rpex \
-  --env-name hopper-medium-replay-v2 \
-  --corruption random \
-  --corruption-target mixed \
-  --mixed-ratios 0.1 0.2 0.3 0.4 \
-  --stage both \
-  --seed 0
-```
-
-The ratios allocate transitions *within* the corrupted subset. For example, with
-the default offline corruption rate of `0.3`, the expected fractions of the full
-offline dataset are 3% observations, 6% actions, 9% rewards, and 12% dynamics.
-Each selected transition is assigned to exactly one target. Actual per-target
-counts and fractions are written to `config.json` under `offline_corruption`.
-
-### Adversarial attack checkpoint
-
-Adversarial corruption of `observations`, `actions`, and `dynamics` requires an
-EDAC gradient oracle, as in RPEX. Checkpoints for the following three
-environments are discovered automatically from the original `RIQL-main`
-directory:
+The commands in this README use the three medium-replay benchmark dataset IDs:
 
 - `halfcheetah-medium-replay-v2`
 - `hopper-medium-replay-v2`
 - `walker2d-medium-replay-v2`
 
-For other dataset types, provide a checkpoint explicitly:
+Download all three official medium-replay D4RL-v2 HDF5 files:
 
 ```bash
-python run_experiment.py \
-  --algorithm ro2o \
-  --env-name hopper-medium-v2 \
-  --corruption adversarial \
-  --corruption-target actions \
-  --attack-checkpoint /absolute/path/to/EDAC/2999.pt
+python scripts/download_d4rl_datasets.py
 ```
 
-Attack results are stored in `results/attack_cache/<protocol>/`. Cache keys hash
-the dataset and normalizer, attack checkpoint, target/rate/range, attack seed,
-offline and online steps/step sizes, device, timing, objective, optimizer,
-source commit, MC settings, and implementation version. Writes use a per-key
-file lock, temporary file, fsync, SHA-256 sidecar, and atomic replace; loads
-validate the checksum, embedded metadata, shape, dtype, and indices.
-`--attack-min-step-size` is explicit and defaults to zero; no hidden runtime
-lower bound is applied. Add `--force-regenerate-attack` to regenerate a cache.
-
-### Correctness-sensitive modes
-
-- RPEX/RIQL non-legacy profiles resolve to
-  `official_unsquashed_gaussian`: bounded mean, state-independent log standard
-  deviation, ordinary Normal samples, and no tanh-Jacobian correction.
-  `tanh_gaussian` remains available for explicit non-reference ablations.
-  `--action-execution-profile` separately records
-  `official_algorithm_behavior` or `clip_to_action_space`.
-- `--evaluation-mode deterministic_diagnostic` uses policy means and a
-  deterministic expansion branch. `method_faithful` preserves stochastic RPEX
-  expansion, and `both` logs both. Evaluation saves/restores Python, NumPy,
-  PyTorch CPU, and CUDA RNG state.
-- `--mc-return-source post_corruption` is the Cal-QL main default. Reward
-  corruption recomputes return-to-go within trajectory boundaries. Online
-  transitions remain pending until terminal or timeout; only then are exact
-  MC returns written and trajectory-length × UTD updates performed. Main mode
-  finishes the current episode when the requested online budget lands inside
-  a trajectory, and records requested/actual steps, overshoot, completed and
-  effective transitions, and a zero pending length in the completion manifest.
-  It uses `--calibration-mask-mode all`, so it does not reveal corrupted row
-  indices to the learner. Oracle masking, disabled calibration, nonzero BC
-  warmup, and fixed 50:50 mixing are rejected by the research profile.
-  `legacy_pre_corruption` is an explicit reproduction mode.
-- `--backup-entropy` enables the entropy term in the Cal-QL Bellman backup. The
-  default is disabled, matching the task configuration used by the reference.
-- `--state-normalization` accepts `standard`, `robust_median_mad`, or `none`.
-  Statistics are fitted after corruption and serialized in checkpoints.
-
-## 4. Running the offline and online stages separately
-
-Run the offline stage only:
+Download only selected datasets or use a custom cache directory:
 
 ```bash
-python run_experiment.py \
-  --algorithm riql_pex \
-  --env-name halfcheetah-medium-replay-v2 \
-  --corruption random \
-  --corruption-target rewards \
-  --stage offline \
-  --seed 0
+python scripts/download_d4rl_datasets.py \
+  --env-name halfcheetah-medium-replay-v2 hopper-medium-replay-v2 \
+  --dataset-dir /path/to/d4rl/datasets
 ```
 
-Then run the online stage using the manifest-tagged final checkpoint from the
-resulting run directory:
+The same loader also accepts the medium and medium-expert D4RL-v2 variants for
+these three domains. Supply those full IDs explicitly to the download script.
+The default cache is `~/.d4rl/datasets`; pass the same custom directory to
+training with `--dataset-dir /path/to/d4rl/datasets`.
+
+The D4RL `-v2` suffix identifies the offline dataset revision. Online
+interaction uses the corresponding Gymnasium MuJoCo v4 task internally
+(`HalfCheetah-v4`, `Hopper-v4`, or `Walker2d-v4`). The repository deliberately
+does not switch those tasks to v5: v5 changes the environment definition, so
+doing so would change the experimental MDP rather than merely modernize syntax.
+
+## Corruption settings
+
+`--corruption` selects the corruption mechanism:
+
+- `clean`: no corruption; the target is automatically `none`.
+- `random`: random RPEX-style data corruption.
+- `adversarial`: adversarial RPEX-style data corruption.
+
+For a non-clean run, `--corruption-target` accepts `observations`, `actions`,
+`rewards`, `dynamics`, or `mixed`. Mixed corruption allocates examples across
+the four targets in that order. Ratios must be non-negative and sum to one:
 
 ```bash
-python run_experiment.py \
-  --algorithm riql_pex \
-  --env-name halfcheetah-medium-replay-v2 \
-  --corruption random \
-  --corruption-target rewards \
-  --stage online \
-  --initialize-from-checkpoint /absolute/path/to/final_manifest_<sha>.pt \
-  --seed 0
+--corruption-target mixed --mixed-ratios 0.1 0.2 0.3 0.4
 ```
 
-The final offline checkpoint is stored as
-`checkpoints/offline/final_manifest_<sha>.pt` inside the run directory. The program fails
-immediately if the checkpoint algorithm, environment, or
-observation/action dimensions do not match the current command. The state
-normalization mode, location, and scale are also restored from the checkpoint.
-New runs write the resolved configuration once, in `config.json`.
+The main severity controls are `--offline-corruption-rate` (default `0.3`),
+`--online-corruption-rate` (default `0.5`), and `--corruption-range` (default
+`1.0`).
 
-Interrupted-run continuation is different. Reissue the original semantic
-arguments and point `--resume-run` at its run directory:
+Adversarial corruption of observations, actions, or dynamics also needs the
+environment-specific EDAC attacker checkpoint. In the original three-folder
+workspace it is found automatically below
+`../RIQL-main/pretrained_model/EDAC/EDAC_baseline_seed0-<env>/2999.pt` and its
+pinned SHA256 is verified. If this repository is moved on its own, pass the
+same weights explicitly (these options are also forwarded by
+`run_all_algorithms.py`):
 
 ```bash
-python run_experiment.py \
-  --algorithm riql_naive \
+--attack-checkpoint /path/to/2999.pt \
+--attack-checkpoint-sha256 "$(shasum -a 256 /path/to/2999.pt | awk '{print $1}')"
+```
+
+Reward-only adversarial corruption does not load an attacker checkpoint.
+
+## Five-baseline research benchmark contract
+
+Experimental **CARE-O2O / ARW-O2O / RG-O2O** implementations from the supplied
+September 2026 working notes are documented in [the candidate guide](docs/cro2o-candidates.md).
+They are not added to the verified five-baseline suite. Use explicit
+`--algorithms care_o2o arw_o2o rg_o2o` with the common-budget launcher.
+
+The `research_benchmark` suite contains exactly `rpex`, `riql_naive`, `wsrl`,
+`cal_ql`, and the canonical `pessimistic_q_ensemble` name. Its source anchors
+are [RPEX/RIQL `35da71e`](https://github.com/felix-thu/RPEX/tree/35da71ee5151b6179d21b9a2b4ce1b6408aedd04),
+[WSRL `ad4dc12`](https://github.com/zhouzypaul/wsrl/tree/ad4dc1248a138bc15d6e053f2d1dba1b8cfbaca2),
+[Cal-QL `ac6eafe`](https://github.com/nakamotoo/Cal-QL/tree/ac6eafec22e8d60836573e1f488c7f626ce8a77e),
+and [Off2OnRL `6f298fa`](https://github.com/shlee94/Off2OnRL/tree/6f298fa9ef040d725067d0f2775022bd2900d635).
+These are source-aligned PyTorch/runtime ports, not claims of bitwise paper
+score reproduction. Cal-QL is a locomotion adaptation and PQE ports the public
+v0 recipe to D4RL-v2.
+
+The common interaction contract is:
+
+1. Keep the policy/expansion proposal unchanged for the method's internal Q,
+   IPW, and log-probability calculations.
+2. Require that proposal to be finite, clip a copy to the environment's action
+   bounds, and pass only that executed action to `env.step`.
+3. Copy the resulting clean transition, poison only the replay copy, and choose
+   the next real action from the environment's clean next observation.
+
+Action poisoning is label poisoning: an out-of-range replay action is retained
+for critic training and is never sent back to the simulator. Logs separately
+record proposal, executed-environment, and poisoned-replay action OOB rates.
+NaN/Inf actions fail explicitly; they are not repaired with `nan_to_num`.
+
+Offline corruption is generated in raw dataset coordinates before learner
+normalization. Online replay corruption also starts in raw transition
+coordinates, then the learner normalizer is applied exactly once. Dataset-std
+scales are frozen from the clean offline artifact (the source and actual
+population standard deviations are serialized); the retained RPEX online
+observation/dynamics rule uses its declared unit scale. Mixed corruption first
+selects a transition and then assigns exactly one field. Reward-only
+adversarial mixed runs do not instantiate EDAC.
+
+The EDAC objective transforms raw attacked states with preprocessing declared
+by the checkpoint. The supplied pinned EDAC payloads do not contain such
+metadata, so the runner uses identity preprocessing and records it as
+`checkpoint_metadata_missing_identity_unverified`; it does not substitute the
+learner normalizer. Attack version
+`corruption_v8_raw_coordinates_private_rng` retains the source Adam optimizer
+recreation, 100 offline/2 online steps, and source step sizes. The research
+adaptation uses resumable phase-private Torch RNGs and applies standard deviation
+once when mapping a dimensionless perturbation to its declared budget. The
+`official_code_reference` diagnostic retains the upstream fresh-generator and
+double-std quirks, so the research attack is not labeled exact RNG parity.
+Selected-transition rates and actual-value-change rates are both stored, and a
+zero selection rate leaves the artifact byte-for-byte unchanged. Reward
+replacement at epsilon zero remains replacement, not a clean shortcut.
+
+Reliability revision (after `15d44da`): research vector attacks use
+`phase_private_torch_v1`: offline seed = `corruption_seed`, online seed =
+`(corruption_seed + 0x4F324F) % 2**63`. Both online perturbation initialization
+and the stochastic EDAC dynamics policy use that persistent online stream.
+Offline cache hit/miss/regeneration therefore cannot change the online attack
+sequence. The RNG semantics field changes the research vector-attack cache
+key and manifest identity; old artifacts remain untouched and are not reused
+under the new key. The offline draw mapping itself is unchanged. Official-code
+diagnostic RNG quirks remain unchanged.
+
+Checkpoints record `attack_rng_schema`; online checkpoints store both private
+states. Offline checkpoints may omit them because the unused online state is
+deterministically reconstructible. Old single-stream research adversarial
+checkpoints cannot exact-resume; compatible weights can still initialize a new
+run. PQE also records `pqe_numerics_version` as
+`centered_moments_strict_priorities_v1`: centered moment variance and a positive floor
+before square root prevent cancellation/NaN gradients without detaching actors
+or changing the pre-tanh Gaussian. Invalid priorities/weights now raise rather
+than silently becoming uniform probabilities; valid floors, clipping, and the
+initial online priority formula are unchanged. MC-return `-Inf` sentinels are
+not priority errors. Old PQE checkpoints likewise support initialization, not
+exact resume across this numerical revision.
+
+Research vector-adversarial and PQE trajectories can change and must be grouped
+by their recorded revisions, not silently merged with old runs. This does not
+invalidate all historical clean/random results for other methods. No historical
+result manifests, caches, or checkpoints are migrated in place. Regression
+tests check local reproducibility and actual backward updates, not long-run
+MuJoCo benchmark scores or paper reproduction.
+
+Primary evaluation is clean deterministic deployment return for all five
+methods. RIQL uses its Gaussian mean; WSRL and Cal-QL use the tanh of their
+pre-tanh mean; PQE uses the tanh of the five-member pre-tanh mean average; RPEX
+deterministically chooses between nominal offline/online actions with its
+existing Q+IPW logits. Method-faithful RPEX epsilon switching remains an
+explicit diagnostic and is never selected as the research primary or as a
+best-of-two score. Use `--evaluation-seed-role tuning` for tuning-only runs;
+only the default `final` role is benchmark/main-table eligible.
+
+Native WSRL uses 10 critics, target subsampling of 2 with replacement,
+LayerNorm, an online-only replay after warmup, and one 1024-sample update split
+into four critic minibatches plus one full-batch actor/temperature update. PQE
+uses five independent two-hidden-layer actors and twin critics, pre-tanh moment
+matching, and balanced replay. The corrected PQE actor has member log-std bounds
+`[-20, 2]`; old three-hidden-affine PQE checkpoints are rejected and require
+retraining or an explicit converter.
+
+RPEX/RIQL source-aligned extraction is AWR in offline and online phases. The
+paper-motivated observation comparison is isolated with
+`--online-policy-extraction align_iql`; it is accepted only for online RPEX
+observation corruption, remains AWR offline, and is serialized as a distinct
+implementation variant. Explicit RIQL table, learning-rate, and UTD overrides
+are preserved. A matched clean control should pass the corrupted run's resolved
+RIQL values explicitly so the clean extension row cannot alter the match.
+
+Run the five methods for one condition with:
+
+```bash
+python run_all_algorithms.py \
   --env-name hopper-medium-replay-v2 \
   --corruption random \
-  --corruption-target rewards \
+  --corruption-target mixed \
+  --suite-profile research_benchmark \
+  --seeds 0 1 2 \
   --stage both \
-  --suite-profile common_budget_robustness \
-  --resume-run /absolute/path/to/run_dir
+  --keep-going
 ```
 
-Only an episode-boundary checkpoint with complete replay, optimizer, scheduler,
-RNG, environment, counter, and writer state is eligible. The requested
-canonical manifest must equal the original manifest; otherwise the command
-fails and instructs the user to initialize a new run instead.
+When this suite is selected and `--algorithms` is omitted, the launcher chooses
+the five baselines above. Reporting first averages the last three evaluations
+within each training seed and then reports the population mean/std across
+seeds. It does not treat evaluation episodes as training seeds or silently
+select the best member/checkpoint.
 
-Current executable equivalence coverage is RIQL-naive plus random observation
-corruption in the diagnostic smoke path only. No valid full-matrix
-save/resume-equivalence receipt exists. This section documents the mechanism;
-it does not certify a benchmark or authorize publication eligibility.
+## Run one experiment
 
-## Quick training diagnostics
-
-The lightweight runner checks finite updates, action/replay invariants, and
-basic return health:
-
-```bash
-OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 \
-python scripts/diagnose_training.py \
-  --algorithm rpex \
-  --env hopper-medium-replay-v2 \
-  --offline-steps 20 \
-  --online-steps 30 \
-  --corruption-rate 0 \
-  --quick
-```
-
-Each diagnostic run writes `diagnostics_summary.json`,
-`diagnostics_summary.csv`, and `config.json` in its run directory.
-
-### Checkpoint intervals and retention
-
-Checkpoints are separated by algorithm through the run directory and by phase
-inside each run:
-
-```text
-results/comparisons/<env>/<corruption>/<target>/<comparison_id>/runs/
-└── <algorithm>/seed_l<learner>_c<corruption>/<run_id>/
-    └── checkpoints/
-        ├── offline/
-        │   ├── step_000100000_manifest_<sha>.pt
-        │   └── final_manifest_<sha>.pt
-        └── online/
-            ├── step_000100000_manifest_<sha>.pt
-            └── final_manifest_<sha>.pt
-```
-
-The shared periodic interval defaults to `100,000`. Five periodic checkpoints
-per phase are retained by default; the manifest-tagged final checkpoint is
-always retained.
+Offline pretraining and online fine-tuning are each `500,000` steps by default.
+They are independently configurable. `--stage both` runs them sequentially in
+one process and carries the trained model directly across the boundary:
 
 ```bash
 python run_experiment.py \
@@ -504,389 +295,307 @@ python run_experiment.py \
   --env-name hopper-medium-replay-v2 \
   --corruption clean \
   --stage both \
-  --offline-checkpoint-period 200000 \
-  --online-checkpoint-period 50000 \
-  --keep-last-checkpoints 3
+  --offline-steps 500000 \
+  --online-steps 500000 \
+  --seed 42
 ```
 
-- `--checkpoint-period N`: shared offline/online interval
-- `--offline-checkpoint-period N`: override the offline interval
-- `--online-checkpoint-period N`: override the online interval
-- `--keep-last-checkpoints K`: retain the newest `K` periodic checkpoints per
-  phase
-- Interval `0`: disable periodic checkpoints for that phase
-- `--keep-last-checkpoints 0`: keep every periodic checkpoint
-
-## 5. Run all algorithms for one fixed setting
-
-Use `run_all_algorithms.py` to run all nine algorithm classes for one fixed
-environment and corruption configuration. The default stage is `both`, so each
-algorithm performs offline pretraining followed immediately by online
-fine-tuning.
+Offline pretraining only:
 
 ```bash
-python run_all_algorithms.py \
+python run_experiment.py \
+  --algorithm rpex \
   --env-name hopper-medium-replay-v2 \
+  --corruption clean \
+  --stage offline \
+  --offline-steps 500000 \
+  --seed 42
+```
+
+Random mixed corruption:
+
+```bash
+python run_experiment.py \
+  --algorithm riql_naive \
+  --env-name halfcheetah-medium-replay-v2 \
   --corruption random \
   --corruption-target mixed \
   --mixed-ratios 0.1 0.2 0.3 0.4 \
-  --seeds 0,1,2 \
+  --stage both \
   --offline-steps 500000 \
-  --online-steps 500000
+  --online-steps 500000 \
+  --seed 0
 ```
 
-Any unrecognized arguments are forwarded to every `run_experiment.py` command,
-which allows shared step, evaluation, replay, and checkpoint settings. Use
-`--dry-run` to print all generated commands without running them:
+HalfCheetah adversarial observation corruption for Cal-QL:
+
+```bash
+python run_experiment.py \
+  --algorithm cal_ql \
+  --env-name halfcheetah-medium-replay-v2 \
+  --corruption adversarial \
+  --corruption-target observations \
+  --stage both \
+  --offline-steps 500000 \
+  --online-steps 500000 \
+  --seed 0
+```
+
+The equivalent Pessimistic Q-Ensemble command is:
+
+```bash
+python run_experiment.py \
+  --algorithm pessimistic_q_ensemble \
+  --env-name halfcheetah-medium-replay-v2 \
+  --corruption adversarial \
+  --corruption-target observations \
+  --stage both \
+  --offline-steps 500000 \
+  --online-steps 500000 \
+  --seed 0
+```
+
+### Checkpoints and continuation
+
+Periodic checkpoint frequency and retention can be controlled independently by
+phase:
+
+```bash
+python run_experiment.py \
+  --algorithm rpex \
+  --env-name hopper-medium-replay-v2 \
+  --corruption clean \
+  --stage both \
+  --offline-steps 500000 \
+  --online-steps 500000 \
+  --offline-checkpoint-period 50000 \
+  --online-checkpoint-period 100000 \
+  --keep-last-checkpoints 3 \
+  --seed 42
+```
+
+Use `--checkpoint-period N` to set one interval for both phases. Its default is
+`100000`, with the newest five periodic checkpoints retained per phase. A value
+of `0` disables periodic checkpoints; phase-final checkpoints are still
+written. Runs are separated by algorithm, environment, corruption, target, and
+seed, and each run has separate `checkpoints/offline/` and
+`checkpoints/online/` directories.
+
+To start a new online-only run from an offline model checkpoint:
+
+```bash
+python run_experiment.py \
+  --algorithm rpex \
+  --env-name hopper-medium-replay-v2 \
+  --corruption clean \
+  --stage online \
+  --initialize-from-checkpoint /path/to/checkpoints/offline/final.pt \
+  --online-steps 500000 \
+  --seed 42
+```
+
+To continue an interrupted run with its optimizer, replay, RNG, and progress
+state, pass the run directory to `--resume-run` instead. Initialization and
+resume have intentionally different semantics:
+
+```bash
+python run_experiment.py \
+  --algorithm rpex \
+  --env-name hopper-medium-replay-v2 \
+  --corruption clean \
+  --stage both \
+  --resume-run /path/to/existing/run_directory
+```
+
+## Run all nine algorithms for one condition
+
+`run_all_algorithms.py` runs all nine algorithms by default, prints the elapsed
+time after every algorithm, and prints a per-algorithm and whole-suite summary
+at the end:
 
 ```bash
 python run_all_algorithms.py \
   --env-name hopper-medium-replay-v2 \
-  --corruption adversarial \
-  --corruption-target dynamics \
-  --seeds 0 \
-  --dry-run
+  --corruption clean \
+  --seeds 42 \
+  --stage both \
+  --offline-steps 500000 \
+  --online-steps 500000 \
+  --keep-going
 ```
 
-Each comparison is stored separately:
-
-```text
-results/comparisons/<env>/<corruption>/<target>/<comparison_id>/
-├── runs/
-│   └── <algorithm>/...
-├── comparison_offline_online.png
-├── comparison_offline.png
-├── comparison_online.png
-├── comparison_{offline_online,offline,online}.csv
-├── final_scores.csv
-├── per_seed_final_scores.csv
-├── paper_reproduction_summary.csv
-├── common_per_seed_final_scores.csv
-├── common_benchmark_summary.csv
-├── timing.csv
-└── manifest.json
-```
-
-- The three `comparison_*.png` files show the combined, offline-only, and
-  online-only curves. They and their matching CSV files are published only
-  after the entire controller suite completes successfully. During or after an
-  incomplete run, inspect each run's `metrics.csv` and `performance.png`
-  instead.
-- The matching CSV files contain mean/std/count at every evaluation step.
-- `final_scores.csv`: backward-compatible common last-three metric; it is not a
-  paper metric
-- `per_seed_final_scores.csv`: publication-eligible source-primary per-seed
-  outputs with each row's reproduction and condition status preserved
-- `paper_reproduction_summary.csv`: only verified rows with
-  `paper_reproduction_eligible=true`; current source-aligned ports are excluded,
-  so an empty file is an intentional fail-closed result
-- `common_per_seed_final_scores.csv` and `common_benchmark_summary.csv`: rows
-  passing the separate `common_benchmark_eligible` contract under one declared
-  cross-algorithm rule; never an official-paper score
-- `timing.csv`: start/end time and elapsed time for every algorithm/seed run
-- `manifest.json`: commands, return codes, per-algorithm timing summaries,
-  overall timing, and artifact paths
-
-After each seed run, the command prints a `RUN_FINISHED` line. After all seeds
-for one algorithm finish, it prints an `ALGORITHM_FINISHED` line containing the
-algorithm's accumulated runtime. At the end, `ALGORITHM_TIMING_SUMMARY` lists
-every completed algorithm followed by the overall start, end, and elapsed time.
-
-Use `--comparison-name NAME` to set the final directory name and `--keep-going`
-to continue with the remaining algorithms if one run fails.
-
-### Fixed 5×9 suite
-
-`run_55_experiment.py` keeps its historical filename. Its default research
-matrix is fixed to 5 algorithms × 9 conditions: four adversarial targets,
-clean, and four random-corruption targets. HalfCheetah is the default and both
-offline and online budgets default to 500,000 steps. The launcher has no
-`--corruption-suite` selector.
-
-On macOS, the Gymnasium-v4 backend is diagnostic-only, so declare that purpose
-explicitly:
+For a fixed random mixed condition:
 
 ```bash
-conda activate corruption
-python run_55_experiment.py \
-  --env-name halfcheetah-medium-replay-v2 \
-  --seeds 0 \
-  --run-purpose diagnostic \
-  --suite-profile common_budget_diagnostic \
-  --protocol local_gymnasium_v4_diagnostic \
-  --allow-diagnostic-protocol
+python run_all_algorithms.py \
+  --env-name walker2d-medium-replay-v2 \
+  --corruption random \
+  --corruption-target mixed \
+  --mixed-ratios 0.1 0.2 0.3 0.4 \
+  --seeds 0 1 2 \
+  --offline-steps 500000 \
+  --online-steps 500000 \
+  --keep-going
 ```
 
-For a research-labelled run, use the pinned Linux D4RL-v2 environment and the
-default legacy protocol. Run the readiness checker before training. It reports
-`CONFIG-READY / RUNTIME EVIDENCE PENDING` until completed Cal-QL trajectories
-and PQE member checkpoints exist. Afterward, point it at the comparison or run
-directories to validate that evidence:
+If `--algorithms` is omitted, the launcher runs all nine methods in the table
+above. Pass `--algorithms ...` only when you want a subset or a custom order.
 
-```bash
-python scripts/check_research_readiness.py \
-  --env-name halfcheetah-medium-replay-v2 \
-  --corruption-suite all \
-  --run-dir /absolute/path/to/comparison_directory
-```
+## Run an experiment matrix
 
-`stage=both` pretrains all five PQE members on the same corrupted artifact,
-writes five independent offline member checkpoints, and then starts balanced
-online fine-tuning automatically. A separate PQE pretraining command is not
-required. For an explicitly separated `stage=online` run, pass exactly five
-distinct files with `--pqe-member-checkpoints PATH0 PATH1 PATH2 PATH3 PATH4`.
-
-Use `--env-name halfcheetah-medium-replay-v2` for HalfCheetah. The local
-Gymnasium-v4 backend remains explicitly identified in every manifest and its
-scores must not be described as an official D4RL-v2 paper reproduction. Use
-`--dry-run` to inspect commands and `--keep-going` to record later failures
-instead of stopping the controller at the first one.
-
-All five algorithms are included in the same main research summary. Cal-QL's
-locomotion-adaptation metadata and PQE's v0-to-v2 port metadata remain attached
-to their rows; neither method is diverted to a separate summary.
-
-`run_55_experiment.py` always executes the nine conditions in this order: the
-four adversarial targets, clean, then the four random targets. Clean and the
-adversarial conditions are custom benchmark transfers; the existing
-adversarial fixture is optimizer-core-only and does not certify an official
-paper reproduction. Applying an RPEX corruption condition to another baseline
-is recorded as `benchmark_transfer`.
-PQE collects a full 1,000-transition block before updating: 5,000 updates for
-the first block and 1,000 for each later full block. A final partial block is
-saved but is not trained early.
-
-Before any strict run, on a supported Linux x86_64 host, execute:
-
-```bash
-python scripts/audit_reproducibility.py
-```
-
-Externally generated receipts default to the repository-private Git path
-returned by `git rev-parse --git-path robust_o2o-certificates` (normally
-`.git/robust_o2o-certificates`) so committing a receipt cannot change the commit
-it attests. `ROBUST_O2O_CERTIFICATE_DIR` may point to an external immutable
-artifact directory. The directory requires an indexed SHA-256 for each receipt;
-the validator does not mint receipts or infer a missing pass.
-
-The audit reports `RPEX/RIQL ELIGIBLE SUBSET STATUS`, `FIVE-BASELINE STATUS`,
-`RANDOM CORRUPTION STATUS`, `ADVERSARIAL CORRUPTION STATUS`, `SAVE/RESUME
-STATUS`, `STRICT ENVIRONMENT STATUS`, and `FINAL BENCHMARK STATUS` separately.
-All are currently **NOT READY** except adversarial corruption, which is
-explicitly **EXCLUDED** because the strict adversarial set is empty. RPEX/RIQL
-lack upstream-executed end-to-end learner parity, so the strict algorithm set
-is empty. The random v1 fixture has a strict-runtime mismatch; the adversarial
-v1 fixture is optimizer-core-only; full online-constructor/evaluation RNG and
-save/resume receipts are absent; and the current Mac is not the pinned Linux
-runtime. WSRL also lacks numerical and reporting parity, Cal-QL locomotion is a
-task adaptation, and PQE is a v0-to-v2 task port. The strict runner must reject before
-output creation. No final benchmark command is published until the audit can
-validate all required clean-tree, source-bound executable receipts.
-
-For a local Mac smoke/debug run only:
-
-```bash
-conda activate corruption
-python run_55_experiment.py \
-  --env-name halfcheetah-medium-replay-v2 \
-  --suite-profile common_budget_diagnostic \
-  --run-purpose diagnostic \
-  --protocol local_gymnasium_v4_diagnostic \
-  --allow-diagnostic-protocol
-```
-
-These local scores are stored and plotted as diagnostic D4RL-reference-scaled
-returns, never as benchmark D4RL normalized returns.
-
-## 6. Full environment/corruption matrix
-
-Run all algorithms under clean, random, and adversarial conditions for one
-environment, the `dynamics` target, and three seeds:
+`run_matrix.py` expands environments, corruption modes, targets, severities,
+algorithms, and seeds into individual commands. Comma-separated values are
+used for environments, corruption modes, targets, seeds, and ranges:
 
 ```bash
 python run_matrix.py \
-  --envs hopper-medium-replay-v2 \
-  --targets dynamics \
-  --seeds 0,1,2
-```
-
-For each algorithm, this runs one `clean` experiment, one `random dynamics`
-experiment, and one `adversarial dynamics` experiment.
-
-This matrix command is diagnostic. No adversarial condition has an end-to-end
-strict certificate. The v1 Hopper observation fixture is an optimizer-core
-check with a strict-runtime mismatch and cannot authorize a final or paper
-reproduction suite.
-
-Print the generated commands without starting experiments:
-
-```bash
-python run_matrix.py \
-  --envs hopper-medium-replay-v2 \
-  --targets dynamics \
-  --seeds 0,1,2 \
-  --dry-run
-```
-
-Compare all four individual corruption targets:
-
-```bash
-python run_matrix.py \
+  --algorithms \
+    rpex riql_pex riql_naive uwmsg pex cal_ql wsrl ro2o pessimistic_q_ensemble \
   --envs halfcheetah-medium-replay-v2,hopper-medium-replay-v2,walker2d-medium-replay-v2 \
-  --targets observations,actions,rewards,dynamics \
-  --seeds 0,1,2
+  --corruptions clean,random,adversarial \
+  --targets observations,actions,rewards,dynamics,mixed \
+  --corruption-ranges 1.0 \
+  --seeds 0,1,2 \
+  --stage both \
+  --mixed-ratios 0.1 0.2 0.3 0.4 \
+  --offline-steps 500000 \
+  --online-steps 500000 \
+  --keep-going
 ```
 
-Additional experiment arguments are forwarded to each run. To check the setup
-with a small experiment on a supported legacy-runtime host:
+Add `--dry-run` first to inspect the expanded commands without training.
 
-```bash
-python run_matrix.py \
-  --envs hopper-medium-replay-v2 \
-  --targets rewards \
-  --seeds 0 \
-  --offline-steps 1000 \
-  --online-steps 1000 \
-  --eval-period 500 \
-  --eval-episodes 2
-```
+## Logs, timing, tables, and plots
 
-This small configuration is intended only to verify the installation and code
-paths. Do not use it for paper-level performance comparisons.
-
-## 7. Performance logs and visualization
-
-Standalone, matrix, `run_all`, and `run_55` runs all use the same comparison
-structure:
+Standalone runs write below:
 
 ```text
-results/
-└── comparisons/<env>/<corruption>/<target>/<comparison_id>/
-    ├── comparison_offline_online.png
-    ├── comparison_offline.png
-    ├── comparison_online.png
-    └── runs/<algorithm>/seed_l<learner>_c<corruption>/<run_id>/
-        ├── config.json
-        ├── experiment_manifest.json
-        ├── result.log
-        ├── metrics.csv
-        ├── train_metrics.jsonl
-        ├── performance.png
-        ├── summary.json
-        └── checkpoints/
-            ├── offline/
-            │   └── final_manifest_<sha>.pt
-            └── online/
-                └── final_manifest_<sha>.pt
+results/comparisons/<environment>/<corruption>/<target>/<comparison-id>/
 ```
 
-- `metrics.csv`: evaluation step, raw return, D4RL normalized return, standard
-  deviation, and cumulative elapsed time
-- `train_metrics.jsonl`: losses, Q statistics, uncertainty,
-  policy-expansion selection ratio, and other training metrics
-- `performance.png`: normalized-return curve for one run
-- `summary.json`: start/end timestamps, total elapsed time, final performance,
-  and success/failure status
-- `config.json`: complete arguments, selected protocol and D4RL environment ID,
-  registered class, D4RL commit, dataset URL/path/SHA-256 when available, and
-  installed Python/NumPy/PyTorch/Gym/D4RL/mujoco-py/h5py versions
+Each completed run contains at least:
 
-Plot the mean ± standard deviation across multiple seeds and algorithms:
+- `metrics.csv`: evaluation scores used by plotting and comparison notebooks.
+- `train_metrics.jsonl`: optimizer and training metrics over time.
+- `performance.png`: the automatic single-run performance plot.
+- `config.json` and `summary.json`: resolved configuration and completion data.
+- `checkpoints/offline/` and/or `checkpoints/online/`: checkpoints for each
+  phase that the run actually executes.
+
+An all-algorithms comparison additionally writes:
+
+- `timing.csv`: start, end, elapsed time, status, and command for every
+  algorithm/seed run.
+- `final_scores.csv`: final-window performance summary.
+- `comparison_offline_online.csv` and `.png`: the continuous offline-to-online
+  curve.
+- `comparison_offline.csv` and `.png`: offline detail.
+- `comparison_online.csv` and `.png`: online detail.
+- `manifest.json`: suite configuration, artifacts, per-run timing, and total
+  timing.
+
+Console timestamps use `YYYY-MM-DD HH:MM:SS`. The all-algorithms launcher prints
+`RUN_FINISHED` for each seed, `ALGORITHM_FINISHED` after each algorithm, and a
+final `ALGORITHM_TIMING_SUMMARY`, `START_TIME`, `END_TIME`, and `ELAPSED` block.
+Standalone runs also print their start time, end time, and elapsed duration.
+
+For interactive comparison, open `comparison.ipynb`, select the
+`corruption-robust-o2o` kernel, and set the environment, corruption, and target
+in its first cell. The notebook presents the table and the combined,
+offline-only, and online-only plots.
+
+You can also regenerate a standalone aggregate plot:
 
 ```bash
 python plot_results.py \
-  --results-dir results/comparisons \
+  --results-dir results/comparisons/hopper-medium-replay-v2/clean/none/<comparison-id>/runs \
+  --env-name hopper-medium-replay-v2 \
+  --corruption clean \
+  --target none \
+  --phase offline_online \
+  --output results/hopper_clean_offline_online.png
+```
+
+## CPU Slurm jobs
+
+The batch files under `slurm/` use the same Python 3.13/Gymnasium/native-MuJoCo
+runtime. They do not install MuJoCo 2.1 or build `mujoco_py`.
+
+Submit from the repository root on a cluster whose CPU partition is named
+`cpu`:
+
+```bash
+# Create/update the shared micromamba environment, download the Hopper dataset,
+# and run the test suite.
+sbatch --wait slurm/setup_cpu.sbatch
+
+# Run a short end-to-end CPU smoke experiment.
+sbatch --wait slurm/smoke_cpu.sbatch
+
+# Start the default 500k + 500k RPEX CPU experiment.
+sbatch slurm/run_cpu.sbatch
+```
+
+Normal experiment options may follow the batch script:
+
+```bash
+sbatch --time=24:00:00 slurm/run_cpu.sbatch \
+  --algorithm uwmsg \
   --env-name hopper-medium-replay-v2 \
   --corruption random \
-  --target dynamics \
-  --phase online \
-  --output results/comparisons/hopper_random_dynamics.png
+  --corruption-target rewards \
+  --stage both \
+  --offline-steps 500000 \
+  --online-steps 500000 \
+  --seed 0
 ```
 
-A CSV summary with the same base filename is generated together with the plot.
+The defaults are stored under `~/.local/share/micromamba` and
+`~/.d4rl/datasets`. Override them with `CRO2O_MAMBA_ROOT_PREFIX`,
+`CRO2O_ENV_PREFIX`, or `CRO2O_DATASET_DIR`. Batch logs are written to
+`slurm-*.out` in the submission directory.
 
-## 8. Timing information
+## Short integration smoke
 
-The following three lines are printed at the end of every run, regardless of
-whether it succeeds or fails:
+After downloading the Hopper dataset, this command exercises dataset loading,
+offline updates, online interaction, replay updates, evaluation, logging, and
+both phase-final checkpoints without launching a full experiment:
 
-```text
-START_TIME: 2026-07-31 10:00:00
-END_TIME: 2026-07-31 20:30:00
-ELAPSED: 10:30:00 (37800.000 seconds)
+```bash
+python run_experiment.py \
+  --algorithm rpex \
+  --env-name hopper-medium-replay-v2 \
+  --corruption clean \
+  --stage both \
+  --device cpu \
+  --offline-steps 2 \
+  --online-steps 12 \
+  --initial-collection-steps 4 \
+  --warmup-steps 4 \
+  --batch-size 8 \
+  --replay-size 64 \
+  --eval-period 1000 \
+  --eval-episodes 1 \
+  --checkpoint-period 0 \
+  --train-log-period 1 \
+  --hidden-dim 32 \
+  --hidden-layers 1 \
+  --seed 0
 ```
 
-The same values are stored in `summary.json`. The `elapsed_seconds` values in
-`metrics.csv` and `train_metrics.jsonl` can be used to compare the
-performance-versus-time trade-off during training.
+Run the automated checks with:
 
-Example final output from `run_all_algorithms.py`:
-
-```text
-ALGORITHM_TIMING_SUMMARY:
-  ALGORITHM: RPEX (rpex) | runs=1/1 completed | START=2026-07-31 10:00:00 | END=2026-07-31 12:10:00 | ELAPSED=02:10:00 (7800.000 seconds)
-  ALGORITHM: RIQL+PEX (riql_pex) | runs=1/1 completed | START=2026-07-31 12:10:00 | END=2026-07-31 14:05:00 | ELAPSED=01:55:00 (6900.000 seconds)
-START_TIME: 2026-07-31 10:00:00
-END_TIME: 2026-07-31 14:05:05
-ELAPSED: 04:05:05 (14705.000 seconds)
+```bash
+python -m pytest -q
+python -m compileall -q robust_o2o *.py scripts
 ```
 
-## 9. Important points for performance and runtime comparisons
+## Research interpretation
 
-- Use `common_budget_diagnostic` when offline/online budgets must be identical.
-  `primary_research_benchmark` uses the strict registry, which currently
-  contains no eligible algorithm. RPEX/RIQL-naive are source-aligned but lack
-  end-to-end learner certificates; WSRL lacks learner/reporting parity; Cal-QL
-  locomotion is a task adaptation; and PQE is a D4RL-v2 port. The primary and
-  final launch paths therefore fail closed. Never combine their diagnostic
-  curves with future certified results.
-- `paper_reproduction` is a reserved run purpose and currently fails closed:
-  no baseline has a certified paper-specific task, seed, budget, environment,
-  learner, corruption, and reporting contract. Use `diagnostic` for exploratory
-  runs. No final contract is currently launchable.
-- On supported hardware, RO2O with `--ro2o-sample-size 20` and the 10-critic
-  UWMSG/RO2O configurations are particularly slow. Reduce the sample size or
-  critic count only during exploratory runs, and restore the original values
-  for final comparisons.
-- MPS and CPU results may not be exactly identical because of floating-point
-  implementation differences. Use the same device for all results in a
-  comparison table.
-- Never aggregate different environment protocols, implementation profiles, or
-  suite profiles. Every run has a hashed canonical manifest and manifest-tagged
-  checkpoints; plotting rejects non-seed manifest differences and duplicates.
-- A single-seed curve has no seed-uncertainty band. Episode-return dispersion is
-  not substituted for across-seed uncertainty.
-- Adversarial offline-attack generation time is included in the total `ELAPSED`
-  time. Check `offline_corruption.loaded_from_cache` in `config.json` to
-  determine whether the attack cache was used.
-- Before starting long experiments, run `scripts/smoke_rpex_d4rl_v2.py` to
-  verify Gym/mujoco_py, the complete D4RL ID, dataset, normalization, and saved
-  provenance.
-
-## 10. Implementation sources
-
-The provided and pinned upstream codebases are source references for the
-unified objectives and default values. A reference URL does not mean that the
-local learner is a thin wrapper or a numerically verified port.
-
-See `docs/reproduction_matrix.md` and
-`docs/baseline_fidelity_manifest.yaml` before interpreting any result. RPEX and
-RIQL-naive are source-aligned ports, WSRL is an unverified framework port,
-locomotion Cal-QL is a frozen source-aligned task adaptation, and Pessimistic
-Q-Ensemble ports the pinned public D4RL-v0 method to the common D4RL-v2
-benchmark. PQE uses five independent actor/twin-critic members, so its offline
-gradient compute is approximately 5× a single-agent baseline even though the
-interaction budget is shared. This benchmark is interaction-matched, not
-compute-matched.
-
-- RPEX: <https://github.com/felix-thu/RPEX>
-- Pinned D4RL environment registry, dataset conversion, and normalization:
-  <https://github.com/rail-berkeley/d4rl/tree/d842aa194b416e564e54b0730d9f934e3e32f854>
-- RIQL: provided `RIQL-main` directory
-- UWMSG: provided `UWMSG-main` directory
-- WSRL: <https://github.com/zhouzypaul/wsrl>
-- Cal-QL: <https://github.com/nakamotoo/Cal-QL>
-- RO2O: <https://github.com/BattleWen/RO2O>
-- Balanced Replay + Pessimistic Q-Ensemble:
-  <https://github.com/shlee94/Off2OnRL>
-# corruption=robust-o2o
+The modern stack makes macOS and current Linux installation practical and
+provides one consistent backend for all algorithms. It is suitable for a
+controlled comparison performed entirely with this version of the repository.
+It should not be described as a bitwise reproduction of results generated by
+the historical Gym/`mujoco_py` runtime. Record the pinned package versions,
+dataset hashes, configuration files, seeds, and commit together with reported
+results.

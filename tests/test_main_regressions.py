@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+import numpy as np
 import torch
 
 from robust_o2o.agents import build_agent
@@ -38,6 +39,37 @@ def _research_config(algorithm: str, **overrides: object) -> ExperimentConfig:
 
 
 class MainBaselineRegressionTest(unittest.TestCase):
+    def test_rpex_online_update_preserves_frozen_offline_actor(self) -> None:
+        torch.manual_seed(29)
+        config = _research_config("rpex", actor_learning_rate=3e-4)
+        agent = build_agent(
+            config,
+            state_dim=3,
+            action_dim=2,
+            max_action=1.0,
+            device=torch.device("cpu"),
+        )
+        agent.update(_batch())
+        agent.begin_online()
+        frozen_before = {
+            name: parameter.detach().clone()
+            for name, parameter in agent.offline_actor.named_parameters()
+        }
+        online_before = {
+            name: parameter.detach().clone()
+            for name, parameter in agent.actor.named_parameters()
+        }
+        metrics = agent.update(_batch())
+        for name, parameter in agent.offline_actor.named_parameters():
+            torch.testing.assert_close(parameter, frozen_before[name])
+        self.assertTrue(
+            any(
+                not torch.equal(parameter.detach(), online_before[name])
+                for name, parameter in agent.actor.named_parameters()
+            )
+        )
+        self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
+
     def test_iql_family_online_phase_uses_fresh_optimizers(self) -> None:
         for algorithm in ("rpex", "riql_naive", "riql_pex"):
             with self.subTest(algorithm=algorithm):

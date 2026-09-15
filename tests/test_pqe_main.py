@@ -10,6 +10,9 @@ import torch.nn as nn
 
 from robust_o2o.agents.pessimistic_q_ensemble import (
     PQE_CHECKPOINT_FORMAT,
+    PQE_MEMBER_LOG_STD_MAX,
+    PQE_MEMBER_LOG_STD_MIN,
+    PQETanhGaussianPolicy,
     PessimisticQEnsembleAgent,
 )
 from robust_o2o.agents.sac_family import SACEnsembleAgent
@@ -83,6 +86,32 @@ class _ConstantQ(nn.Module):
 
 
 class PessimisticQEnsembleStructureTest(unittest.TestCase):
+    def test_member_actor_matches_pinned_two_hidden_layer_architecture(self) -> None:
+        actor = PQETanhGaussianPolicy(3, 2, 8, 1.0)
+        trunk_linears = [
+            module for module in actor.trunk if isinstance(module, nn.Linear)
+        ]
+        self.assertEqual(len(trunk_linears), 2)
+        self.assertEqual(
+            len([module for module in actor.modules() if isinstance(module, nn.Linear)]),
+            4,
+        )
+        self.assertTrue(torch.equal(actor.mean.bias, torch.zeros_like(actor.mean.bias)))
+        for linear in trunk_linears:
+            bound = 1.0 / math.sqrt(linear.weight.shape[0])
+            self.assertLessEqual(float(linear.weight.detach().abs().max()), bound)
+            self.assertTrue(torch.equal(linear.bias, torch.zeros_like(linear.bias)))
+
+        with torch.no_grad():
+            for parameter in actor.parameters():
+                parameter.zero_()
+            actor.log_std.bias.copy_(torch.tensor([-100.0, 100.0]))
+        distribution = actor.distribution(torch.zeros(1, 3))
+        expected = torch.tensor(
+            [[math.exp(PQE_MEMBER_LOG_STD_MIN), math.exp(PQE_MEMBER_LOG_STD_MAX)]]
+        )
+        self.assertTrue(torch.allclose(distribution.stddev, expected))
+
     def test_five_independent_actor_and_twin_critic_members(self) -> None:
         agent = _agent()
 
@@ -253,9 +282,8 @@ class PessimisticQEnsembleReplayObjectiveTest(unittest.TestCase):
             )
 
         actor_before = [
-            parameter.detach().clone()
+            [parameter.detach().clone() for parameter in actor.parameters()]
             for actor in agent.actors
-            for parameter in actor.parameters()
         ]
         metrics = agent.update(
             rl_batch=rl_batch,
@@ -264,12 +292,17 @@ class PessimisticQEnsembleReplayObjectiveTest(unittest.TestCase):
             rl_batch_prioritized=True,
         )
         actor_after = [
-            parameter.detach()
+            [parameter.detach() for parameter in actor.parameters()]
             for actor in agent.actors
-            for parameter in actor.parameters()
         ]
 
-        self.assertTrue(any(not torch.equal(x, y) for x, y in zip(actor_before, actor_after)))
+        for member_index, (before, after) in enumerate(
+            zip(actor_before, actor_after)
+        ):
+            self.assertTrue(
+                any(not torch.equal(x, y) for x, y in zip(before, after)),
+                f"member {member_index} actor did not update",
+            )
         self.assertTrue(math.isfinite(metrics["critic_loss"]))
         self.assertTrue(math.isfinite(metrics["density_loss"]))
         self.assertEqual(metrics["cql_loss_enabled"], 0.0)

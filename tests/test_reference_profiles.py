@@ -11,7 +11,7 @@ from robust_o2o.agents.iql_family import official_epsilon_greedy_sample
 from robust_o2o.agents.calql import calql_max_target_backup
 from robust_o2o.cql import importance_sampled_cql
 from robust_o2o.config import (
-    LOCAL_PROTOCOL,
+    DEFAULT_PROTOCOL,
     ExperimentConfig,
     build_parser,
     config_from_args,
@@ -317,20 +317,13 @@ class ReferenceProfileTest(unittest.TestCase):
         for first, second in zip(agents[0].parameters(), agents[1].parameters()):
             self.assertTrue(torch.equal(first, second))
 
-    def test_local_cli_requires_explicit_acknowledgement(self):
+    def test_runtime_protocol_is_fixed_and_not_a_public_cli_option(self):
         parser = build_parser()
         args = parser.parse_args(
-            [
-                "--algorithm", "rpex",
-                "--env-name", "hopper-medium-replay-v2",
-                "--protocol", LOCAL_PROTOCOL,
-            ]
+            ["--algorithm", "rpex", "--env-name", "hopper-medium-replay-v2"]
         )
-        with self.assertRaisesRegex(ValueError, "diagnostic-only"):
-            config_from_args(args)
-        args.allow_diagnostic_protocol = True
         config = config_from_args(args)
-        self.assertEqual(config.protocol, LOCAL_PROTOCOL)
+        self.assertEqual(config.protocol, DEFAULT_PROTOCOL)
 
     def test_checkpoint_fingerprint_and_profile_mismatch_are_hard_errors(self):
         config = ExperimentConfig(
