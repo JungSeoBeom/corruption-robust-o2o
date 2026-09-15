@@ -31,12 +31,14 @@ from .environment import (
     StateNormalizer,
     EXPECTED_LOCOMOTION_DIMS,
     apply_normalizer,
+    clip_action_to_space,
     environment_metadata,
     evaluate_agent,
     expected_env_spec_id,
     load_d4rl_dataset,
     make_env,
     preserve_training_rng_state,
+    require_finite_action,
     reset_env,
     step_env,
 )
@@ -458,7 +460,7 @@ def bounded_executed_action(
     action_low: np.ndarray,
     action_high: np.ndarray,
 ) -> np.ndarray:
-    return np.clip(raw_policy_action, action_low, action_high).astype(np.float32)
+    return clip_action_to_space(raw_policy_action, action_low, action_high)
 
 
 def _replay_transition_coordinates(
@@ -478,14 +480,15 @@ def _replay_transition_coordinates(
 
 
 def _poison_replay_in_learner_coordinates(config: ExperimentConfig) -> bool:
-    """Use the normalized replay coordinates expected by pinned RPEX attacks."""
+    """Keep corruption out of learner coordinates for every current profile.
 
-    return (
-        config.implementation_profile
-        in ("official_code_reference", "research_benchmark")
-        and config.attack_timing
-        == "official_code_post_transition_replay_poisoning"
-    )
+    The frozen oracle owns any checkpoint-declared state transform.  Returning
+    true here would incorrectly substitute the learner's corrupted-data
+    normalizer for EDAC preprocessing.
+    """
+
+    del config
+    return False
 
 
 def normalizer_sha256(normalizer: StateNormalizer) -> str:
@@ -1168,13 +1171,7 @@ def _evaluate(
         )
         for mode in modes
     }
-    primary_mode = (
-        "method_faithful"
-        if config.algorithm == "rpex" and "method_faithful" in evaluations
-        else "deterministic"
-        if "deterministic" in evaluations
-        else modes[0]
-    )
+    primary_mode = "deterministic" if "deterministic" in evaluations else modes[0]
     metrics = dict(evaluations[primary_mode])
     for mode, values in evaluations.items():
         suffix = "deterministic" if mode == "deterministic" else "method_faithful"
@@ -1305,6 +1302,9 @@ def run_experiment(
         )
         corrupted_dataset, corruption_stats = corrupt_offline_dataset(
             raw_dataset, config, oracle, cache_root
+        )
+        config._corruption_scale_statistics = corruption_stats.get(
+            "corruption_scale_statistics"
         )
 
         if checkpoint_payload is not None:
@@ -1842,7 +1842,34 @@ def _run_online(
                         start_env_step - config.online_steps, 0
                     ),
                     "resume_noop_already_complete": True,
+                    "selected_transition_count": int(
+                        resume_state.get("corrupted_online", 0)
+                    ),
+                    "selected_transition_fraction": (
+                        float(
+                            resume_state.get("corrupted_online", 0)
+                            / start_env_step
+                        )
+                        if start_env_step > 0
+                        else 0.0
+                    ),
+                    "actual_changed_transition_count": int(
+                        resume_state.get("changed_online", 0)
+                    ),
+                    "actual_changed_transition_fraction": (
+                        float(
+                            resume_state.get("changed_online", 0)
+                            / start_env_step
+                        )
+                        if start_env_step > 0
+                        else 0.0
+                    ),
                     "raw_action_oob_fraction": (
+                        float(resume_state.get("raw_oob", 0) / start_env_step)
+                        if start_env_step > 0
+                        else 0.0
+                    ),
+                    "policy_proposal_action_oob_fraction": (
                         float(resume_state.get("raw_oob", 0) / start_env_step)
                         if start_env_step > 0
                         else 0.0
@@ -1852,6 +1879,36 @@ def _run_online(
                     ),
                     "executed_action_abs_max": float(
                         resume_state.get("executed_action_abs_max", 0.0)
+                    ),
+                    "executed_action_oob_fraction": (
+                        float(
+                            resume_state.get("executed_oob", 0)
+                            / start_env_step
+                        )
+                        if start_env_step > 0
+                        else 0.0
+                    ),
+                    "executed_env_action_oob_fraction": (
+                        float(
+                            resume_state.get("executed_oob", 0)
+                            / start_env_step
+                        )
+                        if start_env_step > 0
+                        else 0.0
+                    ),
+                    "poisoned_replay_action_count": int(
+                        resume_state.get("poisoned_replay_action_count", 0)
+                    ),
+                    "poisoned_replay_action_oob_count": int(
+                        resume_state.get("poisoned_replay_action_oob", 0)
+                    ),
+                    "poisoned_replay_action_oob_fraction": (
+                        float(
+                            resume_state.get("poisoned_replay_action_oob", 0)
+                            / start_env_step
+                        )
+                        if start_env_step > 0
+                        else 0.0
                     ),
                 }
             )
@@ -1953,6 +2010,7 @@ def _run_online(
     episode_steps = 0
     episode_return = 0.0
     corrupted_online = int(resume_state.get("corrupted_online", 0)) if online_resume else 0
+    changed_online = int(resume_state.get("changed_online", 0)) if online_resume else 0
     corruption_audit = OnlineCorruptionAudit(
         resume_state.get("online_corruption_audit") if online_resume else None
     )
@@ -1987,6 +2045,16 @@ def _run_online(
     raw_oob = int(resume_state.get("raw_oob", 0)) if online_resume else 0
     executed_oob = int(resume_state.get("executed_oob", 0)) if online_resume else 0
     replay_mismatch = int(resume_state.get("replay_mismatch", 0)) if online_resume else 0
+    poisoned_replay_action_count = (
+        int(resume_state.get("poisoned_replay_action_count", 0))
+        if online_resume
+        else 0
+    )
+    poisoned_replay_action_oob = (
+        int(resume_state.get("poisoned_replay_action_oob", 0))
+        if online_resume
+        else 0
+    )
     priority_metrics: Dict[str, float] = {}
     initial_online_priority = (
         agent.initial_online_priority(
@@ -2015,12 +2083,15 @@ def _run_online(
             "global_rng": capture_global_rng_state(rng, oracle),
             "environment_rng": capture_environment_rng_state(env),
             "corrupted_online": corrupted_online,
+            "changed_online": changed_online,
             "online_corruption_audit": corruption_audit.state_dict(),
             "raw_action_abs_max": raw_action_abs_max,
             "executed_action_abs_max": executed_action_abs_max,
             "raw_oob": raw_oob,
             "executed_oob": executed_oob,
             "replay_mismatch": replay_mismatch,
+            "poisoned_replay_action_count": poisoned_replay_action_count,
+            "poisoned_replay_action_oob": poisoned_replay_action_oob,
             "calql_trajectory": (
                 calql_trajectory.state_dict() if is_calql else None
             ),
@@ -2302,7 +2373,9 @@ def _run_online(
         executed_action = (
             bounded_executed_action(raw_action_np, action_low, action_high)
             if config.action_execution_profile == "clip_to_action_space"
-            else raw_action_np.copy()
+            else require_finite_action(
+                raw_action_np, label="unbounded diagnostic action"
+            ).astype(np.float32, copy=True)
         )
         raw_action_abs_max = max(raw_action_abs_max, float(np.abs(raw_action_np).max()))
         raw_oob += int(
@@ -2370,6 +2443,29 @@ def _run_online(
                 selection_already_sampled=True,
             )
         corrupted_online += int(was_corrupted)
+        comparison_state = (
+            normalizer.transform(raw_state)
+            if normalized_replay_poisoning
+            else raw_state
+        )
+        comparison_next_state = (
+            normalizer.transform(raw_next_state)
+            if normalized_replay_poisoning
+            else raw_next_state
+        )
+        actually_changed = bool(
+            not np.array_equal(stored_state, comparison_state)
+            or not np.array_equal(stored_action, executed_action)
+            or stored_reward != float(reward)
+            or not np.array_equal(stored_next_state, comparison_next_state)
+        )
+        changed_online += int(was_corrupted and actually_changed)
+        if was_corrupted and selected_target == "actions":
+            poisoned_replay_action_count += 1
+            poisoned_replay_action_oob += int(
+                np.any(stored_action < action_low)
+                or np.any(stored_action > action_high)
+            )
         if was_corrupted and selected_target is not None:
             corruption_audit.update(
                 env_step,
@@ -2508,11 +2604,22 @@ def _run_online(
                     ),
                     **wsrl_update_metrics,
                     "online_corruption_fraction": corrupted_online / env_step,
+                    "online_selected_fraction": corrupted_online / env_step,
+                    "online_actual_changed_fraction": changed_online / env_step,
                     "raw_action_abs_max": raw_action_abs_max,
                     "executed_action_abs_max": executed_action_abs_max,
                     "raw_action_oob_fraction": raw_oob / env_step,
+                    "policy_proposal_action_oob_fraction": raw_oob / env_step,
                     "executed_action_oob_fraction": executed_oob / env_step,
+                    "executed_env_action_oob_fraction": executed_oob / env_step,
                     "replay_env_action_mismatch_fraction": replay_mismatch / env_step,
+                    "poisoned_replay_action_oob_fraction": (
+                        poisoned_replay_action_oob / env_step
+                    ),
+                    "poisoned_replay_action_oob_given_action_poison_fraction": (
+                        poisoned_replay_action_oob
+                        / max(poisoned_replay_action_count, 1)
+                    ),
                     **(
                         {
                             key: float(value)
@@ -2655,6 +2762,18 @@ def _run_online(
             "episode_boundary_overshoot": max(
                 actual_online_steps - config.online_steps, 0
             ),
+            "selected_transition_count": int(corrupted_online),
+            "selected_transition_fraction": (
+                float(corrupted_online / actual_online_steps)
+                if actual_online_steps > 0
+                else 0.0
+            ),
+            "actual_changed_transition_count": int(changed_online),
+            "actual_changed_transition_fraction": (
+                float(changed_online / actual_online_steps)
+                if actual_online_steps > 0
+                else 0.0
+            ),
         }
     )
     online_corruption_metadata.update(
@@ -2679,11 +2798,38 @@ def _run_online(
                 if actual_online_steps > 0
                 else 0.0
             ),
+            "policy_proposal_action_oob_fraction": (
+                float(raw_oob / actual_online_steps)
+                if actual_online_steps > 0
+                else 0.0
+            ),
             "raw_action_abs_max": raw_action_abs_max,
             "executed_action_abs_max": executed_action_abs_max,
             "executed_action_oob_fraction": (
                 float(executed_oob / actual_online_steps)
                 if actual_online_steps > 0
+                else 0.0
+            ),
+            "executed_env_action_oob_fraction": (
+                float(executed_oob / actual_online_steps)
+                if actual_online_steps > 0
+                else 0.0
+            ),
+            "poisoned_replay_action_count": int(poisoned_replay_action_count),
+            "poisoned_replay_action_oob_count": int(
+                poisoned_replay_action_oob
+            ),
+            "poisoned_replay_action_oob_fraction": (
+                float(poisoned_replay_action_oob / actual_online_steps)
+                if actual_online_steps > 0
+                else 0.0
+            ),
+            "poisoned_replay_action_oob_given_action_poison_fraction": (
+                float(
+                    poisoned_replay_action_oob
+                    / poisoned_replay_action_count
+                )
+                if poisoned_replay_action_count > 0
                 else 0.0
             ),
         }

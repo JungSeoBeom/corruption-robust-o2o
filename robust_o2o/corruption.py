@@ -24,7 +24,7 @@ from .environment import Dataset, EXPECTED_LOCOMOTION_DIMS
 from .networks import VectorizedLinear
 
 
-ATTACK_IMPLEMENTATION_VERSION = "corruption_v7_replay_transition_poisoning"
+ATTACK_IMPLEMENTATION_VERSION = "corruption_v8_raw_coordinates_private_rng"
 ATTACK_OBJECTIVE = "minimize_edac_ensemble_mean_q"
 CORRUPTION_APPLICATION_CONTRACT = "replay_transition_poisoning"
 
@@ -123,6 +123,82 @@ def _declared_checkpoint_environment(payload: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _oracle_state_preprocessing(
+    payload: Mapping[str, Any], state_dim: int
+) -> tuple[np.ndarray, np.ndarray, bool, str]:
+    """Resolve preprocessing declared by the frozen oracle checkpoint.
+
+    Pinned public EDAC payloads contain weights and optimizer state only.  In
+    that case identity preprocessing is the only non-invented behavior, but it
+    is deliberately marked unverified in provenance.
+    """
+
+    candidates: list[tuple[str, Mapping[str, Any]]] = [("checkpoint", payload)]
+    for outer_key in ("metadata", "preprocessing", "normalization"):
+        nested = payload.get(outer_key)
+        if isinstance(nested, Mapping):
+            candidates.append((f"checkpoint.{outer_key}", nested))
+            for inner_key in ("preprocessing", "normalization"):
+                inner = nested.get(inner_key)
+                if isinstance(inner, Mapping):
+                    candidates.append(
+                        (f"checkpoint.{outer_key}.{inner_key}", inner)
+                    )
+
+    for source, candidate in candidates:
+        mean_value = candidate.get("state_mean", candidate.get("obs_mean"))
+        std_value = candidate.get("state_std", candidate.get("obs_std"))
+        if mean_value is not None or std_value is not None:
+            if mean_value is None or std_value is None:
+                raise ValueError(
+                    f"{source} must declare both state_mean and state_std"
+                )
+            mean = np.asarray(
+                mean_value.detach().cpu().numpy()
+                if isinstance(mean_value, torch.Tensor)
+                else mean_value,
+                dtype=np.float32,
+            ).reshape(-1)
+            std = np.asarray(
+                std_value.detach().cpu().numpy()
+                if isinstance(std_value, torch.Tensor)
+                else std_value,
+                dtype=np.float32,
+            ).reshape(-1)
+            if mean.shape != (state_dim,) or std.shape != (state_dim,):
+                raise ValueError(
+                    "oracle preprocessing dimension mismatch: "
+                    f"mean={mean.shape}, std={std.shape}, expected={(state_dim,)}"
+                )
+            if not np.all(np.isfinite(mean)) or not np.all(np.isfinite(std)):
+                raise ValueError("oracle preprocessing contains NaN or infinity")
+            if np.any(std <= 0.0):
+                raise ValueError("oracle state_std must be strictly positive")
+            return mean, std, True, f"{source}:state_mean_state_std"
+
+        normalize_value = candidate.get(
+            "normalize_states", candidate.get("normalize")
+        )
+        if normalize_value is False:
+            return (
+                np.zeros(state_dim, dtype=np.float32),
+                np.ones(state_dim, dtype=np.float32),
+                True,
+                f"{source}:normalize_states_false",
+            )
+        if normalize_value is True:
+            raise ValueError(
+                f"{source} declares state normalization but provides no statistics"
+            )
+
+    return (
+        np.zeros(state_dim, dtype=np.float32),
+        np.ones(state_dim, dtype=np.float32),
+        False,
+        "checkpoint_metadata_missing_identity_unverified",
+    )
+
+
 class EDACActor(nn.Module):
     """Architecture-compatible loader for the supplied RPEX/RIQL attack oracle."""
 
@@ -140,14 +216,29 @@ class EDACActor(nn.Module):
         self.log_sigma = nn.Linear(256, action_dim)
         self.max_action = max_action
 
-    def forward(self, states: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+    def forward(
+        self,
+        states: torch.Tensor,
+        deterministic: bool = True,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
         hidden = self.trunk(states)
         mean = self.mu(hidden)
         if deterministic:
             raw = mean
         else:
             std = self.log_sigma(hidden).clamp(-5, 2).exp()
-            raw = Normal(mean, std).rsample()
+            if generator is None:
+                raw = Normal(mean, std).rsample()
+            else:
+                noise = torch.randn(
+                    mean.shape,
+                    generator=generator,
+                    dtype=mean.dtype,
+                    device="cpu",
+                ).to(mean.device)
+                raw = mean + std * noise
         return torch.tanh(raw) * self.max_action
 
 
@@ -184,6 +275,7 @@ class AttackOracle:
         *,
         record_trace: bool = False,
         env_name: str | None = None,
+        benchmark_profile: str = "official_code_reference",
     ):
         if not checkpoint.exists():
             raise FileNotFoundError(f"Adversarial attack checkpoint not found: {checkpoint}")
@@ -201,6 +293,10 @@ class AttackOracle:
                     f"actual={(state_dim, action_dim)}"
                 )
         self.implementation_profile = implementation_profile
+        self.benchmark_profile = benchmark_profile
+        self.preserve_upstream_attack_quirks = (
+            benchmark_profile == "official_code_reference"
+        )
         self.record_trace = record_trace
         self.attack_traces: list[Dict[str, Any]] = []
         # Pinned RPEX creates torch.Generator() without a device argument.  It
@@ -211,6 +307,23 @@ class AttackOracle:
         self.actor = EDACActor(state_dim, action_dim, max_action).to(device).eval()
         self.critic = EDACCritic(state_dim, action_dim).to(device).eval()
         state = _load_checkpoint_payload(self.checkpoint, device)
+        (
+            state_mean,
+            state_std,
+            self.preprocessing_verified,
+            self.preprocessing_source,
+        ) = _oracle_state_preprocessing(state, state_dim)
+        self.state_mean = torch.as_tensor(
+            state_mean, dtype=torch.float32, device=device
+        )
+        self.state_std = torch.as_tensor(
+            state_std, dtype=torch.float32, device=device
+        )
+        preprocessing_digest = hashlib.sha256()
+        preprocessing_digest.update(np.ascontiguousarray(state_mean).tobytes())
+        preprocessing_digest.update(np.ascontiguousarray(state_std).tobytes())
+        preprocessing_digest.update(self.preprocessing_source.encode("utf-8"))
+        self.preprocessing_sha256 = preprocessing_digest.hexdigest()
         actor_state, critic_state = _validate_checkpoint_architecture(
             state, state_dim, action_dim
         )
@@ -243,6 +356,11 @@ class AttackOracle:
         for parameter in self.critic.parameters():
             parameter.requires_grad_(False)
 
+    def transform_states(self, states: torch.Tensor) -> torch.Tensor:
+        """Transform raw benchmark states into the frozen oracle coordinates."""
+
+        return (states - self.state_mean) / self.state_std
+
     def attack(
         self,
         original: np.ndarray,
@@ -268,18 +386,24 @@ class AttackOracle:
                     "trajectory recording is unsupported for the stochastic "
                     "online dynamics objective"
                 )
-            # Offline Attack.sample_para uses one persistent seeded CPU stream;
-            # online adversarial_attack creates a fresh, unseeded CPU generator
-            # on every call. Preserve that public-code quirk verbatim.
-            generator = torch.Generator() if online else self.generator
+            # Exact-source diagnostics retain the upstream fresh online stream;
+            # research artifacts use one persistent private stream so repeated
+            # transitions are reproducible and resumable.
+            generator = (
+                torch.Generator()
+                if online and self.preserve_upstream_attack_quirks
+                else self.generator
+            )
             random_values = torch.rand(
                 original_tensor.shape,
                 generator=generator,
                 dtype=torch.float32,
             ).to(self.device)
-            # Upstream includes std here and multiplies by std again while
-            # constructing the attacked input (and once more on return).
-            para = 2.0 * scale * std_tensor * (random_values - 0.5)
+            para = 2.0 * scale * (random_values - 0.5)
+            if self.preserve_upstream_attack_quirks:
+                # Exact-source diagnostic only: upstream multiplies by std in
+                # both the sampled parameter and the effective perturbation.
+                para = para * std_tensor
             initial_para = para.detach().cpu().numpy().astype(np.float32)
             first_post_objective: float | None = None
             last_post_objective: float | None = None
@@ -287,14 +411,26 @@ class AttackOracle:
             def objective(current_para: torch.Tensor) -> torch.Tensor:
                 attacked = original_tensor + current_para * std_tensor
                 if target == "observations":
-                    return self.critic(attacked, actions_tensor).mean()
+                    return self.critic(
+                        self.transform_states(attacked), actions_tensor
+                    ).mean()
                 if target == "actions":
-                    return self.critic(observations_tensor, attacked).mean()
+                    return self.critic(
+                        self.transform_states(observations_tensor), attacked
+                    ).mean()
                 if target == "dynamics":
                     attacked_actions = self.actor(
-                        attacked, deterministic=not online
+                        self.transform_states(attacked),
+                        deterministic=not online,
+                        generator=(
+                            self.generator
+                            if online and not self.preserve_upstream_attack_quirks
+                            else None
+                        ),
                     )
-                    return self.critic(attacked, attacked_actions).mean()
+                    return self.critic(
+                        self.transform_states(attacked), attacked_actions
+                    ).mean()
                 raise ValueError(f"Gradient attack is unsupported for {target}")
 
             for _ in range(steps):
@@ -346,12 +482,17 @@ class AttackOracle:
             noise.requires_grad_(True)
             attacked = original_tensor + noise
             if target == "observations":
-                loss = self.critic(attacked, actions_tensor).mean()
+                loss = self.critic(
+                    self.transform_states(attacked), actions_tensor
+                ).mean()
             elif target == "actions":
-                loss = self.critic(observations_tensor, attacked).mean()
+                loss = self.critic(
+                    self.transform_states(observations_tensor), attacked
+                ).mean()
             elif target == "dynamics":
-                attacked_actions = self.actor(attacked, deterministic=True)
-                loss = self.critic(attacked, attacked_actions).mean()
+                transformed = self.transform_states(attacked)
+                attacked_actions = self.actor(transformed, deterministic=True)
+                loss = self.critic(transformed, attacked_actions).mean()
             else:
                 raise ValueError(f"Gradient attack is unsupported for {target}")
             gradient = torch.autograd.grad(loss, noise)[0]
@@ -446,6 +587,7 @@ def make_attack_oracle(
         config.corruption_seed,
         config.adversarial_attack_profile,
         env_name=config.env_name,
+        benchmark_profile=config.implementation_profile,
     )
 
 
@@ -466,6 +608,22 @@ def dataset_fingerprint(dataset: Dataset) -> str:
         digest.update(str(array.shape).encode("ascii"))
         digest.update(memoryview(array).cast("B"))
     return digest.hexdigest()
+
+
+def corruption_scale_statistics(dataset: Dataset) -> Dict[str, Any]:
+    """Serialize the fixed clean-artifact scales used by every learner."""
+
+    return {
+        "source": "clean_offline_dataset_before_corruption_or_normalization",
+        "estimator": "numpy_population_std_ddof_0",
+        "observations_std": dataset["observations"].std(axis=0).astype(
+            np.float32
+        ).tolist(),
+        "actions_std": dataset["actions"].std(axis=0).astype(np.float32).tolist(),
+        "next_observations_std": dataset["next_observations"].std(axis=0).astype(
+            np.float32
+        ).tolist(),
+    }
 
 
 def make_numpy_corruption_rng(
@@ -538,7 +696,7 @@ def corruption_cache_fingerprint(
     # normalization, online settings, budgets, and Cal-QL return bookkeeping do
     # not affect those values and would incorrectly create per-baseline copies.
     metadata = {
-        "artifact_schema": "offline_corruption_artifact_v4",
+        "artifact_schema": "offline_corruption_artifact_v5",
         "environment": config.env_name,
         "dataset_fingerprint": dataset_hash,
         "attack_checkpoint_fingerprint": checkpoint_hash,
@@ -552,6 +710,7 @@ def corruption_cache_fingerprint(
         "mixed_ratios": list(config.mixed_ratios),
         "attack_implementation_version": ATTACK_IMPLEMENTATION_VERSION,
         "corruption_application_contract": CORRUPTION_APPLICATION_CONTRACT,
+        "corruption_scale_statistics": corruption_scale_statistics(dataset),
         "source_commit": "35da71ee5151b6179d21b9a2b4ce1b6408aedd04",
     }
     if config.corruption == "random":
@@ -588,6 +747,29 @@ def corruption_cache_fingerprint(
                 ),
                 "strict_checkpoint_load_verified": bool(
                     getattr(oracle, "strict_checkpoint_load_verified", False)
+                ),
+                "oracle_preprocessing_verified": bool(
+                    getattr(oracle, "preprocessing_verified", False)
+                ),
+                "oracle_preprocessing_source": getattr(
+                    oracle, "preprocessing_source", "none_reward_rule"
+                ),
+                "oracle_preprocessing_sha256": getattr(
+                    oracle, "preprocessing_sha256", "none_reward_rule"
+                ),
+                "attack_rng_semantics": (
+                    "upstream_fresh_online_generator_quirk"
+                    if bool(
+                        getattr(oracle, "preserve_upstream_attack_quirks", False)
+                    )
+                    else "persistent_private_torch_generator"
+                ),
+                "attack_initialization_semantics": (
+                    "upstream_double_std_quirk"
+                    if bool(
+                        getattr(oracle, "preserve_upstream_attack_quirks", False)
+                    )
+                    else "dimensionless_uniform_then_single_std_scale"
                 ),
             }
         )
@@ -770,6 +952,9 @@ class OnlineCorruptionAudit:
             "environment_interaction_corrupted": False,
             "evaluation_corruption": "clean",
             "online_corruption_scale_profile": config.online_corruption_scale_profile,
+            "corruption_scale_statistics": getattr(
+                config, "_corruption_scale_statistics", None
+            ),
             **reward_corruption_metadata(config, "online"),
         }
 
@@ -779,11 +964,14 @@ def _corruption_stats(
     target_indices: Dict[str, np.ndarray],
     config: ExperimentConfig,
     loaded_from_cache: bool,
+    clean_dataset: Optional[Dataset] = None,
+    corrupted_dataset: Optional[Dataset] = None,
 ) -> Dict[str, Any]:
     total = sum(len(indices) for indices in target_indices.values())
     stats = {
         "corrupted_count": int(total),
         "selected_transition_count": int(total),
+        "selected_transition_fraction": float(total / dataset_size),
         "corrupted_fraction": float(total / dataset_size),
         "loaded_from_cache": float(loaded_from_cache),
         "attack_semantics": config.random_attack_semantics,
@@ -807,12 +995,42 @@ def _corruption_stats(
         stats[f"{target}_selected_indices_sha256"] = hashlib.sha256(
             indices_array.tobytes()
         ).hexdigest()
+        if clean_dataset is not None and corrupted_dataset is not None:
+            key = _target_dataset_key(target)
+            clean_values = np.ascontiguousarray(clean_dataset[key][indices_array])
+            corrupted_values = np.ascontiguousarray(
+                corrupted_dataset[key][indices_array]
+            )
+            if len(indices_array):
+                clean_bytes = clean_values.view(np.uint8).reshape(
+                    len(indices_array), -1
+                )
+                corrupted_bytes = corrupted_values.view(np.uint8).reshape(
+                    len(indices_array), -1
+                )
+                changed = np.any(clean_bytes != corrupted_bytes, axis=1)
+                changed_count = int(changed.sum())
+            else:
+                changed_count = 0
+            stats[f"{target}_actual_changed_count"] = changed_count
+            stats[f"{target}_actual_changed_fraction"] = float(
+                changed_count / dataset_size
+            )
     combined = np.concatenate(
         [np.asarray(value, dtype=np.int64) for value in target_indices.values()]
     ) if target_indices else np.empty(0, dtype=np.int64)
     stats["selected_transition_indices_sha256"] = hashlib.sha256(
         np.sort(combined).tobytes()
     ).hexdigest()
+    if clean_dataset is not None and corrupted_dataset is not None:
+        actual_changed_count = sum(
+            int(stats[f"{target}_actual_changed_count"])
+            for target in INDIVIDUAL_CORRUPTION_TARGETS
+        )
+        stats["actual_changed_transition_count"] = actual_changed_count
+        stats["actual_changed_transition_fraction"] = float(
+            actual_changed_count / dataset_size
+        )
     return stats
 
 
@@ -900,6 +1118,10 @@ def _apply_mc_return_semantics(
     target_indices: Dict[str, np.ndarray],
     config: ExperimentConfig,
 ) -> None:
+    if not any(len(indices) for indices in target_indices.values()):
+        # A zero-rate artifact is a byte-for-byte copy of the clean dataset;
+        # derived labels/returns must not create a hidden difference.
+        return
     if "mc_returns" not in result:
         # Generic corruption callers that are not Cal-QL datasets do not need
         # trajectory returns. Real D4RL loads always include this metadata.
@@ -1001,7 +1223,12 @@ def _load_cached_corruption(
                 target_indices[target] = indices
     _apply_mc_return_semantics(dataset, result, target_indices, config)
     stats = _corruption_stats(
-        len(dataset["rewards"]), target_indices, config, loaded_from_cache=True
+        len(dataset["rewards"]),
+        target_indices,
+        config,
+        loaded_from_cache=True,
+        clean_dataset=dataset,
+        corrupted_dataset=result,
     )
     stats.update(
         cache_hit=True,
@@ -1142,6 +1369,9 @@ def corrupt_offline_dataset(
         return result, {
             "corrupted_count": 0,
             "selected_transition_count": 0,
+            "selected_transition_fraction": 0.0,
+            "actual_changed_transition_count": 0,
+            "actual_changed_transition_fraction": 0.0,
             "corrupted_fraction": 0.0,
             "loaded_from_cache": 0.0,
             "cache_hit": False,
@@ -1153,6 +1383,7 @@ def corrupt_offline_dataset(
             "corruption_rate": config.offline_corruption_rate,
             "corruption_range": config.corruption_range,
             "online_corruption_scale_profile": config.online_corruption_scale_profile,
+            "corruption_scale_statistics": corruption_scale_statistics(dataset),
             **reward_corruption_metadata(config, "offline"),
             "selected_transition_indices_sha256": hashlib.sha256(b"").hexdigest(),
             "corruption_value_sha256": hashlib.sha256(b"").hexdigest(),
@@ -1206,7 +1437,7 @@ def _generate_and_cache_corruption(
         target_indices = {config.corruption_target: indices}
 
     cache_payload = {
-        "format_version": np.asarray(4, dtype=np.int64),
+        "format_version": np.asarray(5, dtype=np.int64),
         "cache_key": np.asarray(cache_key, dtype=np.str_),
         "metadata_json": np.asarray(
             json.dumps(cache_metadata, sort_keys=True, separators=(",", ":")),
@@ -1227,7 +1458,12 @@ def _generate_and_cache_corruption(
 
     _atomic_write_cache(cache_file, cache_payload)
     stats = _corruption_stats(
-        len(dataset["rewards"]), target_indices, config, loaded_from_cache=False
+        len(dataset["rewards"]),
+        target_indices,
+        config,
+        loaded_from_cache=False,
+        clean_dataset=dataset,
+        corrupted_dataset=result,
     )
     stats.update(
         cache_hit=False,
@@ -1449,10 +1685,12 @@ def corrupt_pre_action_value(
         with torch.no_grad():
             action = (
                 oracle.actor(
-                    torch.as_tensor(
-                        raw_state[None, :],
-                        dtype=torch.float32,
-                        device=oracle.device,
+                    oracle.transform_states(
+                        torch.as_tensor(
+                            raw_state[None, :],
+                            dtype=torch.float32,
+                            device=oracle.device,
+                        )
                     ),
                     deterministic=True,
                 )[0]

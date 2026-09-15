@@ -98,6 +98,16 @@ class TrainingInvariantTest(unittest.TestCase):
         low = np.array([-1.0, -2.0], dtype=np.float32)
         high = np.array([1.0, 0.5], dtype=np.float32)
         executed = bounded_executed_action(raw, low, high)
+        with self.assertRaisesRegex(FloatingPointError, "NaN or infinity"):
+            bounded_executed_action(
+                np.asarray([np.nan, 0.0], dtype=np.float32), low, high
+            )
+        with self.assertRaisesRegex(FloatingPointError, "NaN or infinity"):
+            bounded_executed_action(
+                raw,
+                np.asarray([-np.inf, -2.0], dtype=np.float32),
+                high,
+            )
         config = ExperimentConfig("rpex", "hopper-medium-replay-v2")
         _, stored_action, _, _, was_corrupted = corrupt_online_transition(
             np.zeros(3, dtype=np.float32),

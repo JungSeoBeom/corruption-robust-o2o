@@ -26,7 +26,7 @@ from torch.distributions import Normal
 from ..cql import importance_sampled_cql
 from ..config import ExperimentConfig
 from ..dataset import assert_no_corruption_labels
-from ..networks import QNetwork, TanhGaussianPolicy, mlp
+from ..networks import QNetwork, mlp
 from ..replay import TensorBatch
 from .base import BaseAgent, gradient_norm, soft_update
 
@@ -35,7 +35,9 @@ PQE_ENSEMBLE_SIZE = 5
 PQE_MEMBER_SEED_STRIDE = 4
 PQE_MOMENT_LOG_STD_MIN = -20.0
 PQE_MOMENT_LOG_STD_MAX = 2.0
-PQE_CHECKPOINT_FORMAT = "pqe_independent_member_v1"
+PQE_MEMBER_LOG_STD_MIN = -20.0
+PQE_MEMBER_LOG_STD_MAX = 2.0
+PQE_CHECKPOINT_FORMAT = "pqe_independent_member_v2_two_hidden_actor"
 
 
 def _config_value(config: Any, names: Sequence[str], default: Any) -> Any:
@@ -124,6 +126,88 @@ class NonnegativeDensityRatioNetwork(nn.Module):
         return F.relu(self.net(inputs).squeeze(-1))
 
 
+class PQETanhGaussianPolicy(nn.Module):
+    """Exact two-hidden-layer policy used by the pinned Off2OnRL members."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        max_action: float,
+    ) -> None:
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Linear(hidden_dim, action_dim)
+        self.action_dim = int(action_dim)
+        self.max_action = float(max_action)
+        self.register_buffer(
+            "action_scale", torch.full((action_dim,), self.max_action)
+        )
+        self.register_buffer("action_bias", torch.zeros(action_dim))
+
+        # rlkit.torch.pytorch_util.fanin_init at the pinned commit uses the
+        # first weight dimension (the Linear output width) for this bound.
+        for module in self.trunk:
+            if isinstance(module, nn.Linear):
+                bound = 1.0 / math.sqrt(module.weight.shape[0])
+                nn.init.uniform_(module.weight, -bound, bound)
+                nn.init.zeros_(module.bias)
+        nn.init.uniform_(self.mean.weight, -1e-3, 1e-3)
+        nn.init.zeros_(self.mean.bias)
+        nn.init.uniform_(self.log_std.weight, -1e-3, 1e-3)
+        nn.init.uniform_(self.log_std.bias, -1e-3, 1e-3)
+
+    def distribution(self, states: torch.Tensor) -> Normal:
+        hidden = self.trunk(states)
+        mean = self.mean(hidden)
+        log_std = self.log_std(hidden).clamp(
+            PQE_MEMBER_LOG_STD_MIN, PQE_MEMBER_LOG_STD_MAX
+        )
+        return Normal(mean, log_std.exp())
+
+    def forward(
+        self,
+        states: torch.Tensor,
+        deterministic: bool = False,
+        need_log_prob: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        distribution = self.distribution(states)
+        raw_action = distribution.mean if deterministic else distribution.rsample()
+        normalized_action = torch.tanh(raw_action)
+        action = self.action_bias + self.action_scale * normalized_action
+        log_prob = None
+        if need_log_prob:
+            log_prob = distribution.log_prob(raw_action).sum(dim=-1)
+            jacobian = self.action_scale * (1.0 - normalized_action.square())
+            log_prob = log_prob - torch.log(jacobian + 1e-6).sum(dim=-1)
+        return action, log_prob, distribution.mean, distribution.stddev
+
+    def log_prob(
+        self, states: torch.Tensor, actions: torch.Tensor
+    ) -> torch.Tensor:
+        normalized = ((actions - self.action_bias) / self.action_scale).clamp(
+            -0.999999, 0.999999
+        )
+        raw_action = torch.atanh(normalized)
+        distribution = self.distribution(states)
+        log_prob = distribution.log_prob(raw_action).sum(dim=-1)
+        jacobian = self.action_scale * (1.0 - normalized.square())
+        return log_prob - torch.log(jacobian + 1e-6).sum(dim=-1)
+
+    @torch.no_grad()
+    def act(
+        self, states: torch.Tensor, deterministic: bool = False
+    ) -> torch.Tensor:
+        return self(states, deterministic=deterministic)[0]
+
+
 class PessimisticQEnsembleAgent(BaseAgent):
     """Five independent CQL members followed by Off2OnRL online SAC.
 
@@ -186,7 +270,7 @@ class PessimisticQEnsembleAgent(BaseAgent):
             self.base_seed + PQE_MEMBER_SEED_STRIDE * index
             for index in range(self.ensemble_size)
         )
-        actors: list[TanhGaussianPolicy] = []
+        actors: list[PQETanhGaussianPolicy] = []
         q1_members: list[QNetwork] = []
         q2_members: list[QNetwork] = []
         target_q1_members: list[QNetwork] = []
@@ -196,11 +280,10 @@ class PessimisticQEnsembleAgent(BaseAgent):
             # module once.  This avoids perturbing the benchmark learner RNG.
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(member_seed)
-                actor = TanhGaussianPolicy(
+                actor = PQETanhGaussianPolicy(
                     state_dim,
                     action_dim,
                     self.hidden_dim,
-                    self.hidden_layers,
                     max_action,
                 )
                 q1 = QNetwork(
@@ -1140,7 +1223,7 @@ class PessimisticQEnsembleAgent(BaseAgent):
     def checkpoint_state(self) -> Dict[str, Any]:
         state = super().checkpoint_state()
         state["pqe"] = {
-            "format": "pqe_independent_ensemble_v1",
+            "format": "pqe_independent_ensemble_v2_two_hidden_actor",
             "ensemble_size": self.ensemble_size,
             "base_seed": self.base_seed,
             "member_seeds": self.member_seeds,
@@ -1158,8 +1241,11 @@ class PessimisticQEnsembleAgent(BaseAgent):
         metadata = state.get("pqe")
         if not isinstance(metadata, Mapping):
             raise ValueError("checkpoint is missing PQE ensemble metadata")
-        if metadata.get("format") != "pqe_independent_ensemble_v1":
-            raise ValueError("unsupported PQE ensemble checkpoint format")
+        if metadata.get("format") != "pqe_independent_ensemble_v2_two_hidden_actor":
+            raise ValueError(
+                "unsupported PQE ensemble checkpoint format; legacy three-hidden-"
+                "affine actor checkpoints must be retrained or explicitly converted"
+            )
         if int(metadata.get("ensemble_size", -1)) != self.ensemble_size:
             raise ValueError("PQE checkpoint ensemble size mismatch")
         if tuple(metadata.get("member_seeds", ())) != self.member_seeds:
@@ -1238,6 +1324,12 @@ class PessimisticQEnsembleAgent(BaseAgent):
             "total_offline_gradient_updates": self.total_offline_gradient_updates,
             "offline_compute_multiplier": self.ensemble_size,
             "evaluation_policy": "tanh_of_moment_matched_pre_tanh_mean",
+            "member_checkpoint_format": PQE_CHECKPOINT_FORMAT,
+            "member_actor_hidden_affine_layers": 2,
+            "member_actor_log_std_bounds": [
+                PQE_MEMBER_LOG_STD_MIN,
+                PQE_MEMBER_LOG_STD_MAX,
+            ],
             "actor_independence": True,
             "critic_independence": True,
             "shared_actor": False,

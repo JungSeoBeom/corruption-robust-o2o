@@ -44,6 +44,19 @@ def _small_corruption_dataset():
     }
 
 
+def _tiny_batch(size: int = 8):
+    generator = torch.Generator().manual_seed(123)
+    return {
+        "observations": torch.randn(size, 3, generator=generator),
+        "actions": torch.empty(size, 2).uniform_(
+            -0.8, 0.8, generator=generator
+        ),
+        "rewards": torch.randn(size, generator=generator),
+        "next_observations": torch.randn(size, 3, generator=generator),
+        "terminals": torch.zeros(size),
+    }
+
+
 def _concurrent_cache_worker(cache_root: str, result_queue) -> None:
     config = ExperimentConfig(
         "riql_naive",
@@ -76,6 +89,142 @@ def _assert_nested_equal(test: unittest.TestCase, first, second) -> None:
 
 
 class FidelityProfileTest(unittest.TestCase):
+    def test_research_primary_evaluation_and_execution_are_uniform(self):
+        for algorithm in (
+            "rpex",
+            "riql_naive",
+            "wsrl",
+            "cal_ql",
+            "pessimistic_q_ensemble",
+        ):
+            with self.subTest(algorithm=algorithm):
+                config = ExperimentConfig(
+                    algorithm,
+                    "hopper-medium-replay-v2",
+                    suite_profile="research_benchmark",
+                    run_purpose="research_benchmark",
+                )
+                self.assertEqual(config.evaluation_mode, "deterministic")
+                self.assertEqual(config.evaluation_policy_profile, "deterministic")
+                self.assertEqual(
+                    config.action_execution_profile, "clip_to_action_space"
+                )
+        tuning = ExperimentConfig(
+            "wsrl",
+            "hopper-medium-replay-v2",
+            suite_profile="research_benchmark",
+            evaluation_seed_role="tuning",
+        ).to_dict()
+        self.assertFalse(tuning["benchmark_eligible"])
+        self.assertFalse(tuning["main_table_eligible"])
+        self.assertFalse(build_experiment_manifest(tuning)["benchmark_eligible"])
+
+    def test_riql_explicit_overrides_and_online_align_variant_are_preserved(self):
+        config = ExperimentConfig(
+            "rpex",
+            "hopper-medium-replay-v2",
+            corruption="random",
+            corruption_target="observations",
+            suite_profile="research_benchmark",
+            run_purpose="research_benchmark",
+            updates_per_step=7,
+            actor_learning_rate=8e-4,
+            critic_learning_rate=9e-4,
+            riql_sigma=0.77,
+            riql_quantile=0.33,
+            num_critics=7,
+            inv_temperature=4.5,
+            kappa=0.22,
+            online_policy_extraction="align_iql",
+        )
+        self.assertEqual(config.updates_per_step, 7)
+        self.assertEqual(config.actor_learning_rate, 8e-4)
+        self.assertEqual(config.critic_learning_rate, 9e-4)
+        self.assertEqual(config.riql_sigma, 0.77)
+        self.assertEqual(config.riql_quantile, 0.33)
+        self.assertEqual(config.num_critics, 7)
+        self.assertEqual(config.inv_temperature, 4.5)
+        self.assertEqual(config.kappa, 0.22)
+        self.assertEqual(config.policy_extraction, "awr")
+        self.assertEqual(config.online_policy_extraction, "align_iql")
+        self.assertIn("online_align_iql", config.implementation_variant)
+        with self.assertRaisesRegex(ValueError, "only as an explicit online RPEX"):
+            ExperimentConfig(
+                "riql_naive",
+                "hopper-medium-replay-v2",
+                corruption="random",
+                corruption_target="observations",
+                online_policy_extraction="align_iql",
+            )
+
+        tiny = ExperimentConfig(
+            "rpex",
+            "hopper-medium-replay-v2",
+            corruption="random",
+            corruption_target="observations",
+            hidden_dim=8,
+            hidden_layers=1,
+            num_critics=3,
+            online_policy_extraction="align_iql",
+        )
+        agent = build_agent(tiny, 3, 2, 1.0, torch.device("cpu"))
+        offline_metrics = agent.update(_tiny_batch())
+        self.assertEqual(offline_metrics["online_align_iql_active"], 0.0)
+        agent.begin_online()
+        online_metrics = agent.update(_tiny_batch())
+        self.assertEqual(online_metrics["online_align_iql_active"], 1.0)
+
+    def test_matched_clean_control_preserves_explicit_corrupted_row(self):
+        corrupted = ExperimentConfig(
+            "rpex",
+            "hopper-medium-replay-v2",
+            corruption="random",
+            corruption_target="observations",
+            suite_profile="research_benchmark",
+            run_purpose="research_benchmark",
+        )
+        clean = ExperimentConfig(
+            "rpex",
+            "hopper-medium-replay-v2",
+            corruption="clean",
+            suite_profile="research_benchmark",
+            run_purpose="research_benchmark",
+            riql_sigma=corrupted.riql_sigma,
+            riql_quantile=corrupted.riql_quantile,
+            num_critics=corrupted.num_critics,
+            inv_temperature=corrupted.inv_temperature,
+            kappa=corrupted.kappa,
+            updates_per_step=corrupted.updates_per_step,
+            actor_learning_rate=corrupted.actor_learning_rate,
+            critic_learning_rate=corrupted.critic_learning_rate,
+            online_policy_extraction=corrupted.online_policy_extraction,
+        )
+        for name in (
+            "riql_sigma",
+            "riql_quantile",
+            "num_critics",
+            "inv_temperature",
+            "kappa",
+            "updates_per_step",
+            "actor_learning_rate",
+            "critic_learning_rate",
+            "policy_extraction",
+            "online_policy_extraction",
+        ):
+            self.assertEqual(getattr(clean, name), getattr(corrupted, name), name)
+
+    def test_reward_only_adversarial_mixed_needs_no_oracle_checkpoint(self):
+        config = ExperimentConfig(
+            "wsrl",
+            "hopper-medium-v2",
+            corruption="adversarial",
+            corruption_target="mixed",
+            mixed_ratios=(0.0, 0.0, 1.0, 0.0),
+            suite_profile="research_benchmark",
+            run_purpose="research_benchmark",
+        )
+        self.assertIsNone(config.to_dict()["attack_checkpoint_source"])
+
     def test_research_suite_includes_explicit_calql_and_pqe_ports(self):
         for algorithm, implementation_type in (
             ("cal_ql", "source_aligned_locomotion_adaptation"),
@@ -847,6 +996,7 @@ class FidelityProfileTest(unittest.TestCase):
             ("replay_size", 123),
             ("max_grad_norm", 9.0),
             ("policy_extraction", "align_iql"),
+            ("online_policy_extraction", "align_iql"),
         ):
             changed = json.loads(json.dumps(first))
             changed["resolved_hyperparameters"][key] = value

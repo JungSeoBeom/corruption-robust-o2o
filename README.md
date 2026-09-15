@@ -38,7 +38,7 @@ method-specific online behavior.
 Run the following commands from this repository directory:
 
 ```bash
-cd /Users/seobeom/programming/project/corruption_robust_o2o
+cd /path/to/corruption_robust_o2o
 conda env create -f environment.yml
 conda activate corruption-robust-o2o
 python -m pip check
@@ -148,6 +148,100 @@ same weights explicitly (these options are also forwarded by
 ```
 
 Reward-only adversarial corruption does not load an attacker checkpoint.
+
+## Five-baseline research benchmark contract
+
+The `research_benchmark` suite contains exactly `rpex`, `riql_naive`, `wsrl`,
+`cal_ql`, and the canonical `pessimistic_q_ensemble` name. Its source anchors
+are [RPEX/RIQL `35da71e`](https://github.com/felix-thu/RPEX/tree/35da71ee5151b6179d21b9a2b4ce1b6408aedd04),
+[WSRL `ad4dc12`](https://github.com/zhouzypaul/wsrl/tree/ad4dc1248a138bc15d6e053f2d1dba1b8cfbaca2),
+[Cal-QL `ac6eafe`](https://github.com/nakamotoo/Cal-QL/tree/ac6eafec22e8d60836573e1f488c7f626ce8a77e),
+and [Off2OnRL `6f298fa`](https://github.com/shlee94/Off2OnRL/tree/6f298fa9ef040d725067d0f2775022bd2900d635).
+These are source-aligned PyTorch/runtime ports, not claims of bitwise paper
+score reproduction. Cal-QL is a locomotion adaptation and PQE ports the public
+v0 recipe to D4RL-v2.
+
+The common interaction contract is:
+
+1. Keep the policy/expansion proposal unchanged for the method's internal Q,
+   IPW, and log-probability calculations.
+2. Require that proposal to be finite, clip a copy to the environment's action
+   bounds, and pass only that executed action to `env.step`.
+3. Copy the resulting clean transition, poison only the replay copy, and choose
+   the next real action from the environment's clean next observation.
+
+Action poisoning is label poisoning: an out-of-range replay action is retained
+for critic training and is never sent back to the simulator. Logs separately
+record proposal, executed-environment, and poisoned-replay action OOB rates.
+NaN/Inf actions fail explicitly; they are not repaired with `nan_to_num`.
+
+Offline corruption is generated in raw dataset coordinates before learner
+normalization. Online replay corruption also starts in raw transition
+coordinates, then the learner normalizer is applied exactly once. Dataset-std
+scales are frozen from the clean offline artifact (the source and actual
+population standard deviations are serialized); the retained RPEX online
+observation/dynamics rule uses its declared unit scale. Mixed corruption first
+selects a transition and then assigns exactly one field. Reward-only
+adversarial mixed runs do not instantiate EDAC.
+
+The EDAC objective transforms raw attacked states with preprocessing declared
+by the checkpoint. The supplied pinned EDAC payloads do not contain such
+metadata, so the runner uses identity preprocessing and records it as
+`checkpoint_metadata_missing_identity_unverified`; it does not substitute the
+learner normalizer. Attack version
+`corruption_v8_raw_coordinates_private_rng` retains the source Adam optimizer
+recreation, 100 offline/2 online steps, and source step sizes. The research
+adaptation uses a resumable private Torch RNG and applies standard deviation
+once when mapping a dimensionless perturbation to its declared budget. The
+`official_code_reference` diagnostic retains the upstream fresh-generator and
+double-std quirks, so the research attack is not labeled exact RNG parity.
+Selected-transition rates and actual-value-change rates are both stored, and a
+zero selection rate leaves the artifact byte-for-byte unchanged. Reward
+replacement at epsilon zero remains replacement, not a clean shortcut.
+
+Primary evaluation is clean deterministic deployment return for all five
+methods. RIQL uses its Gaussian mean; WSRL and Cal-QL use the tanh of their
+pre-tanh mean; PQE uses the tanh of the five-member pre-tanh mean average; RPEX
+deterministically chooses between nominal offline/online actions with its
+existing Q+IPW logits. Method-faithful RPEX epsilon switching remains an
+explicit diagnostic and is never selected as the research primary or as a
+best-of-two score. Use `--evaluation-seed-role tuning` for tuning-only runs;
+only the default `final` role is benchmark/main-table eligible.
+
+Native WSRL uses 10 critics, target subsampling of 2 with replacement,
+LayerNorm, an online-only replay after warmup, and one 1024-sample update split
+into four critic minibatches plus one full-batch actor/temperature update. PQE
+uses five independent two-hidden-layer actors and twin critics, pre-tanh moment
+matching, and balanced replay. The corrected PQE actor has member log-std bounds
+`[-20, 2]`; old three-hidden-affine PQE checkpoints are rejected and require
+retraining or an explicit converter.
+
+RPEX/RIQL source-aligned extraction is AWR in offline and online phases. The
+paper-motivated observation comparison is isolated with
+`--online-policy-extraction align_iql`; it is accepted only for online RPEX
+observation corruption, remains AWR offline, and is serialized as a distinct
+implementation variant. Explicit RIQL table, learning-rate, and UTD overrides
+are preserved. A matched clean control should pass the corrupted run's resolved
+RIQL values explicitly so the clean extension row cannot alter the match.
+
+Run the five methods for one condition with:
+
+```bash
+python run_all_algorithms.py \
+  --env-name hopper-medium-replay-v2 \
+  --corruption random \
+  --corruption-target mixed \
+  --suite-profile research_benchmark \
+  --seeds 0 1 2 \
+  --stage both \
+  --keep-going
+```
+
+When this suite is selected and `--algorithms` is omitted, the launcher chooses
+the five baselines above. Reporting first averages the last three evaluations
+within each training seed and then reports the population mean/std across
+seeds. It does not treat evaluation episodes as training seeds or silently
+select the best member/checkpoint.
 
 ## Run one experiment
 

@@ -40,6 +40,7 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         protocol == DEFAULT_PROTOCOL
         and environment_protocol == DEFAULT_PROTOCOL
         and score_semantics == SCORE_SEMANTICS
+        and resolved.get("benchmark_eligible", True)
     )
     policy_distribution = str(resolved.get("action_distribution"))
     implementation_type, benchmark_role = _benchmark_classification(
@@ -98,6 +99,7 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "evaluation_action_sampling",
         "evaluation_env_strategy",
         "evaluation_seed_schedule",
+        "evaluation_seed_role",
         "evaluation_protocol_parity_verified",
         "max_episode_steps",
         "initial_collection_steps",
@@ -124,6 +126,7 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "mixed_corruption_profile",
         "action_execution_profile",
         "policy_extraction",
+        "online_policy_extraction",
         "task_profile",
         "adversarial_attack_profile",
         "allow_experimental_adversarial_attack",
@@ -231,7 +234,9 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "benchmark_task_version": benchmark_task_version,
         "offline_compute_multiplier": offline_compute_multiplier,
         "main_table_eligible": bool(
-            benchmark_role == "main" and not uses_corruption_labels
+            benchmark_role == "main"
+            and not uses_corruption_labels
+            and resolved.get("main_table_eligible", True)
         ),
         "uses_corruption_labels": uses_corruption_labels,
         "paper_title": (
@@ -315,6 +320,9 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "target_entropy": resolved.get("target_entropy"),
         "wsrl_entropy_profile": resolved.get("wsrl_entropy_profile"),
         "evaluation_mode": resolved.get("evaluation_mode"),
+        "offline_policy_extraction": resolved.get("policy_extraction"),
+        "online_policy_extraction": resolved.get("online_policy_extraction"),
+        "implementation_variant": resolved.get("implementation_variant"),
         "online_replay_profile": resolved.get("online_replay_profile"),
         "attack_semantics": resolved.get("random_attack_semantics"),
         "attack_timing": resolved.get("attack_timing"),
@@ -328,9 +336,16 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "environment_interaction_corrupted": False,
         "evaluation_corruption": resolved.get("evaluation_corruption", "clean"),
         "attack_implementation": resolved.get("adversarial_attack_profile"),
+        "attack_exact_upstream_parity": resolved.get(
+            "attack_exact_upstream_parity", False
+        ),
+        "attack_parity_limitation": resolved.get("attack_parity_limitation"),
         "adversarial_attack_profile": resolved.get("adversarial_attack_profile"),
         "online_corruption_scale_profile": resolved.get(
             "online_corruption_scale_profile"
+        ),
+        "corruption_scale_statistics": offline_corruption.get(
+            "corruption_scale_statistics"
         ),
         "offline_adversarial_reward_rule": resolved.get(
             "offline_adversarial_reward_rule"
@@ -352,6 +367,21 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "attacker_checkpoint_strict_load": offline_corruption.get(
             "strict_checkpoint_load_verified"
+        ),
+        "oracle_preprocessing_verified": offline_corruption.get(
+            "oracle_preprocessing_verified"
+        ),
+        "oracle_preprocessing_source": offline_corruption.get(
+            "oracle_preprocessing_source"
+        ),
+        "oracle_preprocessing_sha256": offline_corruption.get(
+            "oracle_preprocessing_sha256"
+        ),
+        "attack_rng_semantics": offline_corruption.get(
+            "attack_rng_semantics"
+        ),
+        "attack_initialization_semantics": offline_corruption.get(
+            "attack_initialization_semantics"
         ),
         "attacker_checkpoint_source": resolved.get("attack_checkpoint_source"),
         "attacker_checkpoint_expected_sha256": resolved.get(
@@ -378,6 +408,15 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         },
         "selected_transition_count": resolved.get("offline_corruption", {}).get(
             "selected_transition_count"
+        ),
+        "selected_transition_fraction": offline_corruption.get(
+            "selected_transition_fraction"
+        ),
+        "actual_changed_transition_count": offline_corruption.get(
+            "actual_changed_transition_count"
+        ),
+        "actual_changed_transition_fraction": offline_corruption.get(
+            "actual_changed_transition_fraction"
         ),
         "selected_transition_hash": resolved.get("offline_corruption", {}).get(
             "selected_transition_indices_sha256"
@@ -423,6 +462,7 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "evaluation_env_strategy": resolved.get("evaluation_env_strategy"),
         "evaluation_seed_schedule": resolved.get("evaluation_seed_schedule"),
+        "evaluation_seed_role": resolved.get("evaluation_seed_role"),
         "train_env_seed": resolved.get("train_env_seed"),
         "eval_seed": resolved.get("eval_seed"),
         "offline_updates": resolved.get("offline_update_budget"),

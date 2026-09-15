@@ -57,6 +57,37 @@ class EnvironmentSetupError(RuntimeError):
     """Raised when the Gymnasium/MuJoCo environment cannot be constructed."""
 
 
+def require_finite_action(action: np.ndarray, *, label: str) -> np.ndarray:
+    """Validate an action without silently repairing NaN or infinity."""
+
+    array = np.asarray(action)
+    if not np.all(np.isfinite(array)):
+        raise FloatingPointError(f"{label} contains NaN or infinity: {array!r}")
+    return array
+
+
+def clip_action_to_space(
+    proposal: np.ndarray,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+) -> np.ndarray:
+    """Map a finite proposal to the finite action-space box."""
+
+    proposal_array = require_finite_action(proposal, label="action proposal")
+    low = require_finite_action(action_low, label="action-space lower bound")
+    high = require_finite_action(action_high, label="action-space upper bound")
+    if proposal_array.shape != low.shape or low.shape != high.shape:
+        raise ValueError(
+            "action proposal and bounds must have identical shapes; got "
+            f"proposal={proposal_array.shape}, low={low.shape}, high={high.shape}"
+        )
+    if np.any(low > high):
+        raise ValueError("action-space lower bound exceeds upper bound")
+    executed = np.clip(proposal_array, low, high).astype(np.float32)
+    require_finite_action(executed, label="executed action")
+    return executed
+
+
 def _validate_protocol(protocol: str) -> None:
     if protocol != MODERN_PROTOCOL:
         raise ValueError(
@@ -882,14 +913,19 @@ def evaluate_agent(
                 )
                 action_np = action.detach().cpu().numpy()
                 if action_execution_profile == "clip_to_action_space":
-                    action_np = np.clip(
-                        action_np, env.action_space.low, env.action_space.high
+                    action_np = clip_action_to_space(
+                        action_np,
+                        env.action_space.low,
+                        env.action_space.high,
                     )
                 elif action_execution_profile != "official_algorithm_behavior":
                     raise ValueError(
                         f"Unknown action_execution_profile {action_execution_profile!r}"
                     )
-                action_np = action_np.astype(np.float32)
+                else:
+                    action_np = require_finite_action(
+                        action_np, label="unbounded diagnostic action"
+                    ).astype(np.float32)
                 raw_state, reward, terminated, truncated, _ = step_env(
                     env,
                     action_np,
