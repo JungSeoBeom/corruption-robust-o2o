@@ -25,6 +25,7 @@ from .networks import VectorizedLinear
 
 
 ATTACK_IMPLEMENTATION_VERSION = "corruption_v8_raw_coordinates_private_rng"
+ATTACK_RNG_SCHEMA = "phase_private_torch_v1"
 ATTACK_OBJECTIVE = "minimize_edac_ensemble_mean_q"
 CORRUPTION_APPLICATION_CONTRACT = "replay_transition_poisoning"
 
@@ -304,6 +305,11 @@ class AttackOracle:
         self.generator_device = torch.device("cpu")
         self.generator = torch.Generator()
         self.generator.manual_seed(int(seed))
+        # Keep the historical offline stream; phase separation is independent
+        # of cache identity, algorithm, and the number of offline draws.
+        self.online_generator = torch.Generator().manual_seed(
+            (int(seed) + 0x4F324F) % (2**63)
+        )
         self.actor = EDACActor(state_dim, action_dim, max_action).to(device).eval()
         self.critic = EDACCritic(state_dim, action_dim).to(device).eval()
         state = _load_checkpoint_payload(self.checkpoint, device)
@@ -356,6 +362,30 @@ class AttackOracle:
         for parameter in self.critic.parameters():
             parameter.requires_grad_(False)
 
+    def rng_state_dict(self) -> Dict[str, Any] | torch.Tensor:
+        if self.preserve_upstream_attack_quirks:
+            return self.generator.get_state()
+        return {
+            "schema": ATTACK_RNG_SCHEMA,
+            "offline": self.generator.get_state(),
+            "online": self.online_generator.get_state(),
+        }
+
+    def load_rng_state_dict(self, state: Any) -> None:
+        if self.preserve_upstream_attack_quirks:
+            self.generator.set_state(state)
+            return
+        if not isinstance(state, dict) or state.get("schema") != ATTACK_RNG_SCHEMA:
+            raise ValueError(
+                "AttackOracle exact resume requires phase-private RNG schema; "
+                "legacy single-stream state cannot be migrated"
+            )
+        # Validate both states before changing either live stream.
+        for phase in ("offline", "online"):
+            torch.Generator().set_state(state[phase].cpu())
+        self.generator.set_state(state["offline"].cpu())
+        self.online_generator.set_state(state["online"].cpu())
+
     def transform_states(self, states: torch.Tensor) -> torch.Tensor:
         """Transform raw benchmark states into the frozen oracle coordinates."""
 
@@ -380,6 +410,11 @@ class AttackOracle:
         )
         actions_tensor = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
         std_tensor = torch.as_tensor(std, dtype=torch.float32, device=self.device)
+        phase_generator = (
+            self.online_generator
+            if online and not self.preserve_upstream_attack_quirks
+            else self.generator
+        )
         if self.implementation_profile == "rpex_official_adam":
             if self.record_trace and target == "dynamics" and online:
                 raise ValueError(
@@ -387,12 +422,11 @@ class AttackOracle:
                     "online dynamics objective"
                 )
             # Exact-source diagnostics retain the upstream fresh online stream;
-            # research artifacts use one persistent private stream so repeated
-            # transitions are reproducible and resumable.
+            # research artifacts use persistent, phase-separated private streams.
             generator = (
                 torch.Generator()
                 if online and self.preserve_upstream_attack_quirks
-                else self.generator
+                else phase_generator
             )
             random_values = torch.rand(
                 original_tensor.shape,
@@ -423,7 +457,7 @@ class AttackOracle:
                         self.transform_states(attacked),
                         deterministic=not online,
                         generator=(
-                            self.generator
+                            phase_generator
                             if online and not self.preserve_upstream_attack_quirks
                             else None
                         ),
@@ -476,7 +510,7 @@ class AttackOracle:
             dtype=torch.float32,
             device=self.generator_device,
         )
-        initial.uniform_(-scale, scale, generator=self.generator)
+        initial.uniform_(-scale, scale, generator=phase_generator)
         noise = initial.to(self.device) * std_tensor
         for _ in range(steps):
             noise.requires_grad_(True)
@@ -762,7 +796,9 @@ def corruption_cache_fingerprint(
                     if bool(
                         getattr(oracle, "preserve_upstream_attack_quirks", False)
                     )
-                    else "persistent_private_torch_generator"
+                    else (
+                        ATTACK_RNG_SCHEMA if oracle is not None else "none_reward_rule"
+                    )
                 ),
                 "attack_initialization_semantics": (
                     "upstream_double_std_quirk"

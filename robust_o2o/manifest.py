@@ -544,6 +544,9 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
             field: resolved.get(field) for field in hyperparameter_fields
         },
     }
+    # Never stamp historical configs with today's implementation revision.
+    if algorithm == "pessimistic_q_ensemble" and resolved.get("pqe_numerics_version"):
+        manifest["pqe_numerics_version"] = resolved["pqe_numerics_version"]
     manifest["manifest_sha256"] = canonical_json_sha256(manifest)
     return manifest
 

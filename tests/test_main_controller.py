@@ -157,6 +157,9 @@ class MainControllerContractTest(unittest.TestCase):
             def __init__(self):
                 self.generator = torch.Generator().manual_seed(0)
 
+            def rng_state_dict(self):
+                return self.generator.get_state()
+
             def attack(self, original, *args, **kwargs):
                 del args, kwargs
                 return np.full_like(original, -1.7, dtype=np.float32)

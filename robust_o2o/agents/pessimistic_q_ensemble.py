@@ -40,6 +40,13 @@ PQE_MEMBER_LOG_STD_MAX = 2.0
 PQE_CHECKPOINT_FORMAT = "pqe_independent_member_v2_two_hidden_actor"
 
 
+def _validate_density_weights(weights: torch.Tensor, location: str) -> None:
+    if weights.ndim != 1 or weights.numel() == 0:
+        raise ValueError(f"{location}: weights must be a non-empty vector")
+    if not torch.isfinite(weights).all() or (weights < 0).any():
+        raise ValueError(f"{location}: weights must be finite and non-negative")
+
+
 def _config_value(config: Any, names: Sequence[str], default: Any) -> Any:
     for name in names:
         value = getattr(config, name, None)
@@ -123,7 +130,10 @@ class NonnegativeDensityRatioNetwork(nn.Module):
         self, states: torch.Tensor, actions: torch.Tensor
     ) -> torch.Tensor:
         inputs = torch.cat((states, actions), dim=-1)
-        return F.relu(self.net(inputs).squeeze(-1))
+        raw_weights = self.net(inputs).squeeze(-1)
+        if not torch.isfinite(raw_weights).all():
+            raise ValueError("PQE density network: non-finite output before ReLU")
+        return F.relu(raw_weights)
 
 
 class PQETanhGaussianPolicy(nn.Module):
@@ -548,12 +558,13 @@ class PessimisticQEnsembleAgent(BaseAgent):
         stds = torch.stack([distribution.stddev for distribution in distributions])
         average_mean = means.mean(dim=0)
         average_variance = (
-            (stds.square() + means.square()).mean(dim=0)
-            - average_mean.square()
+            stds.square().mean(dim=0)
+            + (means - average_mean.unsqueeze(0)).square().mean(dim=0)
         )
-        average_std = average_variance.clamp_min(0.0).sqrt().clamp(
-            math.exp(PQE_MOMENT_LOG_STD_MIN),
-            math.exp(PQE_MOMENT_LOG_STD_MAX),
+        average_std = average_variance.clamp_min(
+            math.exp(2.0 * PQE_MOMENT_LOG_STD_MIN)
+        ).sqrt().clamp_max(
+            math.exp(PQE_MOMENT_LOG_STD_MAX)
         )
         return average_mean, average_std
 
@@ -619,13 +630,18 @@ class PessimisticQEnsembleAgent(BaseAgent):
         online_weights: torch.Tensor,
         epsilon: float = 1e-10,
     ) -> torch.Tensor:
+        _validate_density_weights(offline_weights, "PQE density objective/offline")
+        _validate_density_weights(online_weights, "PQE density objective/online")
         offline_term = -torch.log(
             2.0 / (offline_weights + 1.0) + epsilon
         )
         online_term = torch.log(
             2.0 * online_weights / (online_weights + 1.0) + epsilon
         )
-        return offline_term.mean() - online_term.mean()
+        loss = offline_term.mean() - online_term.mean()
+        if not torch.isfinite(loss):
+            raise ValueError("PQE density objective: non-finite loss")
+        return loss
 
     def density_ratio_loss(
         self,
@@ -654,9 +670,15 @@ class PessimisticQEnsembleAgent(BaseAgent):
         ceiling: float = 1e3,
         epsilon: float = 1e-10,
     ) -> torch.Tensor:
+        _validate_density_weights(weights, "PQE priority/weights")
+        _validate_density_weights(offline_weights, "PQE priority/offline weights")
         numerator = weights.pow(1.0 / temperature)
         denominator = offline_weights.pow(1.0 / temperature).mean()
-        return (numerator / (denominator + epsilon)).clamp(floor, ceiling)
+        if not torch.isfinite(denominator):
+            raise ValueError("PQE priority: non-finite normalization denominator")
+        priorities = numerator / (denominator + epsilon)
+        _validate_density_weights(priorities, "PQE priority/pre-clamp")
+        return priorities.clamp(floor, ceiling)
 
     @torch.no_grad()
     def density_priorities(

@@ -37,6 +37,8 @@ from .fidelity import (
 )
 
 
+PQE_NUMERICS_VERSION = "centered_moments_strict_priorities_v1"
+
 ALGORITHMS = (
     "rpex",
     "riql_pex",
@@ -1379,6 +1381,9 @@ class ExperimentConfig:
         if self.is_research_suite:
             self._validate_research_benchmark()
         result = asdict(self)
+        result["pqe_numerics_version"] = (
+            PQE_NUMERICS_VERSION if self.algorithm == "pessimistic_q_ensemble" else None
+        )
         result["effective_offline_ratio"] = self.effective_offline_ratio
         result["offline_ratio_rule"] = (
             "offline_size/(offline_size+completed_online_size)"

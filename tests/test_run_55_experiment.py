@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import unittest
+import importlib.util
+
+if importlib.util.find_spec("run_55_experiment") is None:
+    raise unittest.SkipTest("run_55_experiment.py is an optional gitignored local runner")
 
 from robust_o2o.config import ALGORITHMS
 from robust_o2o.fidelity import MAIN_BASELINES

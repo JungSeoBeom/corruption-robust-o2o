@@ -12,10 +12,15 @@ import numpy as np
 import torch
 
 from .agents import build_agent
-from .config import ExperimentConfig
+from .config import (
+    ExperimentConfig,
+    INDIVIDUAL_CORRUPTION_TARGETS,
+    PQE_NUMERICS_VERSION,
+)
 from .calql_online import CalQLTrajectoryAccumulator, dynamic_batch_counts
 from .corruption import (
     AttackOracle,
+    ATTACK_RNG_SCHEMA,
     OnlineCorruptionAudit,
     corrupt_pre_action_value,
     corrupt_offline_dataset,
@@ -631,7 +636,7 @@ def capture_global_rng_state(
             else None
         ),
         "attack_rng": (
-            oracle.generator.get_state() if oracle is not None else None
+            oracle.rng_state_dict() if oracle is not None else None
         ),
     }
     if hasattr(torch, "mps") and hasattr(torch.mps, "get_rng_state"):
@@ -659,7 +664,7 @@ def restore_global_rng_state(
     if corruption_rng is not None and state.get("corruption_rng") is not None:
         restore_numpy_rng_state(corruption_rng, state["corruption_rng"])
     if oracle is not None and state.get("attack_rng") is not None:
-        oracle.generator.set_state(state["attack_rng"])
+        oracle.load_rng_state_dict(state["attack_rng"])
 
 
 def capture_environment_rng_state(env: object) -> Dict[str, Any]:
@@ -707,6 +712,14 @@ def save_checkpoint(
 ) -> None:
     payload = {
         "format_version": 4,
+        "attack_rng_schema": (
+            "upstream_single_torch"
+            if config.implementation_profile == "official_code_reference"
+            else ATTACK_RNG_SCHEMA
+        ),
+        "pqe_numerics_version": (
+            PQE_NUMERICS_VERSION if config.algorithm == "pessimistic_q_ensemble" else None
+        ),
         "algorithm": config.algorithm,
         "env_name": config.env_name,
         "protocol": config.protocol,
@@ -1001,6 +1014,8 @@ def _validate_checkpoint(
     state_dim: int,
     action_dim: int,
 ) -> None:
+    if config.resume_run:
+        _validate_reliability_resume(payload, config)
     if payload.get("algorithm") != config.algorithm:
         raise ValueError(
             f"Checkpoint algorithm={payload.get('algorithm')!r}, "
@@ -1062,6 +1077,52 @@ def _validate_checkpoint(
                 "Checkpoint action_distribution="
                 f"{saved_distribution!r}, requested={config.action_distribution!r}"
             )
+
+
+def _validate_reliability_resume(payload: Dict[str, Any], config: ExperimentConfig) -> None:
+    """Reject changed training semantics before committing any run output."""
+    if (
+        config.algorithm == "pessimistic_q_ensemble"
+        and payload.get("pqe_numerics_version") != PQE_NUMERICS_VERSION
+    ):
+        raise ValueError(
+            "PQE exact resume requires current moment/priority numerics; "
+            "use initialization for older weights"
+        )
+    if (
+        config.corruption == "adversarial"
+        and (
+            config.corruption_target in ("observations", "actions", "dynamics")
+            or (
+                config.corruption_target == "mixed"
+                and any(
+                    ratio > 0 and target != "rewards"
+                    for target, ratio in zip(
+                        INDIVIDUAL_CORRUPTION_TARGETS, config.mixed_ratios
+                    )
+                )
+            )
+        )
+        and config.implementation_profile != "official_code_reference"
+    ):
+        if payload.get("attack_rng_schema") != ATTACK_RNG_SCHEMA:
+            raise ValueError(
+                "Research adversarial exact resume requires phase-private RNG "
+                "schema; legacy single-stream checkpoints support initialization only"
+            )
+        resume = payload.get("resume_state") or {}
+        if resume.get("phase") == "online":
+            state = resume.get("global_rng", {}).get("attack_rng")
+            if not isinstance(state, dict) or state.get("schema") != ATTACK_RNG_SCHEMA:
+                raise ValueError(
+                    "Online exact resume is missing phase-private attack RNG state"
+                )
+            for phase in ("offline", "online"):
+                if phase not in state:
+                    raise ValueError(
+                        f"Online exact resume is missing {phase} attack RNG state"
+                    )
+                torch.Generator().set_state(state[phase].cpu())
 
 
 def _restore_agent_config(config: ExperimentConfig, payload: Dict[str, Any]) -> None:

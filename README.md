@@ -196,13 +196,43 @@ metadata, so the runner uses identity preprocessing and records it as
 learner normalizer. Attack version
 `corruption_v8_raw_coordinates_private_rng` retains the source Adam optimizer
 recreation, 100 offline/2 online steps, and source step sizes. The research
-adaptation uses a resumable private Torch RNG and applies standard deviation
+adaptation uses resumable phase-private Torch RNGs and applies standard deviation
 once when mapping a dimensionless perturbation to its declared budget. The
 `official_code_reference` diagnostic retains the upstream fresh-generator and
 double-std quirks, so the research attack is not labeled exact RNG parity.
 Selected-transition rates and actual-value-change rates are both stored, and a
 zero selection rate leaves the artifact byte-for-byte unchanged. Reward
 replacement at epsilon zero remains replacement, not a clean shortcut.
+
+Reliability revision (after `15d44da`): research vector attacks use
+`phase_private_torch_v1`: offline seed = `corruption_seed`, online seed =
+`(corruption_seed + 0x4F324F) % 2**63`. Both online perturbation initialization
+and the stochastic EDAC dynamics policy use that persistent online stream.
+Offline cache hit/miss/regeneration therefore cannot change the online attack
+sequence. The RNG semantics field changes the research vector-attack cache
+key and manifest identity; old artifacts remain untouched and are not reused
+under the new key. The offline draw mapping itself is unchanged. Official-code
+diagnostic RNG quirks remain unchanged.
+
+Checkpoints record `attack_rng_schema`; online checkpoints store both private
+states. Offline checkpoints may omit them because the unused online state is
+deterministically reconstructible. Old single-stream research adversarial
+checkpoints cannot exact-resume; compatible weights can still initialize a new
+run. PQE also records `pqe_numerics_version` as
+`centered_moments_strict_priorities_v1`: centered moment variance and a positive floor
+before square root prevent cancellation/NaN gradients without detaching actors
+or changing the pre-tanh Gaussian. Invalid priorities/weights now raise rather
+than silently becoming uniform probabilities; valid floors, clipping, and the
+initial online priority formula are unchanged. MC-return `-Inf` sentinels are
+not priority errors. Old PQE checkpoints likewise support initialization, not
+exact resume across this numerical revision.
+
+Research vector-adversarial and PQE trajectories can change and must be grouped
+by their recorded revisions, not silently merged with old runs. This does not
+invalidate all historical clean/random results for other methods. No historical
+result manifests, caches, or checkpoints are migrated in place. Regression
+tests check local reproducibility and actual backward updates, not long-run
+MuJoCo benchmark scores or paper reproduction.
 
 Primary evaluation is clean deterministic deployment return for all five
 methods. RIQL uses its Gaussian mean; WSRL and Cal-QL use the tanh of their

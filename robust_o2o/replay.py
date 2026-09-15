@@ -20,6 +20,38 @@ RPEX_OFFICIAL_REPLAY_SAMPLING = "rpex_official_global_rng"
 INVALID_MC_RETURN = np.float32(-np.inf)
 
 
+def _validate_priorities(
+    values: np.ndarray, location: str, size: int | None = None
+) -> np.ndarray:
+    try:
+        values = np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{location}: priorities must be numeric") from exc
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError(f"{location}: priorities must be a non-empty vector")
+    if size is not None and len(values) != size:
+        raise ValueError(f"{location}: priority length does not match rows")
+    if not np.isfinite(values).all() or (values < 0).any():
+        raise ValueError(f"{location}: priorities must be finite and non-negative")
+    return values
+
+
+def _priority_update_arrays(
+    indices: torch.Tensor, priorities: torch.Tensor, size: int, location: str
+) -> tuple[np.ndarray, np.ndarray]:
+    idx = indices.detach().cpu().numpy()
+    values = _validate_priorities(priorities.detach().cpu().numpy(), location)
+    if (
+        idx.ndim != 1
+        or not np.issubdtype(idx.dtype, np.integer)
+        or len(idx) != len(values)
+    ):
+        raise ValueError(f"{location}: indices must be an aligned integer vector")
+    if (idx < 0).any() or (idx >= size).any():
+        raise ValueError(f"{location}: priority index out of bounds")
+    return idx, values
+
+
 def _tensor_batch(dataset: Dataset, indices: np.ndarray, device: torch.device) -> TensorBatch:
     return {
         key: torch.as_tensor(value[indices], dtype=torch.float32, device=device)
@@ -61,6 +93,12 @@ class OfflineDataset:
             return {}
         if prioritized and probabilities is None:
             probabilities = _safe_probabilities(self.priorities)
+        if probabilities is not None:
+            probabilities = _validate_priorities(
+                probabilities, "OfflineDataset.sample probabilities", self.size
+            )
+            if not np.isclose(probabilities.sum(), 1.0):
+                raise ValueError("OfflineDataset.sample: probabilities must sum to one")
         if self.sampling_profile == RPEX_OFFICIAL_REPLAY_SAMPLING:
             if prioritized or probabilities is not None:
                 raise ValueError(
@@ -86,8 +124,9 @@ class OfflineDataset:
         return result
 
     def update_priorities(self, indices: torch.Tensor, priorities: torch.Tensor) -> None:
-        idx = indices.detach().cpu().numpy().astype(np.int64, copy=False)
-        values = priorities.detach().cpu().numpy().astype(np.float64, copy=False)
+        idx, values = _priority_update_arrays(
+            indices, priorities, self.size, "OfflineDataset.update_priorities"
+        )
         self.priorities[idx] = np.maximum(values, 1e-12)
         self.priority_updates += int(len(idx))
 
@@ -107,12 +146,15 @@ class OfflineDataset:
         }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
+        values = _validate_priorities(
+            state["priorities"], "OfflineDataset.load_state_dict", self.size
+        )
         saved_profile = state.get("sampling_profile", NUMPY_REPLAY_SAMPLING)
         if saved_profile != self.sampling_profile:
             raise ValueError("offline replay sampling profile changed across resume")
         if state.get("rng_state") is not None:
             self.rng.bit_generator.state = state["rng_state"]
-        self.priorities[...] = np.asarray(state["priorities"], dtype=np.float64)
+        self.priorities[...] = values
         self.priority_updates = int(state.get("priority_updates", 0))
 
 
@@ -163,6 +205,10 @@ class ReplayBuffer:
         priority: float = 1.0,
         mc_return: Optional[float] = None,
     ) -> None:
+        priority_array = np.asarray(priority)
+        if priority_array.ndim != 0:
+            raise ValueError("ReplayBuffer.add: priority must be a scalar")
+        _validate_priorities(priority_array.reshape(1), "ReplayBuffer.add")
         index = self.position
         self.states[index] = state
         self.actions[index] = action
@@ -195,8 +241,8 @@ class ReplayBuffer:
             raise ValueError("ReplayBuffer.add_batch fields have different lengths")
         if mc_returns is not None and len(mc_returns) != count:
             raise ValueError("mc_returns length does not match replay batch")
-        if priorities is not None and len(priorities) != count:
-            raise ValueError("priorities length does not match replay batch")
+        if priorities is not None:
+            _validate_priorities(priorities, "ReplayBuffer.add_batch", count)
         for index in range(count):
             self.add(
                 observations[index],
@@ -266,8 +312,9 @@ class ReplayBuffer:
         return result
 
     def update_priorities(self, indices: torch.Tensor, priorities: torch.Tensor) -> None:
-        idx = indices.detach().cpu().numpy()
-        values = priorities.detach().cpu().numpy()
+        idx, values = _priority_update_arrays(
+            indices, priorities, self.size, "ReplayBuffer.update_priorities"
+        )
         self.priorities[idx] = np.maximum(values, 1e-12)
         self.priority_updates += int(len(idx))
 
@@ -302,6 +349,10 @@ class ReplayBuffer:
         if int(state["capacity"]) != self.capacity:
             raise ValueError("resume replay capacity does not match resolved config")
         size = int(state["size"])
+        if size:
+            _validate_priorities(
+                state["priorities"], "ReplayBuffer.load_state_dict", size
+            )
         for name in (
             "states",
             "actions",
@@ -328,13 +379,18 @@ class ReplayBuffer:
 
 
 def _safe_probabilities(priorities: np.ndarray) -> np.ndarray:
-    values = np.asarray(priorities, dtype=np.float64)
-    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    values = _validate_priorities(priorities, "_safe_probabilities")
     values = np.maximum(values, 1e-12)
+    # Scaling only when necessary avoids overflow without changing ratios.
+    if values.max() > np.finfo(np.float64).max / len(values):
+        values = values / values.max()
     total = float(values.sum())
     if not np.isfinite(total) or total <= 0.0:
-        return np.full(len(values), 1.0 / len(values), dtype=np.float64)
-    return values / total
+        raise ValueError("_safe_probabilities: invalid normalization total")
+    probabilities = values / total
+    if not np.isfinite(probabilities).all() or not np.isclose(probabilities.sum(), 1.0):
+        raise ValueError("_safe_probabilities: invalid normalized probabilities")
+    return probabilities
 
 
 def _priority_statistics(
@@ -500,13 +556,24 @@ def update_sample_priorities(
     """Apply aligned density-ratio priorities to their original source rows."""
     if "_indices" not in batch or "_source" not in batch:
         raise RuntimeError("priority update requires replay indices and source metadata")
-    indices = batch["_indices"].reshape(-1)
-    source = batch["_source"].reshape(-1)
-    values = priorities.reshape(-1)
+    indices = batch["_indices"]
+    source = batch["_source"]
+    values = priorities
+    _validate_priorities(values.detach().cpu().numpy(), "update_sample_priorities")
+    if indices.ndim != 1 or source.ndim != 1:
+        raise ValueError("update_sample_priorities: metadata must be vectors")
     if not (len(indices) == len(source) == len(values)):
         raise RuntimeError("priority metadata is not aligned with the sampled batch")
     offline_mask = source == 0
     online_mask = source == 1
+    if not (offline_mask | online_mask).all():
+        raise ValueError("update_sample_priorities: unknown replay source")
+    # Validate both partitions before mutating either replay.
+    for replay, mask in ((offline, offline_mask), (online, online_mask)):
+        if mask.any():
+            _priority_update_arrays(
+                indices[mask], values[mask], replay.size, "update_sample_priorities"
+            )
     if offline_mask.any():
         offline.update_priorities(indices[offline_mask], values[offline_mask])
     if online_mask.any():
