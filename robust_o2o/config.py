@@ -38,6 +38,7 @@ from .fidelity import (
 
 
 PQE_NUMERICS_VERSION = "centered_moments_strict_priorities_v1"
+CANDIDATE_ALGORITHMS = ("care_o2o", "arw_o2o", "rg_o2o")
 
 ALGORITHMS = (
     "rpex",
@@ -49,6 +50,7 @@ ALGORITHMS = (
     "wsrl",
     "ro2o",
     "pessimistic_q_ensemble",
+    *CANDIDATE_ALGORITHMS,
 )
 
 DEFAULT_PROTOCOL = "gymnasium_mujoco_v4_d4rl_v2"
@@ -64,6 +66,9 @@ ACTION_DIMS = {
 
 
 ALGORITHM_TITLES = {
+    "care_o2o": "CARE-O2O",
+    "arw_o2o": "ARW-O2O",
+    "rg_o2o": "RG-O2O",
     "rpex": "RPEX: Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption",
     "riql_pex": "RPEX ablation: RIQL + Policy Expansion",
     "riql_naive": "Towards Robust Offline Reinforcement Learning under Diverse Data Corruption",
@@ -76,6 +81,7 @@ ALGORITHM_TITLES = {
 }
 
 ALGORITHM_ALIASES = {
+    "care-o2o": "care_o2o", "arw-o2o": "arw_o2o", "rg-o2o": "rg_o2o",
     "riql+pex": "riql_pex",
     "riql-pex": "riql_pex",
     "riql_naive": "riql_naive",
@@ -187,6 +193,28 @@ class ExperimentConfig:
     max_episode_steps: int = 1_000
 
     hidden_dim: int = 256
+    # PDF working candidates: declared implementation defaults, not paper-tuned.
+    candidate_audit_folds: int = 2
+    candidate_audit_steps: Optional[int] = None
+    candidate_recalibration_steps: int = 1000
+    candidate_generator_steps: Optional[int] = None
+    candidate_candidates: int = 10
+    candidate_diffusion_steps: int = 20
+    candidate_check_probability: float = 0.05
+    candidate_optimism: float = 1.0
+    candidate_mad_multiplier: float = 1.4826
+    candidate_trust_min: float = 0.05
+    candidate_trust_temperature: float = 1.0
+    candidate_uncertainty_allowance: float = 1.0
+    candidate_residual_threshold: float = 2.0
+    candidate_scale_floor: float = 1.0
+    candidate_scale_window: int = 2048
+    candidate_bootstrap_probability: float = 0.8
+    candidate_retention_period: int = 100
+    candidate_retention_mode: str = "adaptive"
+    candidate_retention_smoothing: float = 0.1
+    candidate_bias_scale: float = 1.0
+    candidate_advantage_clip: float = 5.0
     hidden_layers: int = 2
     learning_rate: float = 3e-4
     actor_learning_rate: Optional[float] = None
@@ -323,6 +351,36 @@ class ExperimentConfig:
                 "select canonical algorithm='cal_ql' for new runs"
             )
         self.algorithm = ALGORITHM_ALIASES.get(requested_algorithm, requested_algorithm)
+        if self.algorithm in CANDIDATE_ALGORITHMS:
+            if self.candidate_retention_mode not in ("adaptive", "fixed", "none"):
+                raise ValueError("candidate_retention_mode must be adaptive, fixed, or none")
+            if self.implementation_profile not in (None, "common_budget_robustness"):
+                raise ValueError("CRO2O candidates are unverified working proposals; use common_budget_robustness")
+            if self.action_distribution != "tanh_gaussian" or self.deterministic_policy:
+                raise ValueError("CRO2O candidates require matched bounded stochastic initializers")
+            if self.candidate_audit_steps is None:
+                self.candidate_audit_steps = self.offline_steps
+            if self.candidate_generator_steps is None:
+                self.candidate_generator_steps = self.offline_steps
+            for name in ("candidate_audit_folds", "candidate_candidates", "candidate_diffusion_steps", "candidate_scale_window", "candidate_retention_period"):
+                if getattr(self, name) < (2 if name in ("candidate_audit_folds", "candidate_diffusion_steps") else 1):
+                    raise ValueError(f"invalid {name}")
+            for name in ("candidate_audit_steps", "candidate_generator_steps", "candidate_recalibration_steps"):
+                if getattr(self, name) < 0:
+                    raise ValueError(f"invalid {name}")
+            for name in ("candidate_trust_min", "candidate_bootstrap_probability"):
+                if not 0 < getattr(self, name) < 1:
+                    raise ValueError(f"{name} must be in (0,1)")
+            if not 0 < self.candidate_retention_smoothing <= 1:
+                raise ValueError("candidate_retention_smoothing must be in (0,1]")
+            for name in ("candidate_scale_floor", "candidate_trust_temperature", "candidate_mad_multiplier", "candidate_bias_scale", "candidate_advantage_clip"):
+                if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                    raise ValueError(f"{name} must be finite and positive")
+            if not 0 <= self.candidate_check_probability <= 1:
+                raise ValueError("candidate_check_probability must be in [0,1]")
+            for name in ("candidate_optimism", "candidate_uncertainty_allowance", "candidate_residual_threshold"):
+                if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                    raise ValueError(f"{name} must be finite and non-negative")
         self.env_name = normalize_env_name(self.env_name)
         self.corruption = self.corruption.lower()
         self.corruption_target = self.corruption_target.lower()
@@ -1353,6 +1411,8 @@ class ExperimentConfig:
     def effective_offline_ratio(self) -> float:
         if self.offline_ratio is not None:
             return self.offline_ratio
+        if self.algorithm in CANDIDATE_ALGORITHMS:
+            return 0.5
         if (
             self.algorithm in ("rpex", "riql_pex")
             and self.online_replay_profile == "paper_offline_online_mixture"
@@ -1381,6 +1441,17 @@ class ExperimentConfig:
         if self.is_research_suite:
             self._validate_research_benchmark()
         result = asdict(self)
+        if self.algorithm in CANDIDATE_ALGORITHMS:
+            result["candidate_spec"] = {
+                "version": "cro2o_working_notes_20260915_v1",
+                **{k: v for k, v in result.items() if k.startswith("candidate_")},
+                "evaluation": (
+                    "stochastic_diffusion_exploitation_reranking"
+                    if self.algorithm == "rg_o2o" else "deterministic_base_actor"
+                ),
+                "audit_unit": "trajectory_block",
+                "logged_action_contract": "existing_unclipped_replay_poisoning",
+            }
         result["pqe_numerics_version"] = (
             PQE_NUMERICS_VERSION if self.algorithm == "pessimistic_q_ensemble" else None
         )
@@ -1447,6 +1518,13 @@ class ExperimentConfig:
                 else "algorithm_profile_default"
             )
         )
+        if self.algorithm in CANDIDATE_ALGORITHMS:
+            result["evaluation_action_sampling"] = result["candidate_spec"]["evaluation"]
+            result["online_replay_sampler"] = "private_numpy_choice_with_replacement"
+            result["offline_ratio_rule"] = (
+                f"separately_normalized_sources_{self.candidate_retention_mode}"
+                if self.algorithm == "arw_o2o" else "fixed_count_mixture_trust_weighted"
+            )
         result["evaluation_env_strategy"] = "separate_clean_environment"
         result["evaluation_seed_schedule"] = (
             "reseed_each_call_episode_as_seed_plus_10000_plus_episode"
@@ -1966,6 +2044,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--offline-ratio", type=float)
+    candidate_defaults = {
+        "audit-folds": (int, 2), "audit-steps": (int, None),
+        "recalibration-steps": (int, 1000), "generator-steps": (int, None),
+        "candidates": (int, 10), "diffusion-steps": (int, 20),
+        "check-probability": (float, .05), "optimism": (float, 1.),
+        "mad-multiplier": (float, 1.4826), "trust-min": (float, .05),
+        "trust-temperature": (float, 1.), "uncertainty-allowance": (float, 1.),
+        "residual-threshold": (float, 2.), "scale-floor": (float, 1.),
+        "scale-window": (int, 2048), "bootstrap-probability": (float, .8),
+        "retention-period": (int, 100), "retention-smoothing": (float, .1),
+        "bias-scale": (float, 1.), "advantage-clip": (float, 5.),
+    }
+    for name, (kind, default) in candidate_defaults.items():
+        parser.add_argument(f"--candidate-{name}", type=kind, default=default)
+    parser.add_argument("--candidate-retention-mode", choices=("adaptive", "fixed", "none"), default="adaptive")
     return parser
 
 

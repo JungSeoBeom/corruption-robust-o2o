@@ -16,7 +16,10 @@ from .config import (
     ExperimentConfig,
     INDIVIDUAL_CORRUPTION_TARGETS,
     PQE_NUMERICS_VERSION,
+    CANDIDATE_ALGORITHMS,
 )
+from .agents.cro2o import register_offline_blocks
+from .cro2o_training import prepare_candidate, candidate_update
 from .calql_online import CalQLTrajectoryAccumulator, dynamic_batch_counts
 from .corruption import (
     AttackOracle,
@@ -530,11 +533,15 @@ def _parameter_snapshot(agent: object) -> Dict[str, list[torch.Tensor]]:
                 for parameter in module.parameters()
             ]
     critic_modules = []
+    proposal = getattr(agent, "proposal", None)
+    if proposal is not None:
+        groups["actor"].extend(parameter.detach().clone() for parameter in proposal.parameters())
     for name in ("critic", "critic2", "q1", "q2", "value"):
         module = getattr(agent, name, None)
         if module is not None:
             critic_modules.append(module)
     for name in (
+        "critics",
         "q1_members",
         "q2_members",
     ):
@@ -1241,6 +1248,12 @@ def _evaluate(
             "normalized_return_mean"
         ]
     metrics["evaluation_mode"] = primary_mode
+    if config.algorithm == "rg_o2o":
+        # Sampling candidates remains stochastic even though selection is an
+        # argmax. Do not label this a deterministic base-actor evaluation.
+        metrics["evaluation_mode"] = "generative_exploitation"
+        metrics.pop("return_deterministic", None)
+        metrics.pop("normalized_return_deterministic", None)
     logger.log_evaluation(
         phase, step, env_steps, agent.total_updates, metrics
     )
@@ -1432,6 +1445,10 @@ def run_experiment(
             )
         if resume_payload is not None:
             restore_global_rng_state(resume_payload["global_rng"], oracle=oracle)
+        if config.algorithm in CANDIDATE_ALGORITHMS:
+            register_offline_blocks(agent, corrupted_dataset)
+            if config.initialize_from_checkpoint and agent.online_phase:
+                raise ValueError("CRO2O new-run initialization requires an offline checkpoint; online state requires --resume-run")
 
         # RunLogger.write_config intentionally commits a resume by superseding
         # any completion marker and transitioning summary.json to `running`.
@@ -1535,8 +1552,11 @@ def run_experiment(
                     state_dim,
                     action_dim,
                     resume_state=resume_payload,
+                    candidate_dataset=corrupted_dataset if config.algorithm in CANDIDATE_ALGORITHMS else None,
                 )
         if config.stage in ("online", "both"):
+            if config.algorithm in CANDIDATE_ALGORITHMS:
+                prepare_candidate(agent, corrupted_dataset, offline)
             if not agent.online_phase:
                 agent.begin_online()
             _run_online(
@@ -1619,6 +1639,7 @@ def _run_offline(
     state_dim: int,
     action_dim: int,
     resume_state: Optional[Dict[str, Any]] = None,
+    candidate_dataset: Optional[Dict[str, np.ndarray]] = None,
 ) -> None:
     logger.logger.info("offline pre-training started")
     is_pqe = config.algorithm == "pessimistic_q_ensemble"
@@ -1704,7 +1725,7 @@ def _run_offline(
                     ),
                 },
             )
-        if step % config.eval_period == 0:
+        if step % config.eval_period == 0 and not (candidate_dataset is not None and step == offline_budget):
             _evaluate(
                 logger,
                 env,
@@ -1746,10 +1767,13 @@ def _run_offline(
                     "writer_append_position": _writer_positions(logger),
                 },
             )
+    if candidate_dataset is not None:
+        prepare_candidate(agent, candidate_dataset, offline)
     if (
         config.implementation_profile != "official_code_reference"
         and (
-            offline_budget == 0
+            candidate_dataset is not None
+            or offline_budget == 0
             or offline_budget % config.eval_period != 0
         )
     ):
@@ -1810,6 +1834,7 @@ def _run_online(
     is_pqe = config.algorithm == "pessimistic_q_ensemble"
     is_calql = config.algorithm == "cal_ql"
     is_wsrl = config.algorithm == "wsrl"
+    is_candidate = config.algorithm in CANDIDATE_ALGORITHMS
     replay = ReplayBuffer(
         state_dim,
         action_dim,
@@ -2092,7 +2117,7 @@ def _run_online(
         )
     warmup = (
         max(config.initial_collection_steps, config.warmup_steps)
-        if is_wsrl
+        if is_wsrl or is_candidate
         else config.pqe_first_online_block_steps
         if is_pqe
         else 0
@@ -2251,7 +2276,11 @@ def _run_online(
         if is_calql:
             # Cal-QL is updated only after a complete trajectory has exact RTG.
             return
-        if is_wsrl:
+        if is_candidate:
+            # Recalibrate immediately after K0, before the first optimistic
+            # action. Candidate replay samples with replacement.
+            can_update = not before_transition and replay.size > 0 and env_step >= warmup
+        elif is_wsrl:
             can_update = (
                 env_step >= wsrl_first_update_step
                 and replay.size >= required_online_samples
@@ -2278,6 +2307,17 @@ def _run_online(
                 and replay.size >= required_online_samples
             )
         if not can_update:
+            return
+
+        if is_candidate:
+            while agent.recalibration_updates < config.candidate_recalibration_steps:
+                last_metrics = candidate_update(agent, offline, replay, config, critic_only=True)
+                accumulator.add(last_metrics)
+            if env_step <= warmup:
+                return
+            for _ in range(config.updates_per_step):
+                last_metrics = candidate_update(agent, offline, replay, config)
+                accumulator.add(last_metrics)
             return
 
         if is_wsrl:
@@ -2565,6 +2605,10 @@ def _run_online(
                 )
                 perform_calql_trajectory_updates(completed)
         else:
+            if is_candidate:
+                agent.observe_transition(replay_state, stored_action, stored_reward,
+                                         replay_next_state, float(terminated), replay.position,
+                                         episode_finished)
             replay.add(
                 replay_state,
                 stored_action,

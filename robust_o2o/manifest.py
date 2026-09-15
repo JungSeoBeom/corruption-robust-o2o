@@ -545,6 +545,8 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         },
     }
     # Never stamp historical configs with today's implementation revision.
+    if resolved.get("candidate_spec"):
+        manifest["candidate_spec"] = resolved["candidate_spec"]
     if algorithm == "pessimistic_q_ensemble" and resolved.get("pqe_numerics_version"):
         manifest["pqe_numerics_version"] = resolved["pqe_numerics_version"]
     manifest["manifest_sha256"] = canonical_json_sha256(manifest)

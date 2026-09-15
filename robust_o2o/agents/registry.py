@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import torch
 
-from ..config import ExperimentConfig
+from ..config import ExperimentConfig, CANDIDATE_ALGORITHMS
+from .cro2o import CRO2OAgent
 from .base import BaseAgent
 from .calql import CalQLAgent
 from .iql_family import IQLFamilyAgent
@@ -44,6 +45,8 @@ def build_agent(
     # RIQL/RPEX table selection is resolved once by ExperimentConfig so CLI
     # overrides and the serialized provenance cannot diverge at construction.
     _apply_uwmsg_defaults(config)
+    if config.algorithm in CANDIDATE_ALGORITHMS:
+        return CRO2OAgent(config, state_dim, action_dim, max_action, device)
     if config.algorithm in ("rpex", "riql_pex", "riql_naive", "pex"):
         return IQLFamilyAgent(config, state_dim, action_dim, max_action, device)
     if config.algorithm == "cal_ql":

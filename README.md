@@ -156,6 +156,11 @@ Reward-only adversarial corruption does not load an attacker checkpoint.
 
 ## Five-baseline research benchmark contract
 
+Experimental **CARE-O2O / ARW-O2O / RG-O2O** implementations from the supplied
+September 2026 working notes are documented in [the candidate guide](docs/cro2o-candidates.md).
+They are not added to the verified five-baseline suite. Use explicit
+`--algorithms care_o2o arw_o2o rg_o2o` with the common-budget launcher.
+
 The `research_benchmark` suite contains exactly `rpex`, `riql_naive`, `wsrl`,
 `cal_ql`, and the canonical `pessimistic_q_ensemble` name. Its source anchors
 are [RPEX/RIQL `35da71e`](https://github.com/felix-thu/RPEX/tree/35da71ee5151b6179d21b9a2b4ce1b6408aedd04),
