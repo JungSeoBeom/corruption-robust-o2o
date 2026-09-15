@@ -28,6 +28,11 @@ corruption rule, replay rule, optimizer schedule, or training budget.
 `calql` and `cal-ql` are accepted aliases for `cal_ql`; `pqe` is an alias for
 `pessimistic_q_ensemble`.
 
+PEX, RIQL+PEX, UWMSG, and RO2O have a separate
+[implementation audit](docs/optional-algorithm-audit.md). Their execution tests
+pass, but unresolved source differences and reproducibility issues mean that
+the nine executable names are not nine verified paper baselines.
+
 RIQL-naive and UWMSG use replay-buffer-based offline reduction during online
 fine-tuning: online transitions are stored in replay and the same offline
 objective is applied to sampled online batches. The other methods keep their
