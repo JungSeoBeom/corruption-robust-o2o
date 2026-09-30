@@ -57,7 +57,19 @@ ALGORITHM_DISPLAY_NAMES = {
     "wsrl": "WSRL",
     "ro2o": "RO2O",
     "pessimistic_q_ensemble": "Pessimistic Q-Ensemble (D4RL-v2 port)",
+    "care_o2o": "CARE-O2O",
+    "arw_o2o": "ARW-O2O",
+    "rg_o2o": "RG-O2O",
 }
+
+
+def algorithm_display_name(algorithm: str) -> str:
+    """Return a stable label without letting a new registry entry crash a run."""
+
+    return ALGORITHM_DISPLAY_NAMES.get(
+        algorithm,
+        algorithm.replace("_", " ").title(),
+    )
 
 TIMING_FIELDS = (
     "algorithm",
@@ -285,7 +297,7 @@ def summarize_algorithm_timings(
         summaries.append(
             {
                 "algorithm": algorithm,
-                "algorithm_name": ALGORITHM_DISPLAY_NAMES[algorithm],
+                "algorithm_name": algorithm_display_name(algorithm),
                 "start_time": rows[0]["start_time"],
                 "end_time": rows[-1]["end_time"],
                 "elapsed_seconds": elapsed,
@@ -399,7 +411,7 @@ def main() -> int:
         run_records.append(
             {
                 "algorithm": algorithm,
-                "algorithm_name": ALGORITHM_DISPLAY_NAMES[algorithm],
+                "algorithm_name": algorithm_display_name(algorithm),
                 "seed": seed,
                 "status": run_status,
                 "start_time": format_timestamp(run_start_wall),
@@ -411,7 +423,7 @@ def main() -> int:
             }
         )
         print(
-            f"RUN_FINISHED: {ALGORITHM_DISPLAY_NAMES[algorithm]} "
+            f"RUN_FINISHED: {algorithm_display_name(algorithm)} "
             f"({algorithm}) seed={seed} status={run_status} | "
             f"ELAPSED={format_duration(run_elapsed)} "
             f"({run_elapsed:.3f} seconds)",

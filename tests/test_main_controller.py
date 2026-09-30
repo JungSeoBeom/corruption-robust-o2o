@@ -134,6 +134,66 @@ def _controller_config(
 
 
 class MainControllerContractTest(unittest.TestCase):
+    def test_random_state_poisoning_routes_fitted_normalizer_to_replay(self):
+        for target in ("observations", "dynamics"):
+            with self.subTest(target=target):
+                replay_instances = []
+                policy_inputs = []
+
+                class CapturingReplay(ReplayBuffer):
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        replay_instances.append(self)
+
+                class Agent:
+                    total_updates = 0
+
+                    def select_action(self, state, evaluate=False):
+                        policy_inputs.append(state.cpu().numpy().copy())
+                        return torch.zeros(1)
+
+                    def update(self, batch):
+                        raise AssertionError("one-step collection should not update")
+
+                config = _controller_config(
+                    "rpex", online_steps=1,
+                    corruption="random", corruption_target=target,
+                )
+                config.online_corruption_rate = 1.0
+                normalizer = StateNormalizer(
+                    mean=np.array([3.0, -7.0], dtype=np.float32),
+                    std=np.array([0.1, 9.0], dtype=np.float32),
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    with (
+                        patch("robust_o2o.experiment.ReplayBuffer", CapturingReplay),
+                        patch("robust_o2o.experiment._evaluate"),
+                        patch("robust_o2o.experiment._save_phase_checkpoint"),
+                    ):
+                        _run_online(
+                            _GymnasiumEnv(), object(), _dataset(), config, Agent(),
+                            OfflineDataset(_dataset(), seed=0), normalizer, None,
+                            torch.device("cpu"), _logger(directory, "state-noise"),
+                            state_dim=2, action_dim=1,
+                        )
+                clean_state = normalizer.transform(np.array([0.0, 0.5]))
+                clean_next = normalizer.transform(np.array([1.0, 1.5]))
+                np.testing.assert_allclose(policy_inputs[0].reshape(-1), clean_state)
+                rng = np.random.default_rng(config.corruption_seed)
+                rng.random()  # Transition selection precedes the noise draw.
+                noise = rng.uniform(-1.0, 1.0, size=2)
+                replay = replay_instances[0]
+                np.testing.assert_allclose(
+                    replay.states[0],
+                    clean_state + (noise if target == "observations" else 0),
+                    atol=3e-6,
+                )
+                np.testing.assert_allclose(
+                    replay.next_states[0],
+                    clean_next + (noise if target == "dynamics" else 0),
+                    atol=3e-6,
+                )
+
     def test_action_poisoning_keeps_oob_replay_label_and_audits_all_actions(self):
         replay_instances: list[ReplayBuffer] = []
 

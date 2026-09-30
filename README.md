@@ -139,6 +139,12 @@ The main severity controls are `--offline-corruption-rate` (default `0.3`),
 `--online-corruption-rate` (default `0.5`), and `--corruption-range` (default
 `1.0`).
 
+Random reward corruption **replaces** selected rewards with `Uniform[-30ε, 30ε]`;
+it does not add that noise to the clean reward. Online `official_code_reference`
+retains the upstream exception `Uniform[-30, 30]` independent of ε. At the
+default ε=1 these recipes agree. Cal-QL MC returns use the post-corruption reward
+sequence and stop at episode boundaries; evaluation returns remain clean.
+
 Adversarial corruption of observations, actions, or dynamics also needs the
 environment-specific EDAC attacker checkpoint. In the original three-folder
 workspace it is found automatically below
@@ -189,10 +195,34 @@ Offline corruption is generated in raw dataset coordinates before learner
 normalization. Online replay corruption also starts in raw transition
 coordinates, then the learner normalizer is applied exactly once. Dataset-std
 scales are frozen from the clean offline artifact (the source and actual
-population standard deviations are serialized); the retained RPEX online
-observation/dynamics rule uses its declared unit scale. Mixed corruption first
+population standard deviations are serialized). For **random** online
+observation/dynamics corruption, `rpex_official_code` uses unit noise in the
+normalized observation coordinates, matching the wrapped upstream environment.
+In raw coordinates this means multiplying the noise by the fitted learner
+normalizer's standard deviation before the single normalization pass. With
+normalization disabled it retains raw unit noise. Adversarial EDAC inputs and
+the `dataset_std_scaled_extension` recipe retain their raw-coordinate semantics.
+Mixed corruption first
 selects a transition and then assigns exactly one field. Reward-only
 adversarial mixed runs do not instantiate EDAC.
+
+Revision `fix main 3` records this correction as
+`online_corruption_coordinate_system=normalized_random_state_units_v1`.
+Historical runs without that field used raw unit noise and must not be merged
+with corrected random state/dynamics runs. Old checkpoints can initialize a
+new run; exact resume across this coordinate change is rejected. Offline
+corruption caches are unchanged. IQL-family `--max-grad-norm` now clips actor,
+critic and value gradients when explicitly set; its default remains disabled.
+
+Comparison plots and final-score tables reject different corruption recipes,
+reward supports, datasets, or evaluation/budget conditions across algorithms.
+Method-specific objectives and UTD ratios may still differ and remain logged.
+`plot_results.select_latest_comparable_records` selects a shared condition from
+the newest usable RPEX run before choosing each method's latest variant/seeds;
+it returns excluded records so a local notebook can explain missing methods.
+It never falls back to a different corruption just to fill a missing curve.
+Repository provenance includes source-content and tracked-diff SHA256 values,
+so different dirty edits with the same `git status` are distinguishable.
 
 The EDAC objective transforms raw attacked states with preprocessing declared
 by the checkpoint. The supplied pinned EDAC payloads do not contain such

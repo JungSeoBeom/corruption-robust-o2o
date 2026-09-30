@@ -112,10 +112,10 @@ def runtime_package_versions() -> Dict[str, str]:
     return versions
 
 
-def repository_state_metadata() -> Dict[str, Any]:
-    """Return cheap repository provenance for a run manifest."""
+def repository_state_metadata(repository_root: Path | None = None) -> Dict[str, Any]:
+    """Identify actual source contents, including uncommitted Python changes."""
 
-    repository_root = Path(__file__).resolve().parents[1]
+    repository_root = repository_root or Path(__file__).resolve().parents[1]
 
     def git(*arguments: str) -> bytes:
         completed = subprocess.run(
@@ -130,11 +130,25 @@ def repository_state_metadata() -> Dict[str, Any]:
     status = git(
         "status", "--porcelain=v1", "--untracked-files=normal", "-z"
     )
+    digest = hashlib.sha256()
+    paths = git("ls-files", "--cached", "--others", "--exclude-standard", "-z")
+    for name in sorted(set(paths.split(b"\0")) - {b""}):
+        relative = os.fsdecode(name)
+        if not (relative.endswith(".py") or relative in ("requirements.txt", "environment.yml")):
+            continue
+        path = repository_root / relative
+        digest.update(name + b"\0")
+        if path.is_file():
+            digest.update(b"present\0" + hashlib.sha256(path.read_bytes()).digest())
+        else:
+            digest.update(b"deleted\0")
     return {
         "git_commit": commit,
         "repository_commit": commit,
         "repository_dirty": bool(status),
         "repository_status_sha256": hashlib.sha256(status).hexdigest(),
+        "repository_code_sha256": digest.hexdigest(),
+        "repository_diff_sha256": hashlib.sha256(git("diff", "HEAD", "--binary")).hexdigest(),
     }
 
 

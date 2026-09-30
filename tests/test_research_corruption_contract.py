@@ -20,7 +20,6 @@ from robust_o2o.corruption import (
 )
 from robust_o2o.dataset import CORRUPTION_LABEL_KEYS
 from robust_o2o.experiment import (
-    _poison_replay_in_learner_coordinates,
     capture_global_rng_state,
     restore_global_rng_state,
 )
@@ -81,22 +80,6 @@ class FixedPoisonedActionOracle(AdditiveOracle):
 
 
 class ResearchCorruptionContractTest(unittest.TestCase):
-    def test_research_poisoning_uses_raw_coordinates_before_one_normalization(self):
-        research = ExperimentConfig(
-            "rpex",
-            "hopper-medium-replay-v2",
-            run_purpose="research_benchmark",
-            suite_profile="research_benchmark",
-            implementation_profile="research_benchmark",
-        )
-        legacy_diagnostic = ExperimentConfig(
-            "rpex", "hopper-medium-replay-v2"
-        )
-        self.assertFalse(_poison_replay_in_learner_coordinates(research))
-        self.assertFalse(
-            _poison_replay_in_learner_coordinates(legacy_diagnostic)
-        )
-
     def test_zero_rate_artifact_is_bitwise_clean_and_reports_no_change(self):
         dataset = synthetic_dataset(32)
         config = ExperimentConfig(

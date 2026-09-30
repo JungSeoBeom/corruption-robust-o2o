@@ -29,6 +29,9 @@ env/
 /comparison.ipynb
 /run_55_experiment.py
 
+# Accidental files created by pasted CLI options / shell redirection
+/--*
+
 # Experiment outputs, logs, and checkpoints
 results/
 logs/

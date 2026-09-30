@@ -225,6 +225,8 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "repository_status_sha256": resolved.get(
             "repository_status_sha256"
         ),
+        "repository_code_sha256": resolved.get("repository_code_sha256"),
+        "repository_diff_sha256": resolved.get("repository_diff_sha256"),
         "algorithm": algorithm,
         "display_name": display_name,
         "implementation_type": implementation_type,
@@ -343,6 +345,9 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "adversarial_attack_profile": resolved.get("adversarial_attack_profile"),
         "online_corruption_scale_profile": resolved.get(
             "online_corruption_scale_profile"
+        ),
+        "online_corruption_coordinate_system": resolved.get(
+            "online_corruption_coordinate_system", "raw"
         ),
         "corruption_scale_statistics": offline_corruption.get(
             "corruption_scale_statistics"
@@ -599,6 +604,14 @@ SEED_FIELDS = {
     "launch_manifest_sha256",
     "completion_manifest_sha256",
     "selected_transition_count",
+    # Realized corruption statistics and cache locations vary with the seed;
+    # configured rate/range, RNG semantics and dataset identity remain below
+    # in the comparable payload. This does not relax manifest/resume checks.
+    "selected_transition_fraction",
+    "actual_changed_transition_count",
+    "actual_changed_transition_fraction",
+    "offline_corruption_artifact_cache_key",
+    "offline_corruption_artifact_path",
     "selected_transition_hash",
     "corruption_value_hash",
     "corruption_artifact_hash",
@@ -622,3 +635,88 @@ SEED_FIELDS = {
 def aggregation_signature(manifest: Mapping[str, Any]) -> str:
     comparable = {key: value for key, value in manifest.items() if key not in SEED_FIELDS}
     return canonical_json_sha256(comparable)
+
+
+def comparison_condition(
+    manifest: Mapping[str, Any], config: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Shared experimental conditions, excluding method-specific objectives.
+
+    Algorithm signatures cannot catch different corruptions across algorithms.
+    Use the immutable launch metadata, falling back to historical configs only
+    when a field was not recorded. Unknown conditions remain distinct from
+    known ones. Inactive state/attacker controls do not split reward-only runs.
+    """
+    hyperparameters = manifest.get("resolved_hyperparameters", {})
+
+    def read(name: str, config_name: str | None = None, default=None):
+        for source, key in ((manifest, name), (hyperparameters, name), (config, config_name or name)):
+            if source.get(key) is not None:
+                return source[key]
+        return default
+
+    condition = {
+        "dataset_id": read("dataset_id", "env_name"),
+        "dataset_sha256": read("dataset_sha256"),
+        "protocol": read("environment_protocol", "protocol"),
+        "online_env_id": read("online_env_id"),
+        "evaluation_env_id": read("evaluation_env_id"),
+        "mujoco_runtime_version": read("mujoco_runtime_version"),
+        "corruption": read("corruption"),
+        "corruption_target": read("corruption_target"),
+        "offline_updates": read("offline_updates", "offline_steps"),
+        "online_environment_steps": read("requested_online_steps", "online_steps"),
+        "evaluation_interval": read("evaluation_interval", "eval_period"),
+        "evaluation_episodes": read("evaluation_episodes", "eval_episodes"),
+        "environment_horizon": read("environment_horizon", "max_episode_steps"),
+        "evaluation_corruption": read("evaluation_corruption", default="clean"),
+        "action_execution_profile": read("action_execution_profile"),
+    }
+    corruption = condition["corruption"]
+    target = condition["corruption_target"]
+    if corruption == "clean":
+        return condition
+    rates = read("corruption_rate", default={})
+    condition.update(
+        offline_corruption_rate=rates.get("offline", read("offline_corruption_rate")),
+        online_corruption_rate=rates.get("online", read("online_corruption_rate")),
+        corruption_range=read("corruption_range"),
+        attack_timing=read("attack_timing"),
+        random_attack_semantics=read("random_attack_semantics"),
+        corruption_rng_implementation=read("corruption_rng_implementation"),
+        attack_implementation_version=read("attack_implementation_version"),
+    )
+    ratios = read("mixed_ratios") if target == "mixed" else None
+    active = {target} if target != "mixed" else {
+        name for name, ratio in zip(("observations", "actions", "rewards", "dynamics"), ratios or (1, 1, 1, 1))
+        if ratio > 0
+    }
+    if target == "mixed":
+        condition.update(mixed_ratios=ratios, mixed_corruption_profile=read("mixed_corruption_profile"))
+    if active & {"observations", "dynamics"}:
+        coordinates = read("online_corruption_coordinate_system", default="raw")
+        condition.update(
+            online_corruption_scale_profile=read("online_corruption_scale_profile"),
+            online_corruption_coordinate_system=coordinates,
+        )
+        if coordinates != "raw":
+            condition["noise_normalization"] = read("normalization_source", "state_normalization")
+    if "rewards" in active:
+        if corruption == "random":
+            epsilon = read("corruption_range")
+            online_scale = 1.0 if read("implementation_profile") == "official_code_reference" else epsilon
+            condition["reward_replacement_bounds"] = {
+                "offline": None if epsilon is None else 30.0 * epsilon,
+                "online": None if online_scale is None else 30.0 * online_scale,
+            }
+        else:
+            condition["offline_adversarial_reward_rule"] = read("offline_adversarial_reward_rule")
+            condition["online_adversarial_reward_rule"] = read("online_adversarial_reward_rule")
+    if corruption == "adversarial" and active - {"rewards"}:
+        for name in (
+            "adversarial_attack_profile", "attacker_checkpoint_sha256",
+            "oracle_preprocessing_sha256", "attack_rng_schema", "offline_attack_steps",
+            "online_attack_steps", "attack_step_size", "online_attack_step_size", "attack_norm",
+        ):
+            condition[name] = read(name)
+    return condition

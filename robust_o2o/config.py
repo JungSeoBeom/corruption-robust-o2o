@@ -1408,6 +1408,28 @@ class ExperimentConfig:
         return self.checkpoint_period
 
     @property
+    def online_corruption_coordinate_system(self) -> str:
+        """Units of online random state noise, distinct from replay storage.
+
+        RPEX adds unit noise to the normalized environment observation. We
+        implement that in raw replay coordinates using the fitted normalizer's
+        scale, then normalize the poisoned transition exactly once.
+        """
+        state_target = self.corruption_target in ("observations", "dynamics") or (
+            self.corruption_target == "mixed"
+            and (self.mixed_ratios[0] > 0 or self.mixed_ratios[3] > 0)
+        )
+        if (
+            self.corruption == "random"
+            and state_target
+            and self.online_corruption_scale_profile == "rpex_official_code"
+            and self.normalize_states
+            and self.state_normalization != "none"
+        ):
+            return "normalized_random_state_units_v1"
+        return "raw"
+
+    @property
     def effective_offline_ratio(self) -> float:
         if self.offline_ratio is not None:
             return self.offline_ratio
@@ -1441,6 +1463,7 @@ class ExperimentConfig:
         if self.is_research_suite:
             self._validate_research_benchmark()
         result = asdict(self)
+        result["online_corruption_coordinate_system"] = self.online_corruption_coordinate_system
         if self.algorithm in CANDIDATE_ALGORITHMS:
             result["candidate_spec"] = {
                 "version": "cro2o_working_notes_20260915_v1",

@@ -471,34 +471,6 @@ def bounded_executed_action(
     return clip_action_to_space(raw_policy_action, action_low, action_high)
 
 
-def _replay_transition_coordinates(
-    stored_state: np.ndarray,
-    stored_next_state: np.ndarray,
-    normalizer: StateNormalizer,
-    already_normalized: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return one replay transition in exactly one normalized coordinate pass."""
-
-    if already_normalized:
-        return stored_state, stored_next_state
-    return (
-        normalizer.transform(stored_state),
-        normalizer.transform(stored_next_state),
-    )
-
-
-def _poison_replay_in_learner_coordinates(config: ExperimentConfig) -> bool:
-    """Keep corruption out of learner coordinates for every current profile.
-
-    The frozen oracle owns any checkpoint-declared state transform.  Returning
-    true here would incorrectly substitute the learner's corrupted-data
-    normalizer for EDAC preprocessing.
-    """
-
-    del config
-    return False
-
-
 def normalizer_sha256(normalizer: StateNormalizer) -> str:
     digest = hashlib.sha256(normalizer.mode.encode("utf-8"))
     for value in (normalizer.mean, normalizer.std):
@@ -1088,6 +1060,12 @@ def _validate_checkpoint(
 
 def _validate_reliability_resume(payload: Dict[str, Any], config: ExperimentConfig) -> None:
     """Reject changed training semantics before committing any run output."""
+    saved_coordinates = payload.get("config", {}).get("online_corruption_coordinate_system", "raw")
+    if saved_coordinates != config.online_corruption_coordinate_system:
+        raise ValueError(
+            "Online corruption coordinates changed; old checkpoints support "
+            "initialization, not exact resume across the random state-noise correction"
+        )
     if (
         config.algorithm == "pessimistic_q_ensemble"
         and payload.get("pqe_numerics_version") != PQE_NUMERICS_VERSION
@@ -2452,6 +2430,7 @@ def _run_online(
                 rng,
                 state_std,
                 action_std,
+                normalizer_std=normalizer.std,
             )
         state_tensor = torch.as_tensor(
             normalizer.transform(policy_state), dtype=torch.float32, device=device
@@ -2470,6 +2449,7 @@ def _run_online(
                 rng,
                 state_std,
                 action_std,
+                normalizer_std=normalizer.std,
             )
         executed_action = (
             bounded_executed_action(raw_action_np, action_low, action_high)
@@ -2504,26 +2484,12 @@ def _run_online(
             selected_target = sample_online_corruption_target(config, rng)
 
         if pre_action and selected_target in ("observations", "actions"):
-            normalized_replay_poisoning = False
             stored_state = policy_state.copy()
             stored_action = executed_action.copy()
             stored_reward = float(reward)
             stored_next_state = raw_next_state.copy()
             was_corrupted = True
         else:
-            normalized_replay_poisoning = _poison_replay_in_learner_coordinates(
-                config
-            )
-            corruption_state = (
-                normalizer.transform(raw_state)
-                if normalized_replay_poisoning
-                else raw_state
-            )
-            corruption_next_state = (
-                normalizer.transform(raw_next_state)
-                if normalized_replay_poisoning
-                else raw_next_state
-            )
             (
                 stored_state,
                 stored_action,
@@ -2531,10 +2497,10 @@ def _run_online(
                 stored_next_state,
                 was_corrupted,
             ) = corrupt_online_transition(
-                corruption_state,
+                raw_state,
                 executed_action,
                 reward,
-                corruption_next_state,
+                raw_next_state,
                 config,
                 oracle,
                 rng,
@@ -2542,23 +2508,14 @@ def _run_online(
                 action_std,
                 selected_target=selected_target,
                 selection_already_sampled=True,
+                normalizer_std=normalizer.std,
             )
         corrupted_online += int(was_corrupted)
-        comparison_state = (
-            normalizer.transform(raw_state)
-            if normalized_replay_poisoning
-            else raw_state
-        )
-        comparison_next_state = (
-            normalizer.transform(raw_next_state)
-            if normalized_replay_poisoning
-            else raw_next_state
-        )
         actually_changed = bool(
-            not np.array_equal(stored_state, comparison_state)
+            not np.array_equal(stored_state, raw_state)
             or not np.array_equal(stored_action, executed_action)
             or stored_reward != float(reward)
-            or not np.array_equal(stored_next_state, comparison_next_state)
+            or not np.array_equal(stored_next_state, raw_next_state)
         )
         changed_online += int(was_corrupted and actually_changed)
         if was_corrupted and selected_target == "actions":
@@ -2579,12 +2536,9 @@ def _run_online(
         replay_mismatch += int(
             not np.allclose(stored_action, executed_action, rtol=1e-6, atol=1e-6)
         )
-        replay_state, replay_next_state = _replay_transition_coordinates(
-            stored_state,
-            stored_next_state,
-            normalizer,
-            normalized_replay_poisoning,
-        )
+        # Corruption returns raw transitions; learner normalization happens once.
+        replay_state = normalizer.transform(stored_state)
+        replay_next_state = normalizer.transform(stored_next_state)
         if is_calql:
             completed = calql_trajectory.append(
                 observation=replay_state,

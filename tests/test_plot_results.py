@@ -6,7 +6,9 @@ import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
 
 from plot_results import (
@@ -359,6 +361,38 @@ class AggregateResultsTest(unittest.TestCase):
             self.assertNotIn("calql_source_aligned", svg)
             self.assertNotIn("post-replay", svg)
             self.assertNotIn("unit-scale", svg)
+
+    def test_three_seed_bands_and_single_seed_line(self):
+        from matplotlib.axes import Axes
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for algorithm, scores in (
+                ("rpex", (60.0, 80.0, 100.0)),
+                ("riql_naive", (20.0, 40.0, 60.0)),
+                ("wsrl", (70.0,)),
+            ):
+                for seed, score in enumerate(scores):
+                    self._make_run(root, algorithm, seed, score, 1.0)
+            with patch.object(
+                Axes, "fill_between", autospec=True, side_effect=Axes.fill_between
+            ) as fill:
+                output = plot_aggregate(root, root / "comparison.png")
+            curves = pd.read_csv(output.with_suffix(".csv"))
+
+        self.assertEqual(fill.call_count, 2)
+        for call in fill.call_args_list:
+            self.assertTrue(call.kwargs["where"].all())
+            self.assertIn("color", call.kwargs)
+        for algorithm, expected_mean in (("rpex", 80.0), ("riql_naive", 40.0)):
+            curve = curves[curves["algorithm"] == algorithm]
+            np.testing.assert_allclose(curve["mean"], [expected_mean - 1, expected_mean])
+            np.testing.assert_allclose(curve["std"], np.std([20, 40, 60], ddof=0))
+            self.assertEqual(curve["count"].tolist(), [3, 3])
+        single = curves[curves["algorithm"] == "wsrl"]
+        self.assertEqual(single["mean"].tolist(), [69.0, 70.0])
+        self.assertEqual(single["std"].tolist(), [0.0, 0.0])
+        self.assertEqual(single["count"].tolist(), [1, 1])
 
     def test_historical_result_algorithm_names_load_as_canonical(self):
         with tempfile.TemporaryDirectory() as directory:

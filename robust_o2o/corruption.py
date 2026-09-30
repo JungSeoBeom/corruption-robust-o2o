@@ -991,6 +991,7 @@ class OnlineCorruptionAudit:
             "corruption_scale_statistics": getattr(
                 config, "_corruption_scale_statistics", None
             ),
+            "online_corruption_coordinate_system": config.online_corruption_coordinate_system,
             **reward_corruption_metadata(config, "online"),
         }
 
@@ -1528,6 +1529,7 @@ def corrupt_online_transition(
     action_std: np.ndarray,
     selected_target: Optional[str] = None,
     selection_already_sampled: bool = False,
+    normalizer_std: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]:
     """Poison one replay transition after a clean environment interaction.
 
@@ -1613,7 +1615,8 @@ def corrupt_online_transition(
         "dynamics": next_state,
     }[target]
     std = online_corruption_scale(
-        target, config, state_std=state_std, action_std=action_std
+        target, config, state_std=state_std, action_std=action_std,
+        normalizer_std=normalizer_std,
     )
     if config.corruption == "random":
         attacked = original + rng.uniform(
@@ -1666,12 +1669,20 @@ def online_corruption_scale(
     *,
     state_std: np.ndarray,
     action_std: np.ndarray,
+    normalizer_std: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     if target == "actions":
         return action_std
     if target not in ("observations", "dynamics"):
         raise ValueError(f"No vector scale is defined for target {target!r}")
     if config.online_corruption_scale_profile == "rpex_official_code":
+        if config.online_corruption_coordinate_system == "normalized_random_state_units_v1":
+            if normalizer_std is None:
+                raise ValueError("normalized online random state noise requires normalizer_std")
+            scale = np.asarray(normalizer_std, dtype=np.float32)
+            if scale.shape != state_std.shape or not np.all(np.isfinite(scale)) or np.any(scale <= 0):
+                raise ValueError("normalizer_std must be a finite positive state-size vector")
+            return scale
         return np.ones_like(state_std, dtype=np.float32)
     if config.online_corruption_scale_profile == "dataset_std_scaled_extension":
         return state_std
@@ -1691,6 +1702,7 @@ def corrupt_pre_action_value(
     rng: np.random.RandomState | np.random.Generator,
     state_std: np.ndarray,
     action_std: np.ndarray,
+    normalizer_std: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     if config.is_research_suite:
         raise RuntimeError(
@@ -1703,7 +1715,8 @@ def corrupt_pre_action_value(
     if target not in ("observations", "actions"):
         return original.copy()
     std = online_corruption_scale(
-        target, config, state_std=state_std, action_std=action_std
+        target, config, state_std=state_std, action_std=action_std,
+        normalizer_std=normalizer_std,
     )
     if config.corruption == "random":
         return (

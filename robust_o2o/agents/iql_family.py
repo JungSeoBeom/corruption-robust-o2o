@@ -325,6 +325,11 @@ class IQLFamilyAgent(BaseAgent):
         rewards = batch["rewards"].reshape(-1)
         next_states = batch["next_observations"]
         terminals = batch["terminals"].reshape(-1)
+        max_grad_norm = (
+            self.config.max_grad_norm
+            if self.config.max_grad_norm is not None
+            else float("inf")
+        )
 
         with torch.no_grad():
             target_values_all = self.target_critic(states, actions)
@@ -342,7 +347,7 @@ class IQLFamilyAgent(BaseAgent):
         self.value_optimizer.zero_grad(set_to_none=True)
         value_loss.backward()
         value_grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.value.parameters(), float("inf")
+            self.value.parameters(), max_grad_norm
         )
         self.value_optimizer.step()
 
@@ -358,7 +363,7 @@ class IQLFamilyAgent(BaseAgent):
         self.q_optimizer.zero_grad(set_to_none=True)
         q_loss.backward()
         critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.critic.parameters(), float("inf")
+            self.critic.parameters(), max_grad_norm
         )
         self.q_optimizer.step()
         soft_update(
@@ -397,7 +402,7 @@ class IQLFamilyAgent(BaseAgent):
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.actor.parameters(), float("inf")
+            self.actor.parameters(), max_grad_norm
         )
         self.actor_optimizer.step()
         if self.actor_scheduler is not None and not self.online_phase:

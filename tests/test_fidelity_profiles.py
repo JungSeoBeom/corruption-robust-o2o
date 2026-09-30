@@ -333,6 +333,7 @@ class FidelityProfileTest(unittest.TestCase):
     def test_online_corruption_scale_profiles(self):
         state_std = np.asarray([2.0, 4.0, 8.0], dtype=np.float32)
         action_std = np.asarray([0.25, 0.5], dtype=np.float32)
+        normalizer_std = np.asarray([3.0, 5.0, 9.0], dtype=np.float32)
         official = ExperimentConfig(
             "rpex",
             "hopper-medium-replay-v2",
@@ -343,17 +344,19 @@ class FidelityProfileTest(unittest.TestCase):
         self.assertTrue(
             np.array_equal(
                 online_corruption_scale(
-                    "observations", official, state_std=state_std, action_std=action_std
+                    "observations", official, state_std=state_std, action_std=action_std,
+                    normalizer_std=normalizer_std,
                 ),
-                np.ones_like(state_std),
+                normalizer_std,
             )
         )
         self.assertTrue(
             np.array_equal(
                 online_corruption_scale(
-                    "dynamics", official, state_std=state_std, action_std=action_std
+                    "dynamics", official, state_std=state_std, action_std=action_std,
+                    normalizer_std=normalizer_std,
                 ),
-                np.ones_like(state_std),
+                normalizer_std,
             )
         )
         self.assertTrue(
@@ -970,6 +973,11 @@ class FidelityProfileTest(unittest.TestCase):
         )
         self.assertEqual(aggregation_signature(first), aggregation_signature(second))
         second["selected_transition_count"] = 17
+        second["selected_transition_fraction"] = 0.31
+        second["actual_changed_transition_count"] = 16
+        second["actual_changed_transition_fraction"] = 0.29
+        second["offline_corruption_artifact_cache_key"] = "seed-specific-key"
+        second["offline_corruption_artifact_path"] = "/workspace/cache/seed99.npz"
         second["selected_transition_hash"] = "seed-specific-mask"
         second["corruption_value_hash"] = "seed-specific-values"
         second["corruption_artifact_hash"] = "seed-specific-final-artifact"
@@ -1006,6 +1014,10 @@ class FidelityProfileTest(unittest.TestCase):
 
         for key, value in (
             ("online_corruption_scale_profile", "rpex_official_code"),
+            ("corruption_rate", {"offline": 0.9, "online": 0.9}),
+            ("corruption_range", 123.0),
+            ("dataset_sha256", "different-dataset"),
+            ("corruption_rng_implementation", "different-rng"),
             ("adversarial_attack_profile", "experimental_sign_pgd"),
             ("wsrl_entropy_profile", "legacy_zero"),
             ("run_purpose", "final_benchmark"),

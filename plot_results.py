@@ -13,7 +13,7 @@ from robust_o2o.fidelity import (
     HISTORICAL_RESULT_ALGORITHM_ALIASES,
     canonical_json_sha256,
 )
-from robust_o2o.manifest import aggregation_signature
+from robust_o2o.manifest import aggregation_signature, comparison_condition
 
 
 _PLOT_ALGORITHM_LABELS = {
@@ -26,6 +26,9 @@ _PLOT_ALGORITHM_LABELS = {
     "wsrl": "WSRL",
     "ro2o": "RO2O",
     "pessimistic_q_ensemble": "Pessimistic Q-Ensemble",
+    "care_o2o": "CARE-O2O",
+    "arw_o2o": "ARW-O2O",
+    "rg_o2o": "RG-O2O",
 }
 
 
@@ -300,6 +303,10 @@ def _load_runs(root: Path):
                 "repository_commit",
                 "repository_dirty",
                 "repository_status_sha256",
+                "repository_code_sha256",
+                "repository_diff_sha256",
+                "online_corruption_coordinate_system",
+                "online_corruption_scale_profile",
                 "suite_profile",
                 "run_purpose",
                 "condition_status",
@@ -544,6 +551,9 @@ def _load_runs(root: Path):
             "wsrl_entropy_profile", "legacy_unknown"
         )
         frame["aggregation_signature"] = aggregation_signature(manifest)
+        condition = comparison_condition(manifest, config)
+        frame["comparison_condition_signature"] = canonical_json_sha256(condition)
+        frame["comparison_condition_json"] = json.dumps(condition, sort_keys=True)
         frame["resolved_algorithm_profile"] = manifest.get(
             "algorithm_profile",
             config.get("resolved_algorithm_profile", "unknown_legacy_profile"),
@@ -812,6 +822,45 @@ def _validate_score_contract(frame, context: str) -> None:
                 f"Mixed {column} values cannot be aggregated in {context}: "
                 f"{values!r}"
             )
+    if "comparison_condition_signature" in frame:
+        for _, group in frame.groupby(["env_name", "corruption", "corruption_target"], dropna=False):
+            if group["comparison_condition_signature"].nunique(dropna=False) > 1:
+                conditions = [json.loads(value) for value in group["comparison_condition_json"].unique()]
+                fields = sorted({key for value in conditions for key in value})
+                differing = [key for key in fields if len({json.dumps(value.get(key), sort_keys=True) for value in conditions}) > 1]
+                raise RuntimeError(
+                    f"Mixed experimental conditions across algorithms in {context}: "
+                    + ", ".join(differing)
+                    + ". Select runs with the same corruption, dataset, and evaluation/budget contract."
+                )
+
+
+def select_latest_comparable_records(records, reference_algorithm="rpex"):
+    """Select one shared condition before selecting each method's latest seeds.
+
+    Input records must already be filtered to one task/target and usable status.
+    Return excluded records too, so notebooks can show what was omitted.
+    """
+    if not records:
+        return [], []
+    references = [row for row in records if row["algorithm"] == reference_algorithm]
+    anchor = max(references or records, key=lambda row: row["started_at"])
+    signature = anchor["comparison_condition_signature"]
+    compatible = [row for row in records if row["comparison_condition_signature"] == signature]
+    selected = []
+    for algorithm in dict.fromkeys(row["algorithm"] for row in compatible):
+        runs = [row for row in compatible if row["algorithm"] == algorithm]
+        newest = max(runs, key=lambda row: row["started_at"])["aggregation_signature"]
+        by_seed = {}
+        for row in runs:
+            if row["aggregation_signature"] != newest:
+                continue
+            seed = (row["learner_seed"], row["corruption_seed"])
+            if seed not in by_seed or row["started_at"] > by_seed[seed]["started_at"]:
+                by_seed[seed] = row
+        selected.extend(by_seed.values())
+    selected_paths = {str(row["run_dir"]) for row in selected}
+    return selected, [row for row in records if str(row["run_dir"]) not in selected_paths]
 
 
 def write_final_score_summary(
@@ -1058,13 +1107,17 @@ def plot_aggregate(
             summary[key] = value
         summary_frames.append(summary)
         label = _plot_algorithm_label(group[0])
-        axis.plot(summary[x_column], summary["mean"], label=label)
-        axis.fill_between(
-            summary[x_column],
-            summary["mean"] - summary["std"],
-            summary["mean"] + summary["std"],
-            alpha=0.15,
-        )
+        line, = axis.plot(summary[x_column], summary["mean"], label=label)
+        multiple_seeds = summary["count"] > 1
+        if multiple_seeds.any():
+            axis.fill_between(
+                summary[x_column],
+                summary["mean"] - summary["std"],
+                summary["mean"] + summary["std"],
+                where=multiple_seeds,
+                color=line.get_color(),
+                alpha=0.15,
+            )
     if not summary_frames:
         axis.text(
             0.5,
