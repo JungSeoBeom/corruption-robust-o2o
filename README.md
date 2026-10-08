@@ -121,29 +121,59 @@ doing so would change the experimental MDP rather than merely modernize syntax.
 
 ## Corruption settings
 
-`--corruption` selects the corruption mechanism:
+`--corruption-profile riql_rpex_code` is the default shared corruption
+contract for every algorithm. It is independent of the learner's
+`--implementation-profile`: changing the learner does not change the attack
+recipe. The contract is anchored to the pinned RIQL/RPEX source code and is
+recorded as `riql_rpex_code_v1` with attack implementation
+`corruption_v9_source_contract`. The selected Gymnasium v4 training environment
+and D4RL-v2 dataset protocol are unchanged.
+
+The corruption source anchors are [RIQL `cc07d81`](https://github.com/YangRui2015/RIQL/tree/cc07d81201e4cd44415560523fcd719f57bbf12c)
+and [RPEX `35da71e`](https://github.com/felix-thu/RPEX/tree/35da71ee5151b6179d21b9a2b4ce1b6408aedd04).
+
+`--corruption` selects the mechanism:
 
 - `clean`: no corruption; the target is automatically `none`.
-- `random`: random RPEX-style data corruption.
-- `adversarial`: adversarial RPEX-style data corruption.
+- `random`: uniform RIQL/RPEX data corruption.
+- `adversarial`: EDAC-based RIQL/RPEX data corruption, or its reward rule.
 
-For a non-clean run, `--corruption-target` accepts `observations`, `actions`,
-`rewards`, `dynamics`, or `mixed`. Mixed corruption allocates examples across
-the four targets in that order. Ratios must be non-negative and sum to one:
+Source corruption accepts one non-clean target: `observations`, `actions`,
+`rewards`, or `dynamics`. The pinned public code does not define a mixed-target
+contract. Partitioned mixed corruption and dataset-standard-deviation online
+noise remain explicit historical extensions through
+`--corruption-profile legacy_extension`; they are not reported as source
+settings. For partitioned mixed corruption, ratios are ordered as observation,
+action, reward, dynamics, must be non-negative, and must sum to one:
 
 ```bash
+--corruption-profile legacy_extension \
 --corruption-target mixed --mixed-ratios 0.1 0.2 0.3 0.4
+```
+
+The experimental online dataset-std scale likewise requires both options:
+
+```bash
+--corruption-profile legacy_extension \
+--online-corruption-scale-profile dataset_std_scaled_extension
 ```
 
 The main severity controls are `--offline-corruption-rate` (default `0.3`),
 `--online-corruption-rate` (default `0.5`), and `--corruption-range` (default
-`1.0`).
+`1.0`, denoted ε). Source mask/noise draws use a private NumPy `RandomState`
+MT19937 stream seeded by `corruption_seed`, which defaults to the experiment
+seed. The stream preserves the source draw mapping without consuming learner
+NumPy RNG.
 
-Random reward corruption **replaces** selected rewards with `Uniform[-30ε, 30ε]`;
-it does not add that noise to the clean reward. Online `official_code_reference`
-retains the upstream exception `Uniform[-30, 30]` independent of ε. At the
-default ε=1 these recipes agree. Cal-QL MC returns use the post-corruption reward
-sequence and stop at episode boundaries; evaluation returns remain clean.
+Offline vector corruption uses each attacked field's clean offline population
+standard deviation: random corruption adds `Uniform[-ε, ε] × σ`. Random reward
+corruption **replaces** selected offline rewards with `Uniform[-30ε, 30ε]`.
+Online random observation/dynamics noise has unit scale in normalized state
+coordinates; online action noise uses the clean offline action standard
+deviation. Source online random reward replacement is `Uniform[-30, 30]`
+independent of ε, preserving the public code's exception even when ε≠1.
+Cal-QL MC returns use the post-corruption reward sequence and stop at episode
+boundaries; evaluation returns remain clean.
 
 Adversarial corruption of observations, actions, or dynamics also needs the
 environment-specific EDAC attacker checkpoint. In the original three-folder
@@ -162,11 +192,6 @@ Reward-only adversarial corruption does not load an attacker checkpoint.
 
 ## Five-baseline research benchmark contract
 
-Experimental **CARE-O2O / ARW-O2O / RG-O2O** implementations from the supplied
-September 2026 working notes are documented in [the candidate guide](docs/cro2o-candidates.md).
-They are not added to the verified five-baseline suite. Use explicit
-`--algorithms care_o2o arw_o2o rg_o2o` with the common-budget launcher.
-
 The `research_benchmark` suite contains exactly `rpex`, `riql_naive`, `wsrl`,
 `cal_ql`, and the canonical `pessimistic_q_ensemble` name. Its source anchors
 are [RPEX/RIQL `35da71e`](https://github.com/felix-thu/RPEX/tree/35da71ee5151b6179d21b9a2b4ce1b6408aedd04),
@@ -177,41 +202,47 @@ These are source-aligned PyTorch/runtime ports, not claims of bitwise paper
 score reproduction. Cal-QL is a locomotion adaptation and PQE ports the public
 v0 recipe to D4RL-v2.
 
-The common interaction contract is:
+The default source interaction contract is:
 
 1. Keep the policy/expansion proposal unchanged for the method's internal Q,
    IPW, and log-probability calculations.
-2. Require that proposal to be finite, clip a copy to the environment's action
-   bounds, and pass only that executed action to `env.step`.
-3. Copy the resulting clean transition, poison only the replay copy, and choose
-   the next real action from the environment's clean next observation.
+2. Require that proposal to be finite and pass it to `env.step` with
+   `action_execution_profile=official_algorithm_behavior`, preserving the
+   public code's action handling. The runner adds no action-space clipping;
+   bounded policies and the selected simulator may enforce their own bounds.
+3. Copy the resulting clean transition and apply corruption to the replay copy
+   after the environment step. Choose the next real action from the
+   environment's clean next observation.
 
-Action poisoning is label poisoning: an out-of-range replay action is retained
-for critic training and is never sent back to the simulator. Logs separately
-record proposal, executed-environment, and poisoned-replay action OOB rates.
-NaN/Inf actions fail explicitly; they are not repaired with `nan_to_num`.
+Action poisoning changes the replay label; the poisoned action is retained
+for critic training and is never sent back to the simulator. Source action
+noise is added to the original finite policy proposal, including a proposal
+outside the declared action-space range. Logs separately record proposal,
+environment-call, and poisoned-replay action OOB rates. NaN/Inf actions fail
+explicitly. The application-clipped action path remains available only under
+an explicit `legacy_extension` corruption profile.
 
 Offline corruption is generated in raw dataset coordinates before learner
-normalization. Online replay corruption also starts in raw transition
-coordinates, then the learner normalizer is applied exactly once. Dataset-std
-scales are frozen from the clean offline artifact (the source and actual
-population standard deviations are serialized). For **random** online
-observation/dynamics corruption, `rpex_official_code` uses unit noise in the
-normalized observation coordinates, matching the wrapped upstream environment.
-In raw coordinates this means multiplying the noise by the fitted learner
-normalizer's standard deviation before the single normalization pass. With
-normalization disabled it retains raw unit noise. Adversarial EDAC inputs and
-the `dataset_std_scaled_extension` recipe retain their raw-coordinate semantics.
-Mixed corruption first
-selects a transition and then assigns exactly one field. Reward-only
-adversarial mixed runs do not instantiate EDAC.
+normalization. Source state normalization is fitted to the concatenated
+corrupted offline observations and next observations; its denominator is
+`population_std + 1e-3`. Online source attacks operate in the same normalized
+state coordinates as the wrapped upstream environment. Random state noise is
+therefore `Uniform[-ε, ε]` in that space. The runner maps it back with the
+actual normalization denominator before a single learner normalization pass.
+With normalization disabled, online state noise uses raw unit scale.
+Adversarial state inputs and perturbations likewise use source online
+coordinates; online action scales remain the offline action standard deviation.
+The source coordinate field is `normalized_source_state_units_v2` when active.
+The optional legacy dataset-std extension retains its separately recorded
+raw-coordinate recipe.
 
-Revision `fix main 3` records this correction as
-`online_corruption_coordinate_system=normalized_random_state_units_v1`.
-Historical runs without that field used raw unit noise and must not be merged
-with corrected random state/dynamics runs. Old checkpoints can initialize a
-new run; exact resume across this coordinate change is rejected. Offline
-corruption caches are unchanged. IQL-family `--max-grad-norm` now clips actor,
+The earlier `fix main 3` correction remains identifiable as
+`normalized_random_state_units_v1` for historical extension runs. The new
+source profile additionally changes mask RNG, normalization, action handling,
+and adversarial details. Source-version cache keys and exact-resume checks
+prevent those histories from being silently reused or pooled with the new
+contract. Existing manifests, caches, and checkpoints are preserved; compatible
+weights can initialize a new run. IQL-family `--max-grad-norm` clips actor,
 critic and value gradients when explicitly set; its default remains disabled.
 
 Comparison plots and final-score tables reject different corruption recipes,
@@ -224,36 +255,36 @@ It never falls back to a different corruption just to fill a missing curve.
 Repository provenance includes source-content and tracked-diff SHA256 values,
 so different dirty edits with the same `git status` are distinguishable.
 
-The EDAC objective transforms raw attacked states with preprocessing declared
-by the checkpoint. The supplied pinned EDAC payloads do not contain such
-metadata, so the runner uses identity preprocessing and records it as
-`checkpoint_metadata_missing_identity_unverified`; it does not substitute the
-learner normalizer. Attack version
-`corruption_v8_raw_coordinates_private_rng` retains the source Adam optimizer
-recreation, 100 offline/2 online steps, and source step sizes. The research
-adaptation uses resumable phase-private Torch RNGs and applies standard deviation
-once when mapping a dimensionless perturbation to its declared budget. The
-`official_code_reference` diagnostic retains the upstream fresh-generator and
-double-std quirks, so the research attack is not labeled exact RNG parity.
-Selected-transition rates and actual-value-change rates are both stored, and a
-zero selection rate leaves the artifact byte-for-byte unchanged. Reward
-replacement at epsilon zero remains replacement, not a clean shortcut.
+Source EDAC objectives consume the states supplied by the source attack
+pipeline: raw offline states and normalized online states when state
+normalization is active. The pinned EDAC payload has no preprocessing metadata;
+identity oracle preprocessing is recorded explicitly, and incompatible
+checkpoint preprocessing is rejected for the source profile. Legacy extensions
+continue to use their declared raw-state preprocessing.
 
-Reliability revision (after `15d44da`): research vector attacks use
-`phase_private_torch_v1`: offline seed = `corruption_seed`, online seed =
-`(corruption_seed + 0x4F324F) % 2**63`. Both online perturbation initialization
-and the stochastic EDAC dynamics policy use that persistent online stream.
-Offline cache hit/miss/regeneration therefore cannot change the online attack
-sequence. The RNG semantics field changes the research vector-attack cache
-key and manifest identity; old artifacts remain untouched and are not reused
-under the new key. The offline draw mapping itself is unchanged. Official-code
-diagnostic RNG quirks remain unchanged.
+Source adversarial attacks preserve the public code's double-standard-deviation
+initialization: the sampled optimization parameter is scaled by σ, then the
+effective perturbation is multiplied by σ again. They recreate Adam at every
+step and use 100 steps with base step size `0.01` offline, and 2 steps with base
+step size `0.1` online; the optimizer rate is scaled by ε. Online perturbation
+initialization uses a fresh default Torch generator for each source attack.
+The stochastic EDAC actor used by dynamics objectives has resumable,
+phase-private RNG state so corruption does not consume the learner's Torch
+stream and offline cache regeneration cannot shift the online actor stream.
+This schema is recorded as `rpex_code_init_phase_private_actor_v1`.
 
-Checkpoints record `attack_rng_schema`; online checkpoints store both private
-states. Offline checkpoints may omit them because the unused online state is
-deterministically reconstructible. Old single-stream research adversarial
-checkpoints cannot exact-resume; compatible weights can still initialize a new
-run. PQE also records `pqe_numerics_version` as
+The port fixes two upstream offline dynamics execution errors (an actor tuple
+used as an action and an undefined standard-deviation name) while preserving
+the intended stochastic objective. These runtime fixes, private actor RNGs,
+and the user-selected v4 environment mean the port does not claim identical
+upstream trajectories or benchmark scores. Selected-transition rates and
+actual-value-change rates are both stored; a zero selection rate leaves the
+artifact unchanged. Reward replacement at ε=0 remains replacement.
+
+Checkpoints record the corruption profile, semantic version, coordinate field,
+and `attack_rng_schema`, with private actor states where required. Exact resume
+across incompatible contracts is rejected; compatible weights can initialize
+new runs. PQE also records `pqe_numerics_version` as
 `centered_moments_strict_priorities_v1`: centered moment variance and a positive floor
 before square root prevent cancellation/NaN gradients without detaching actors
 or changing the pre-tanh Gaussian. Invalid priorities/weights now raise rather
@@ -262,12 +293,12 @@ initial online priority formula are unchanged. MC-return `-Inf` sentinels are
 not priority errors. Old PQE checkpoints likewise support initialization, not
 exact resume across this numerical revision.
 
-Research vector-adversarial and PQE trajectories can change and must be grouped
-by their recorded revisions, not silently merged with old runs. This does not
-invalidate all historical clean/random results for other methods. No historical
-result manifests, caches, or checkpoints are migrated in place. Regression
-tests check local reproducibility and actual backward updates, not long-run
-MuJoCo benchmark scores or paper reproduction.
+Corrupted and PQE trajectories can change and must be grouped by their recorded
+revisions, rather than silently merged with old runs. Historical results remain
+usable under their recorded settings; the new source profile does not relabel
+them. No historical result manifests, caches, or checkpoints are migrated in
+place. Regression tests check local reproducibility and actual backward
+updates, not long-run MuJoCo benchmark scores or paper reproduction.
 
 Primary evaluation is clean deterministic deployment return for all five
 methods. RIQL uses its Gaussian mean; WSRL and Cal-QL use the tanh of their
@@ -275,8 +306,15 @@ pre-tanh mean; PQE uses the tanh of the five-member pre-tanh mean average; RPEX
 deterministically chooses between nominal offline/online actions with its
 existing Q+IPW logits. Method-faithful RPEX epsilon switching remains an
 explicit diagnostic and is never selected as the research primary or as a
-best-of-two score. Use `--evaluation-seed-role tuning` for tuning-only runs;
-only the default `final` role is benchmark/main-table eligible.
+best-of-two score. `evaluation_mode` controls how an already trained policy
+chooses actions during clean evaluation; it does not control training or the
+corruption target. `--evaluation-mode deterministic` uses the policy's mean or
+its deterministic expansion selector; `method_faithful` invokes the method's
+native evaluation behavior, including RPEX's stochastic epsilon switching;
+`both` logs both measurements and retains deterministic return as primary.
+The research benchmark requires `deterministic`. Use
+`--evaluation-seed-role tuning` for tuning-only runs; only the default `final`
+role is benchmark/main-table eligible.
 
 Native WSRL uses 10 critics, target subsampling of 2 with replacement,
 LayerNorm, an online-only replay after warmup, and one 1024-sample update split
@@ -300,7 +338,8 @@ Run the five methods for one condition with:
 python run_all_algorithms.py \
   --env-name hopper-medium-replay-v2 \
   --corruption random \
-  --corruption-target mixed \
+  --corruption-target observations \
+  --corruption-profile riql_rpex_code \
   --suite-profile research_benchmark \
   --seeds 0 1 2 \
   --stage both \
@@ -349,6 +388,7 @@ python run_experiment.py \
   --algorithm riql_naive \
   --env-name halfcheetah-medium-replay-v2 \
   --corruption random \
+  --corruption-profile legacy_extension \
   --corruption-target mixed \
   --mixed-ratios 0.1 0.2 0.3 0.4 \
   --stage both \
@@ -460,6 +500,7 @@ For a fixed random mixed condition:
 python run_all_algorithms.py \
   --env-name walker2d-medium-replay-v2 \
   --corruption random \
+  --corruption-profile legacy_extension \
   --corruption-target mixed \
   --mixed-ratios 0.1 0.2 0.3 0.4 \
   --seeds 0 1 2 \
@@ -483,6 +524,7 @@ python run_matrix.py \
     rpex riql_pex riql_naive uwmsg pex cal_ql wsrl ro2o pessimistic_q_ensemble \
   --envs halfcheetah-medium-replay-v2,hopper-medium-replay-v2,walker2d-medium-replay-v2 \
   --corruptions clean,random,adversarial \
+  --corruption-profile legacy_extension \
   --targets observations,actions,rewards,dynamics,mixed \
   --corruption-ranges 1.0 \
   --seeds 0,1,2 \

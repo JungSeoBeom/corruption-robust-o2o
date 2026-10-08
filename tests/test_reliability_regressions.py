@@ -53,6 +53,7 @@ def oracle_factory(tmp_path):
 def attack_config(target):
     config = ExperimentConfig("rpex", "hopper-medium-replay-v2",
                               corruption="adversarial", corruption_target=target,
+                              corruption_profile="legacy_extension",
                               offline_corruption_rate=1.0, online_corruption_rate=1.0)
     config.implementation_profile = "research_benchmark"
     config.offline_attack_steps = config.online_attack_steps = 2
@@ -400,10 +401,12 @@ def test_numerics_and_rng_versions_split_manifest_groups():
     old = build_experiment_manifest({k: v for k, v in resolved.items() if k != "pqe_numerics_version"})
     assert "pqe_numerics_version" not in old
     assert aggregation_signature(current) != aggregation_signature(old)
+    previous = None
     for version in ("persistent_private_torch_generator", ATTACK_RNG_SCHEMA):
         resolved["offline_corruption"] = {"attack_rng_semantics": version}
         manifest = build_experiment_manifest(resolved)
         if version == ATTACK_RNG_SCHEMA:
+            assert previous is not None
             assert aggregation_signature(manifest) != aggregation_signature(previous)
         previous = manifest
 

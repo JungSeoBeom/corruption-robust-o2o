@@ -278,8 +278,14 @@ class ReferenceProfileTest(unittest.TestCase):
         self.assertEqual(agent.temperature_updates, 1)
 
     def test_role_seed_derivation_is_stable_and_distinct(self):
-        first = ExperimentConfig("rpex", "hopper-medium-replay-v2", seed=7)
-        second = ExperimentConfig("rpex", "hopper-medium-replay-v2", seed=7)
+        first = ExperimentConfig(
+            "rpex", "hopper-medium-replay-v2", seed=7,
+            corruption_profile="legacy_extension",
+        )
+        second = ExperimentConfig(
+            "rpex", "hopper-medium-replay-v2", seed=7,
+            corruption_profile="legacy_extension",
+        )
         values = (
             first.learner_seed,
             first.corruption_seed,
@@ -295,6 +301,18 @@ class ReferenceProfileTest(unittest.TestCase):
             second.eval_seed,
         ))
         self.assertEqual(len(set(values)), len(values))
+
+    def test_source_corruption_seed_matches_base_seed_with_distinct_other_roles(self):
+        config = ExperimentConfig("rpex", "hopper-medium-replay-v2", seed=7)
+        self.assertEqual(config.corruption_seed, config.seed)
+        self.assertEqual(config.learner_seed, config.seed)
+        roles = (
+            config.learner_seed,
+            config.replay_seed,
+            config.train_env_seed,
+            config.eval_seed,
+        )
+        self.assertEqual(len(set(roles)), len(roles))
 
     def test_learner_initialization_ignores_corruption_seed(self):
         configs = [

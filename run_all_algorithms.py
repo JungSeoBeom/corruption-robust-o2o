@@ -39,6 +39,9 @@ from robust_o2o.logging_utils import format_duration, format_timestamp
 from robust_o2o.launcher_utils import (
     CHILD_IDENTITY_OPTIONS,
     REMOVED_LAUNCH_OPTIONS,
+    CORRUPTION_PROFILES,
+    resolved_corruption_scale_profile,
+    validate_corruption_launch_settings,
     canonical_algorithms,
     flatten_cli_values,
     passthrough_conflicts,
@@ -57,9 +60,6 @@ ALGORITHM_DISPLAY_NAMES = {
     "wsrl": "WSRL",
     "ro2o": "RO2O",
     "pessimistic_q_ensemble": "Pessimistic Q-Ensemble (D4RL-v2 port)",
-    "care_o2o": "CARE-O2O",
-    "arw_o2o": "ARW-O2O",
-    "rg_o2o": "RG-O2O",
 }
 
 
@@ -93,6 +93,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--env-name", required=True)
     parser.add_argument("--corruption", choices=CORRUPTION_MODES, required=True)
+    parser.add_argument(
+        "--corruption-profile", choices=CORRUPTION_PROFILES,
+        default="riql_rpex_code",
+    )
     parser.add_argument(
         "--corruption-target", choices=CORRUPTION_TARGETS, default="none"
     )
@@ -195,16 +199,11 @@ def _validate_args(
     removed = passthrough_conflicts(passthrough, REMOVED_LAUNCH_OPTIONS)
     if removed:
         parser.error("these options were removed: " + ", ".join(removed))
-    if args.online_corruption_scale_profile is None:
-        args.online_corruption_scale_profile = (
-            "rpex_official_code"
-            if args.suite_profile in (
-                "research_benchmark",
-                "method_fidelity",
-                "primary_research_benchmark",
-            )
-            else "dataset_std_scaled_extension"
-        )
+    validate_corruption_launch_settings(
+        parser,
+        args,
+        nonclean_targets=(args.corruption_target,) if args.corruption != "clean" else (),
+    )
     if args.corruption == "clean":
         args.corruption_target = "none"
     elif args.corruption_target == "none":
@@ -241,12 +240,7 @@ def commands(
     runs_dir: Path,
 ) -> Iterable[list[str]]:
     script = Path(__file__).resolve().parent / "run_experiment.py"
-    scale_profile = args.online_corruption_scale_profile or (
-        "rpex_official_code"
-        if args.suite_profile
-        in ("research_benchmark", "method_fidelity", "primary_research_benchmark")
-        else "dataset_std_scaled_extension"
-    )
+    scale_profile = resolved_corruption_scale_profile(args)
     for algorithm in args.algorithms:
         for seed in args.seeds:
             command = [
@@ -258,6 +252,8 @@ def commands(
                 args.env_name,
                 "--corruption",
                 args.corruption,
+                "--corruption-profile",
+                args.corruption_profile,
                 "--corruption-target",
                 args.corruption_target,
                 "--mixed-ratios",
@@ -387,6 +383,7 @@ def main() -> int:
         )
 
     print(f"COMPARISON_DIR: {comparison_dir}", flush=True)
+    print(f"CORRUPTION_PROFILE: {args.corruption_profile}", flush=True)
     for index, command in enumerate(generated_commands, start=1):
         print(f"[{index}/{len(generated_commands)}] {shlex.join(command)}", flush=True)
     if args.dry_run:
@@ -491,6 +488,7 @@ def main() -> int:
         "implementation_profile": args.implementation_profile or "auto",
         "suite_profile": args.suite_profile,
         "online_corruption_scale_profile": args.online_corruption_scale_profile,
+        "corruption_profile": args.corruption_profile,
         "environment": args.env_name,
         "corruption": args.corruption,
         "corruption_target": args.corruption_target,

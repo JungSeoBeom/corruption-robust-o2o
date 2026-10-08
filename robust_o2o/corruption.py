@@ -24,7 +24,7 @@ from .environment import Dataset, EXPECTED_LOCOMOTION_DIMS
 from .networks import VectorizedLinear
 
 
-ATTACK_IMPLEMENTATION_VERSION = "corruption_v8_raw_coordinates_private_rng"
+ATTACK_IMPLEMENTATION_VERSION = "corruption_v9_source_contract"
 ATTACK_RNG_SCHEMA = "phase_private_torch_v1"
 ATTACK_OBJECTIVE = "minimize_edac_ensemble_mean_q"
 CORRUPTION_APPLICATION_CONTRACT = "replay_transition_poisoning"
@@ -275,6 +275,7 @@ class AttackOracle:
         implementation_profile: str = "experimental_sign_pgd",
         *,
         record_trace: bool = False,
+        corruption_profile: Optional[str] = None,
         env_name: str | None = None,
         benchmark_profile: str = "official_code_reference",
     ):
@@ -295,8 +296,12 @@ class AttackOracle:
                 )
         self.implementation_profile = implementation_profile
         self.benchmark_profile = benchmark_profile
+        self.source_corruption = corruption_profile == "riql_rpex_code"
         self.preserve_upstream_attack_quirks = (
-            benchmark_profile == "official_code_reference"
+            self.source_corruption or benchmark_profile == "official_code_reference"
+        )
+        self.rng_schema = (
+            "rpex_code_init_phase_private_actor_v1" if self.source_corruption else ATTACK_RNG_SCHEMA
         )
         self.record_trace = record_trace
         self.attack_traces: list[Dict[str, Any]] = []
@@ -305,6 +310,11 @@ class AttackOracle:
         self.generator_device = torch.device("cpu")
         self.generator = torch.Generator()
         self.generator.manual_seed(int(seed))
+        # Upstream actor sampling never consumes the private initialization RNG.
+        # Isolate it from learner RNG while preserving later chunk initializers.
+        self.offline_actor_generator = torch.Generator().manual_seed(
+            (int(seed) ^ 0x5A17) % (2**63)
+        )
         # Keep the historical offline stream; phase separation is independent
         # of cache identity, algorithm, and the number of offline draws.
         self.online_generator = torch.Generator().manual_seed(
@@ -325,6 +335,11 @@ class AttackOracle:
         self.state_std = torch.as_tensor(
             state_std, dtype=torch.float32, device=device
         )
+        if self.source_corruption and (np.any(state_mean != 0) or np.any(state_std != 1)):
+            raise ValueError(
+                "RIQL/RPEX source attacks directly consume supplied states; "
+                "checkpoint-specific oracle normalization requires legacy_extension"
+            )
         preprocessing_digest = hashlib.sha256()
         preprocessing_digest.update(np.ascontiguousarray(state_mean).tobytes())
         preprocessing_digest.update(np.ascontiguousarray(state_std).tobytes())
@@ -363,31 +378,42 @@ class AttackOracle:
             parameter.requires_grad_(False)
 
     def rng_state_dict(self) -> Dict[str, Any] | torch.Tensor:
-        if self.preserve_upstream_attack_quirks:
+        if self.preserve_upstream_attack_quirks and not self.source_corruption:
             return self.generator.get_state()
-        return {
-            "schema": ATTACK_RNG_SCHEMA,
+        state = {
+            "schema": self.rng_schema,
             "offline": self.generator.get_state(),
             "online": self.online_generator.get_state(),
         }
+        if self.source_corruption:
+            state["offline_actor"] = self.offline_actor_generator.get_state()
+        return state
 
     def load_rng_state_dict(self, state: Any) -> None:
-        if self.preserve_upstream_attack_quirks:
+        if self.preserve_upstream_attack_quirks and not self.source_corruption:
             self.generator.set_state(state)
             return
-        if not isinstance(state, dict) or state.get("schema") != ATTACK_RNG_SCHEMA:
+        if not isinstance(state, dict) or state.get("schema") != self.rng_schema:
             raise ValueError(
                 "AttackOracle exact resume requires phase-private RNG schema; "
                 "legacy single-stream state cannot be migrated"
             )
-        # Validate both states before changing either live stream.
-        for phase in ("offline", "online"):
+        # Validate all states before changing any live stream.
+        phases = (
+            ("offline", "online", "offline_actor")
+            if self.source_corruption else ("offline", "online")
+        )
+        for phase in phases:
+            if phase not in state:
+                raise ValueError(f"AttackOracle RNG state is missing {phase}")
             torch.Generator().set_state(state[phase].cpu())
         self.generator.set_state(state["offline"].cpu())
         self.online_generator.set_state(state["online"].cpu())
+        if self.source_corruption:
+            self.offline_actor_generator.set_state(state["offline_actor"].cpu())
 
     def transform_states(self, states: torch.Tensor) -> torch.Tensor:
-        """Transform raw benchmark states into the frozen oracle coordinates."""
+        """Apply checkpoint preprocessing to the supplied attack coordinates."""
 
         return (states - self.state_mean) / self.state_std
 
@@ -412,17 +438,17 @@ class AttackOracle:
         std_tensor = torch.as_tensor(std, dtype=torch.float32, device=self.device)
         phase_generator = (
             self.online_generator
-            if online and not self.preserve_upstream_attack_quirks
+            if online and (self.source_corruption or not self.preserve_upstream_attack_quirks)
             else self.generator
         )
         if self.implementation_profile == "rpex_official_adam":
-            if self.record_trace and target == "dynamics" and online:
+            if self.record_trace and target == "dynamics" and (online or self.source_corruption):
                 raise ValueError(
                     "trajectory recording is unsupported for the stochastic "
                     "online dynamics objective"
                 )
-            # Exact-source diagnostics retain the upstream fresh online stream;
-            # research artifacts use persistent, phase-separated private streams.
+            # Source initialization retains the upstream fresh online generator.
+            # Actor draws use separate private streams to avoid learner coupling.
             generator = (
                 torch.Generator()
                 if online and self.preserve_upstream_attack_quirks
@@ -435,12 +461,18 @@ class AttackOracle:
             ).to(self.device)
             para = 2.0 * scale * (random_values - 0.5)
             if self.preserve_upstream_attack_quirks:
-                # Exact-source diagnostic only: upstream multiplies by std in
+                # Upstream multiplies by std in
                 # both the sampled parameter and the effective perturbation.
                 para = para * std_tensor
             initial_para = para.detach().cpu().numpy().astype(np.float32)
             first_post_objective: float | None = None
             last_post_objective: float | None = None
+            if self.source_corruption:
+                actor_generator = self.online_generator if online else self.offline_actor_generator
+            else:
+                actor_generator = (
+                    phase_generator if online and not self.preserve_upstream_attack_quirks else None
+                )
 
             def objective(current_para: torch.Tensor) -> torch.Tensor:
                 attacked = original_tensor + current_para * std_tensor
@@ -455,12 +487,8 @@ class AttackOracle:
                 if target == "dynamics":
                     attacked_actions = self.actor(
                         self.transform_states(attacked),
-                        deterministic=not online,
-                        generator=(
-                            phase_generator
-                            if online and not self.preserve_upstream_attack_quirks
-                            else None
-                        ),
+                        deterministic=not online and not self.source_corruption,
+                        generator=actor_generator,
                     )
                     return self.critic(
                         self.transform_states(attacked), attacked_actions
@@ -622,6 +650,7 @@ def make_attack_oracle(
         config.adversarial_attack_profile,
         env_name=config.env_name,
         benchmark_profile=config.implementation_profile,
+        corruption_profile=config.corruption_profile,
     )
 
 
@@ -665,14 +694,13 @@ def make_numpy_corruption_rng(
 ) -> np.random.RandomState | np.random.Generator:
     """Construct the corruption stream used to build a shared artifact.
 
-    Research-benchmark artifacts intentionally use one implementation across
-    every baseline. Legacy exact-code diagnostics retain RandomState so old
-    fixture checks remain isolated from the fair benchmark path.
+    Source corruption uses a private MT19937 stream for every learner, matching
+    the upstream mask/noise draw mapping without consuming learner NumPy RNG.
     """
 
     if (
-        config.implementation_profile == "official_code_reference"
-        and not config.is_research_suite
+        config.uses_source_corruption
+        or (config.implementation_profile == "official_code_reference" and not config.is_research_suite)
     ):
         return np.random.RandomState(int(config.corruption_seed))
     return np.random.default_rng(int(config.corruption_seed))
@@ -682,8 +710,8 @@ def corruption_rng_implementation(config: ExperimentConfig) -> str:
     return (
         "numpy.random.RandomState"
         if (
-            config.implementation_profile == "official_code_reference"
-            and not config.is_research_suite
+            config.uses_source_corruption
+            or (config.implementation_profile == "official_code_reference" and not config.is_research_suite)
         )
         else "numpy.random.Generator(PCG64)"
     )
@@ -743,6 +771,8 @@ def corruption_cache_fingerprint(
         "rng_implementation": corruption_rng_implementation(config),
         "mixed_ratios": list(config.mixed_ratios),
         "attack_implementation_version": ATTACK_IMPLEMENTATION_VERSION,
+        "corruption_profile": config.corruption_profile,
+        "corruption_semantics_version": config.corruption_semantics_version,
         "corruption_application_contract": CORRUPTION_APPLICATION_CONTRACT,
         "corruption_scale_statistics": corruption_scale_statistics(dataset),
         "source_commit": "35da71ee5151b6179d21b9a2b4ce1b6408aedd04",
@@ -792,7 +822,9 @@ def corruption_cache_fingerprint(
                     oracle, "preprocessing_sha256", "none_reward_rule"
                 ),
                 "attack_rng_semantics": (
-                    "upstream_fresh_online_generator_quirk"
+                    "rpex_code_init_phase_private_actor_v1"
+                    if bool(getattr(oracle, "source_corruption", False))
+                    else "upstream_fresh_online_generator_quirk"
                     if bool(
                         getattr(oracle, "preserve_upstream_attack_quirks", False)
                     )
@@ -852,7 +884,7 @@ def reward_corruption_metadata(
         bound = 30.0 * (
             1.0
             if phase == "online"
-            and config.implementation_profile == "official_code_reference"
+            and (config.uses_source_corruption or config.implementation_profile == "official_code_reference")
             else config.corruption_range
         )
         return {
@@ -908,7 +940,7 @@ def corrupt_online_reward_value(
         # reward branch, unlike its offline random reward corruption.
         scale = (
             1.0
-            if config.implementation_profile == "official_code_reference"
+            if config.uses_source_corruption or config.implementation_profile == "official_code_reference"
             else config.corruption_range
         )
         return float(rng.uniform(-1.0, 1.0) * 30.0 * scale)
@@ -976,6 +1008,8 @@ class OnlineCorruptionAudit:
             **self.state_dict(),
             "corruption_mode": config.corruption,
             "corruption_target": config.corruption_target,
+            "corruption_profile": config.corruption_profile,
+            "corruption_semantics_version": config.corruption_semantics_version,
             "offline_corruption_rate": config.offline_corruption_rate,
             "online_corruption_rate": config.online_corruption_rate,
             "corruption_range": config.corruption_range,
@@ -1530,6 +1564,7 @@ def corrupt_online_transition(
     selected_target: Optional[str] = None,
     selection_already_sampled: bool = False,
     normalizer_std: Optional[np.ndarray] = None,
+    normalizer_mean: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]:
     """Poison one replay transition after a clean environment interaction.
 
@@ -1540,15 +1575,17 @@ def corrupt_online_transition(
     """
 
     validate_adversarial_target(config)
+    if selected_target is None and not selection_already_sampled:
+        selected_target = sample_online_corruption_target(config, rng)
     if selected_target is None:
-        if selection_already_sampled:
-            # Legacy official-code diagnostics preserve RPEX's quirk where a
-            # non-selected random transition still consumes the candidate
-            # corruption draw.  The fair research path deliberately has no
-            # exact-RNG requirement and does not perform this ghost draw.
+        if selection_already_sampled or config.uses_source_corruption:
+            # Source code draws a candidate even when the mask rejects it.
+            # Preserve the same draw sequence for caller-sampled masks too.
             legacy_official_rng = (
-                config.implementation_profile == "official_code_reference"
-                and not config.is_research_suite
+                (config.uses_source_corruption or (
+                    config.implementation_profile == "official_code_reference"
+                    and not config.is_research_suite
+                ))
                 and config.corruption != "clean"
             )
             ghost_target = (
@@ -1580,8 +1617,6 @@ def corrupt_online_transition(
                 raw_next_state.copy(),
                 False,
             )
-        selected_target = sample_online_corruption_target(config, rng)
-    if selected_target is None:
         return (
             raw_state.copy(),
             action.copy(),
@@ -1627,10 +1662,25 @@ def corrupt_online_transition(
     else:
         if oracle is None:
             raise RuntimeError("An AttackOracle is required for adversarial corruption")
+        attack_original, attack_state, attack_std = original, state, std
+        normalized_oracle = config.uses_source_corruption and config.normalize_states
+        if normalized_oracle:
+            if normalizer_mean is None or normalizer_std is None:
+                raise ValueError("source online adversarial attacks require fitted normalizer mean/std")
+            mean = np.asarray(normalizer_mean, dtype=np.float32)
+            scale = np.asarray(normalizer_std, dtype=np.float32)
+            if (mean.shape != state.shape or scale.shape != state.shape
+                    or not np.all(np.isfinite(mean)) or not np.all(np.isfinite(scale))
+                    or np.any(scale <= 0)):
+                raise ValueError("invalid fitted normalizer for online adversarial attack")
+            attack_state = (state - mean) / scale
+            if target in ("observations", "dynamics"):
+                attack_original = (original - mean) / scale
+                attack_std = np.ones_like(scale)
         attacked = oracle.attack(
-            original[None, :],
-            std[None, :],
-            state[None, :],
+            attack_original[None, :],
+            attack_std[None, :],
+            attack_state[None, :],
             stored_action[None, :],
             target,
             config.corruption_range,
@@ -1638,6 +1688,8 @@ def corrupt_online_transition(
             max(config.online_attack_step_size, config.attack_min_step_size),
             online=True,
         )[0]
+        if normalized_oracle and target in ("observations", "dynamics"):
+            attacked = attacked * scale + mean
     if target == "observations":
         state = attacked.astype(np.float32)
     elif target == "actions":
@@ -1676,7 +1728,9 @@ def online_corruption_scale(
     if target not in ("observations", "dynamics"):
         raise ValueError(f"No vector scale is defined for target {target!r}")
     if config.online_corruption_scale_profile == "rpex_official_code":
-        if config.online_corruption_coordinate_system == "normalized_random_state_units_v1":
+        if config.online_corruption_coordinate_system in (
+            "normalized_random_state_units_v1", "normalized_source_state_units_v2"
+        ):
             if normalizer_std is None:
                 raise ValueError("normalized online random state noise requires normalizer_std")
             scale = np.asarray(normalizer_std, dtype=np.float32)

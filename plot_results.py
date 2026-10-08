@@ -26,9 +26,6 @@ _PLOT_ALGORITHM_LABELS = {
     "wsrl": "WSRL",
     "ro2o": "RO2O",
     "pessimistic_q_ensemble": "Pessimistic Q-Ensemble",
-    "care_o2o": "CARE-O2O",
-    "arw_o2o": "ARW-O2O",
-    "rg_o2o": "RG-O2O",
 }
 
 
@@ -307,6 +304,9 @@ def _load_runs(root: Path):
                 "repository_diff_sha256",
                 "online_corruption_coordinate_system",
                 "online_corruption_scale_profile",
+                "corruption_profile",
+                "corruption_semantics_version",
+                "attack_rng_schema",
                 "suite_profile",
                 "run_purpose",
                 "condition_status",

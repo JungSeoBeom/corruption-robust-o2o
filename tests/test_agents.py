@@ -5,7 +5,7 @@ import unittest
 import torch
 
 from robust_o2o.agents import build_agent
-from robust_o2o.config import ALGORITHMS, CANDIDATE_ALGORITHMS, ExperimentConfig
+from robust_o2o.config import ALGORITHMS, ExperimentConfig
 from robust_o2o.networks import OfficialRPEXGaussianPolicy
 
 
@@ -44,21 +44,10 @@ class AgentSmokeTest(unittest.TestCase):
             with self.subTest(algorithm=algorithm):
                 config = self._config(algorithm)
                 agent = build_agent(config, 5, 2, 1.0, torch.device("cpu"))
-                if algorithm in CANDIDATE_ALGORITHMS:
-                    from robust_o2o.agents.cro2o import register_offline_blocks
-                    from robust_o2o.cro2o_training import prepare_candidate
-                    from robust_o2o.replay import OfflineDataset
-                    data = {k: v.numpy() for k, v in self._batch().items() if not k.startswith("_")}
-                    data["episode_id"] = torch.arange(8).numpy()
-                    candidate_offline = OfflineDataset(data, seed=5)
-                    register_offline_blocks(agent, data)
                 if algorithm == "pessimistic_q_ensemble":
                     metrics = agent.update(
                         member_batches=[self._batch() for _ in range(5)]
                     )
-                elif algorithm in CANDIDATE_ALGORITHMS:
-                    metrics = agent.update(candidate_offline.sample(8, torch.device("cpu")))
-                    prepare_candidate(agent, data, candidate_offline)
                 else:
                     metrics = agent.update(self._batch())
                 self.assertTrue(metrics)
@@ -72,8 +61,6 @@ class AgentSmokeTest(unittest.TestCase):
                         density_online_batch=self._batch(),
                         rl_batch_prioritized=True,
                     )
-                elif algorithm in CANDIDATE_ALGORITHMS:
-                    online_metrics = agent.update(candidate_offline.sample(8, torch.device("cpu")))
                 else:
                     online_metrics = agent.update(self._batch())
                 self.assertTrue(online_metrics)

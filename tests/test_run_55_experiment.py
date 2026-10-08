@@ -74,6 +74,13 @@ class Run55ExperimentTest(unittest.TestCase):
             self.assertEqual(command[command.index("--corruption") + 1], corruption)
             self.assertEqual(command[command.index("--corruption-target") + 1], target)
             self.assertEqual(
+                command[command.index("--corruption-profile") + 1], "riql_rpex_code"
+            )
+            self.assertEqual(
+                command[command.index("--online-corruption-scale-profile") + 1],
+                "rpex_official_code",
+            )
+            self.assertEqual(
                 command[command.index("--algorithms") + 1],
                 ",".join(MAIN_BASELINES),
             )

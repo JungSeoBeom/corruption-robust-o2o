@@ -27,6 +27,9 @@ from robust_o2o.fidelity import (
 from robust_o2o.launcher_utils import (
     CHILD_IDENTITY_OPTIONS,
     REMOVED_LAUNCH_OPTIONS,
+    CORRUPTION_PROFILES,
+    resolved_corruption_scale_profile,
+    validate_corruption_launch_settings,
     canonical_algorithms,
     passthrough_conflicts,
 )
@@ -58,11 +61,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--targets",
         type=_csv,
-        default=["observations", "actions", "rewards", "dynamics", "mixed"],
+        default=["observations", "actions", "rewards", "dynamics"],
     )
     parser.add_argument("--seeds", type=_csv, default=["0"])
     parser.add_argument("--corruption-ranges", type=_csv, default=["1.0"])
     parser.add_argument("--stage", choices=("offline", "online", "both"), default="both")
+    parser.add_argument(
+        "--corruption-profile", choices=CORRUPTION_PROFILES,
+        default="riql_rpex_code",
+    )
     parser.add_argument("--implementation-profile", choices=IMPLEMENTATION_PROFILES)
     parser.add_argument(
         "--suite-profile", choices=SUITE_PROFILES,
@@ -85,14 +92,7 @@ def commands(
     comparison_name: str,
 ):
     script = Path(__file__).resolve().parent / "run_experiment.py"
-    scale_profile = args.online_corruption_scale_profile or (
-        "rpex_official_code"
-        if args.suite_profile in (
-            "method_fidelity",
-            "primary_research_benchmark",
-        )
-        else "dataset_std_scaled_extension"
-    )
+    scale_profile = resolved_corruption_scale_profile(args)
     for algorithm, env_name, corruption, seed in itertools.product(
         args.algorithms, args.envs, args.corruptions, args.seeds
     ):
@@ -108,6 +108,8 @@ def commands(
                 env_name,
                 "--corruption",
                 corruption,
+                "--corruption-profile",
+                args.corruption_profile,
                 "--corruption-target",
                 target,
                 "--seed",
@@ -176,6 +178,14 @@ def _validate_args(
             "non-clean corruptions require at least one --corruption-ranges value"
         )
 
+    validate_corruption_launch_settings(
+        parser,
+        args,
+        nonclean_targets=(
+            args.targets if any(mode != "clean" for mode in args.corruptions) else ()
+        ),
+    )
+
     if not args.seeds:
         parser.error("--seeds cannot be empty")
     for seed in args.seeds:
@@ -214,6 +224,7 @@ def main() -> int:
     generated_commands = list(commands(args, passthrough, comparison_name))
     if not generated_commands:
         parser.error("the resolved matrix contains no runs")
+    print(f"CORRUPTION_PROFILE: {args.corruption_profile}", flush=True)
     failures = 0
     for index, command in enumerate(generated_commands, start=1):
         print(f"[{index}] {shlex.join(command)}", flush=True)

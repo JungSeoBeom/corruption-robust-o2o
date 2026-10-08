@@ -11,13 +11,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from robust_o2o.config import CANDIDATE_ALGORITHMS, DEFAULT_PROTOCOL
+from robust_o2o.config import DEFAULT_PROTOCOL
 from robust_o2o.fidelity import MAIN_BASELINES
 from robust_o2o.logging_utils import format_duration, format_timestamp
 from run_all_algorithms import (
     _comparison_directory,
     _validate_args as validate_run_all_args,
-    algorithm_display_name,
     build_parser as build_run_all_parser,
     main,
     summarize_algorithm_timings,
@@ -37,12 +36,6 @@ def _preflight(root: str) -> dict:
 
 
 class TimingTest(unittest.TestCase):
-    def test_candidate_algorithms_have_launcher_display_names(self):
-        self.assertEqual(
-            [algorithm_display_name(name) for name in CANDIDATE_ALGORITHMS],
-            ["CARE-O2O", "ARW-O2O", "RG-O2O"],
-        )
-
     def test_run_all_uses_compact_comparison_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             args = build_run_all_parser().parse_args(
@@ -138,6 +131,7 @@ class TimingTest(unittest.TestCase):
                 self.assertIn(f"--algorithm {algorithm}", line)
                 self.assertIn("--suite-profile research_benchmark", line)
                 self.assertIn("--implementation-profile research_benchmark", line)
+                self.assertIn("--corruption-profile riql_rpex_code", line)
                 self.assertNotIn("--protocol", line)
                 self.assertNotIn("--run-purpose", line)
             self.assertEqual(list(Path(directory).iterdir()), [])

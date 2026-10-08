@@ -183,6 +183,8 @@ class ResearchCorruptionContractTest(unittest.TestCase):
                     np.ones(2, dtype=np.float32),
                     selected_target=target,
                     selection_already_sampled=True,
+                    normalizer_mean=np.zeros(4, dtype=np.float32),
+                    normalizer_std=np.ones(4, dtype=np.float32),
                 )
                 self.assertTrue(result[-1])
                 clean_fields = (
@@ -245,6 +247,8 @@ class ResearchCorruptionContractTest(unittest.TestCase):
                 np.ones(2, dtype=np.float32),
                 selected_target="actions",
                 selection_already_sampled=True,
+                normalizer_mean=np.zeros(4, dtype=np.float32),
+                normalizer_std=np.ones(4, dtype=np.float32),
             )
             np.testing.assert_array_equal(online[0], clean["observations"][0])
             self.assertFalse(np.array_equal(online[1], clean["actions"][0]))
@@ -276,6 +280,8 @@ class ResearchCorruptionContractTest(unittest.TestCase):
                 np.ones(2, dtype=np.float32),
                 selected_target="actions",
                 selection_already_sampled=True,
+                normalizer_mean=np.zeros(4, dtype=np.float32),
+                normalizer_std=np.ones(4, dtype=np.float32),
             )
         self.assertTrue(selected)
         np.testing.assert_array_equal(
@@ -306,6 +312,8 @@ class ResearchCorruptionContractTest(unittest.TestCase):
                     np.ones(2, dtype=np.float32),
                     selected_target="observations",
                     selection_already_sampled=True,
+                    normalizer_mean=np.zeros(4, dtype=np.float32),
+                    normalizer_std=np.ones(4, dtype=np.float32),
                 )
 
     def test_main_baselines_reuse_the_same_random_offline_artifact(self):

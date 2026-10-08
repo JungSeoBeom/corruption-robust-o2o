@@ -107,6 +107,7 @@ class CorruptionTest(unittest.TestCase):
             "hopper-medium-replay-v2",
             corruption="random",
             corruption_target="mixed",
+            corruption_profile="legacy_extension",
             mixed_ratios=(0.1, 0.2, 0.3, 0.4),
             offline_corruption_rate=1.0,
             seed=11,
@@ -151,6 +152,7 @@ class CorruptionTest(unittest.TestCase):
                 "hopper-medium-replay-v2",
                 corruption="random",
                 corruption_target="mixed",
+                corruption_profile="legacy_extension",
                 mixed_ratios=(0.1, 0.2, 0.3, 0.3),
             )
 

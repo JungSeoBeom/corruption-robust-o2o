@@ -16,14 +16,10 @@ from .config import (
     ExperimentConfig,
     INDIVIDUAL_CORRUPTION_TARGETS,
     PQE_NUMERICS_VERSION,
-    CANDIDATE_ALGORITHMS,
 )
-from .agents.cro2o import register_offline_blocks
-from .cro2o_training import prepare_candidate, candidate_update
 from .calql_online import CalQLTrajectoryAccumulator, dynamic_batch_counts
 from .corruption import (
     AttackOracle,
-    ATTACK_RNG_SCHEMA,
     OnlineCorruptionAudit,
     corrupt_pre_action_value,
     corrupt_offline_dataset,
@@ -691,11 +687,7 @@ def save_checkpoint(
 ) -> None:
     payload = {
         "format_version": 4,
-        "attack_rng_schema": (
-            "upstream_single_torch"
-            if config.implementation_profile == "official_code_reference"
-            else ATTACK_RNG_SCHEMA
-        ),
+        "attack_rng_schema": config.attack_rng_schema,
         "pqe_numerics_version": (
             PQE_NUMERICS_VERSION if config.algorithm == "pessimistic_q_ensemble" else None
         ),
@@ -1066,6 +1058,13 @@ def _validate_reliability_resume(payload: Dict[str, Any], config: ExperimentConf
             "Online corruption coordinates changed; old checkpoints support "
             "initialization, not exact resume across the random state-noise correction"
         )
+    if config.corruption != "clean" and payload.get("config", {}).get(
+        "corruption_semantics_version", "legacy_extension_v8"
+    ) != config.corruption_semantics_version:
+        raise ValueError(
+            "Corruption semantics changed; historical checkpoints support "
+            "initialization, not exact resume under the RIQL/RPEX source contract"
+        )
     if (
         config.algorithm == "pessimistic_q_ensemble"
         and payload.get("pqe_numerics_version") != PQE_NUMERICS_VERSION
@@ -1088,9 +1087,9 @@ def _validate_reliability_resume(payload: Dict[str, Any], config: ExperimentConf
                 )
             )
         )
-        and config.implementation_profile != "official_code_reference"
+        and (config.uses_source_corruption or config.implementation_profile != "official_code_reference")
     ):
-        if payload.get("attack_rng_schema") != ATTACK_RNG_SCHEMA:
+        if payload.get("attack_rng_schema") != config.attack_rng_schema:
             raise ValueError(
                 "Research adversarial exact resume requires phase-private RNG "
                 "schema; legacy single-stream checkpoints support initialization only"
@@ -1098,11 +1097,15 @@ def _validate_reliability_resume(payload: Dict[str, Any], config: ExperimentConf
         resume = payload.get("resume_state") or {}
         if resume.get("phase") == "online":
             state = resume.get("global_rng", {}).get("attack_rng")
-            if not isinstance(state, dict) or state.get("schema") != ATTACK_RNG_SCHEMA:
+            if not isinstance(state, dict) or state.get("schema") != config.attack_rng_schema:
                 raise ValueError(
                     "Online exact resume is missing phase-private attack RNG state"
                 )
-            for phase in ("offline", "online"):
+            phases = (
+                ("offline", "online", "offline_actor")
+                if config.uses_source_corruption else ("offline", "online")
+            )
+            for phase in phases:
                 if phase not in state:
                     raise ValueError(
                         f"Online exact resume is missing {phase} attack RNG state"
@@ -1226,12 +1229,6 @@ def _evaluate(
             "normalized_return_mean"
         ]
     metrics["evaluation_mode"] = primary_mode
-    if config.algorithm == "rg_o2o":
-        # Sampling candidates remains stochastic even though selection is an
-        # argmax. Do not label this a deterministic base-actor evaluation.
-        metrics["evaluation_mode"] = "generative_exploitation"
-        metrics.pop("return_deterministic", None)
-        metrics.pop("normalized_return_deterministic", None)
     logger.log_evaluation(
         phase, step, env_steps, agent.total_updates, metrics
     )
@@ -1368,9 +1365,8 @@ def run_experiment(
                 corrupted_dataset,
                 enabled=config.normalize_states,
                 mode=config.state_normalization,
-                additive_epsilon=(
-                    config.implementation_profile == "official_code_reference"
-                ),
+                additive_epsilon=(config.uses_source_corruption
+                                  or config.implementation_profile == "official_code_reference"),
             )
         normalized_dataset = apply_normalizer(corrupted_dataset, normalizer)
         replay_sampling_profile = (
@@ -1423,11 +1419,6 @@ def run_experiment(
             )
         if resume_payload is not None:
             restore_global_rng_state(resume_payload["global_rng"], oracle=oracle)
-        if config.algorithm in CANDIDATE_ALGORITHMS:
-            register_offline_blocks(agent, corrupted_dataset)
-            if config.initialize_from_checkpoint and agent.online_phase:
-                raise ValueError("CRO2O new-run initialization requires an offline checkpoint; online state requires --resume-run")
-
         # RunLogger.write_config intentionally commits a resume by superseding
         # any completion marker and transitioning summary.json to `running`.
         # Validate append safety first so a rejected checkpoint is read-only.
@@ -1530,11 +1521,8 @@ def run_experiment(
                     state_dim,
                     action_dim,
                     resume_state=resume_payload,
-                    candidate_dataset=corrupted_dataset if config.algorithm in CANDIDATE_ALGORITHMS else None,
                 )
         if config.stage in ("online", "both"):
-            if config.algorithm in CANDIDATE_ALGORITHMS:
-                prepare_candidate(agent, corrupted_dataset, offline)
             if not agent.online_phase:
                 agent.begin_online()
             _run_online(
@@ -1617,7 +1605,6 @@ def _run_offline(
     state_dim: int,
     action_dim: int,
     resume_state: Optional[Dict[str, Any]] = None,
-    candidate_dataset: Optional[Dict[str, np.ndarray]] = None,
 ) -> None:
     logger.logger.info("offline pre-training started")
     is_pqe = config.algorithm == "pessimistic_q_ensemble"
@@ -1703,7 +1690,7 @@ def _run_offline(
                     ),
                 },
             )
-        if step % config.eval_period == 0 and not (candidate_dataset is not None and step == offline_budget):
+        if step % config.eval_period == 0:
             _evaluate(
                 logger,
                 env,
@@ -1745,13 +1732,10 @@ def _run_offline(
                     "writer_append_position": _writer_positions(logger),
                 },
             )
-    if candidate_dataset is not None:
-        prepare_candidate(agent, candidate_dataset, offline)
     if (
         config.implementation_profile != "official_code_reference"
         and (
-            candidate_dataset is not None
-            or offline_budget == 0
+            offline_budget == 0
             or offline_budget % config.eval_period != 0
         )
     ):
@@ -1812,7 +1796,6 @@ def _run_online(
     is_pqe = config.algorithm == "pessimistic_q_ensemble"
     is_calql = config.algorithm == "cal_ql"
     is_wsrl = config.algorithm == "wsrl"
-    is_candidate = config.algorithm in CANDIDATE_ALGORITHMS
     replay = ReplayBuffer(
         state_dim,
         action_dim,
@@ -2095,7 +2078,7 @@ def _run_online(
         )
     warmup = (
         max(config.initial_collection_steps, config.warmup_steps)
-        if is_wsrl or is_candidate
+        if is_wsrl
         else config.pqe_first_online_block_steps
         if is_pqe
         else 0
@@ -2254,11 +2237,7 @@ def _run_online(
         if is_calql:
             # Cal-QL is updated only after a complete trajectory has exact RTG.
             return
-        if is_candidate:
-            # Recalibrate immediately after K0, before the first optimistic
-            # action. Candidate replay samples with replacement.
-            can_update = not before_transition and replay.size > 0 and env_step >= warmup
-        elif is_wsrl:
+        if is_wsrl:
             can_update = (
                 env_step >= wsrl_first_update_step
                 and replay.size >= required_online_samples
@@ -2285,17 +2264,6 @@ def _run_online(
                 and replay.size >= required_online_samples
             )
         if not can_update:
-            return
-
-        if is_candidate:
-            while agent.recalibration_updates < config.candidate_recalibration_steps:
-                last_metrics = candidate_update(agent, offline, replay, config, critic_only=True)
-                accumulator.add(last_metrics)
-            if env_step <= warmup:
-                return
-            for _ in range(config.updates_per_step):
-                last_metrics = candidate_update(agent, offline, replay, config)
-                accumulator.add(last_metrics)
             return
 
         if is_wsrl:
@@ -2509,6 +2477,7 @@ def _run_online(
                 selected_target=selected_target,
                 selection_already_sampled=True,
                 normalizer_std=normalizer.std,
+                normalizer_mean=normalizer.mean,
             )
         corrupted_online += int(was_corrupted)
         actually_changed = bool(
@@ -2559,10 +2528,6 @@ def _run_online(
                 )
                 perform_calql_trajectory_updates(completed)
         else:
-            if is_candidate:
-                agent.observe_transition(replay_state, stored_action, stored_reward,
-                                         replay_next_state, float(terminated), replay.position,
-                                         episode_finished)
             replay.add(
                 replay_state,
                 stored_action,

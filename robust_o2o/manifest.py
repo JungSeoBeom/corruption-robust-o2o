@@ -349,6 +349,9 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         "online_corruption_coordinate_system": resolved.get(
             "online_corruption_coordinate_system", "raw"
         ),
+        "corruption_profile": resolved.get("corruption_profile", "legacy_extension"),
+        "corruption_semantics_version": resolved.get("corruption_semantics_version", "legacy_extension_v8"),
+        "attack_rng_schema": resolved.get("attack_rng_schema"),
         "corruption_scale_statistics": offline_corruption.get(
             "corruption_scale_statistics"
         ),
@@ -550,8 +553,6 @@ def build_experiment_manifest(resolved: Mapping[str, Any]) -> dict[str, Any]:
         },
     }
     # Never stamp historical configs with today's implementation revision.
-    if resolved.get("candidate_spec"):
-        manifest["candidate_spec"] = resolved["candidate_spec"]
     if algorithm == "pessimistic_q_ensemble" and resolved.get("pqe_numerics_version"):
         manifest["pqe_numerics_version"] = resolved["pqe_numerics_version"]
     manifest["manifest_sha256"] = canonical_json_sha256(manifest)
@@ -678,6 +679,8 @@ def comparison_condition(
         return condition
     rates = read("corruption_rate", default={})
     condition.update(
+        corruption_profile=read("corruption_profile", default="legacy_extension"),
+        corruption_semantics_version=read("corruption_semantics_version", default="legacy_extension_v8"),
         offline_corruption_rate=rates.get("offline", read("offline_corruption_rate")),
         online_corruption_rate=rates.get("online", read("online_corruption_rate")),
         corruption_range=read("corruption_range"),
@@ -704,7 +707,10 @@ def comparison_condition(
     if "rewards" in active:
         if corruption == "random":
             epsilon = read("corruption_range")
-            online_scale = 1.0 if read("implementation_profile") == "official_code_reference" else epsilon
+            online_scale = 1.0 if (
+                read("corruption_profile") == "riql_rpex_code"
+                or read("implementation_profile") == "official_code_reference"
+            ) else epsilon
             condition["reward_replacement_bounds"] = {
                 "offline": None if epsilon is None else 30.0 * epsilon,
                 "online": None if online_scale is None else 30.0 * online_scale,

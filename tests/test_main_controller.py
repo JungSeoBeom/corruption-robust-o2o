@@ -114,6 +114,7 @@ def _controller_config(
     online_steps: int,
     corruption: str = "clean",
     corruption_target: str = "none",
+    corruption_profile: str = "riql_rpex_code",
 ) -> ExperimentConfig:
     config = ExperimentConfig(
         algorithm,
@@ -121,6 +122,7 @@ def _controller_config(
         implementation_profile="research_benchmark",
         corruption=corruption,
         corruption_target=corruption_target,
+        corruption_profile=corruption_profile,
         online_steps=online_steps,
         eval_period=100_000,
         train_log_period=100_000,
@@ -179,7 +181,7 @@ class MainControllerContractTest(unittest.TestCase):
                 clean_state = normalizer.transform(np.array([0.0, 0.5]))
                 clean_next = normalizer.transform(np.array([1.0, 1.5]))
                 np.testing.assert_allclose(policy_inputs[0].reshape(-1), clean_state)
-                rng = np.random.default_rng(config.corruption_seed)
+                rng = np.random.RandomState(config.corruption_seed)
                 rng.random()  # Transition selection precedes the noise draw.
                 noise = rng.uniform(-1.0, 1.0, size=2)
                 replay = replay_instances[0]
@@ -229,6 +231,7 @@ class MainControllerContractTest(unittest.TestCase):
             online_steps=1,
             corruption="adversarial",
             corruption_target="actions",
+            corruption_profile="legacy_extension",
         )
         config.online_corruption_rate = 1.0
         env = _GymnasiumEnv(terminal_at=1)
@@ -362,7 +365,9 @@ class MainControllerContractTest(unittest.TestCase):
                         self.total_updates += 1
                         return {"loss": 0.0}
 
-                config = _controller_config(algorithm, online_steps=2)
+                config = _controller_config(
+                    algorithm, online_steps=2, corruption_profile="legacy_extension"
+                )
                 config.initial_collection_steps = 0
                 config.batch_size = 1
                 self.assertEqual(

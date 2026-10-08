@@ -96,14 +96,14 @@ def test_unit_noise_is_added_in_normalized_coordinates(profile, target, field):
         following,
         c,
         None,
-        np.random.default_rng(41),
+        np.random.RandomState(41),
         np.ones(3, np.float32),
         np.ones(2, np.float32),
         selected_target=target,
         selection_already_sampled=True,
         normalizer_std=norm.std,
     )
-    expected_noise = np.random.default_rng(41).uniform(-1, 1, size=3)
+    expected_noise = np.random.RandomState(41).uniform(-1, 1, size=3)
     np.testing.assert_allclose(
         norm.transform(result[field]),
         norm.transform(original) + expected_noise,
@@ -127,11 +127,26 @@ def test_normalized_noise_requires_explicit_fitted_scale_and_preserves_other_pro
     )
     c.normalize_states = True
     c.corruption = "adversarial"
+    with pytest.raises(ValueError, match="requires normalizer_std"):
+        online_corruption_scale("observations", c, **args)
+    fitted_scale = np.array([0.3, 9.0], np.float32)
+    np.testing.assert_array_equal(
+        online_corruption_scale(
+            "observations", c, **args, normalizer_std=fitted_scale
+        ), fitted_scale,
+    )
+    c = config(
+        corruption_profile="legacy_extension",
+        online_corruption_scale_profile="rpex_official_code",
+    )
+    c.corruption = "adversarial"
     np.testing.assert_array_equal(
         online_corruption_scale("observations", c, **args), [1, 1]
     )
-    c.corruption = "random"
-    c.online_corruption_scale_profile = "dataset_std_scaled_extension"
+    c = config(
+        corruption_profile="legacy_extension",
+        online_corruption_scale_profile="dataset_std_scaled_extension",
+    )
     np.testing.assert_array_equal(
         online_corruption_scale("observations", c, **args), [2, 4]
     )
@@ -142,7 +157,11 @@ def test_changed_online_coordinates_cannot_exact_resume_old_weights():
     with pytest.raises(ValueError, match="coordinates changed"):
         _validate_reliability_resume({"config": {}}, c)
     _validate_reliability_resume({"config": c.to_dict()}, c)
-    _validate_reliability_resume({"config": {}}, config("rewards"))
+    with pytest.raises(ValueError, match="Corruption semantics changed"):
+        _validate_reliability_resume({"config": {}}, config("rewards"))
+    _validate_reliability_resume(
+        {"config": {}}, config("rewards", corruption_profile="legacy_extension")
+    )
 
 
 def condition(c):
@@ -151,8 +170,14 @@ def condition(c):
 
 
 def test_comparison_detects_state_noise_units_but_ignores_inactive_reward_knobs():
-    left = config(online_corruption_scale_profile="rpex_official_code")
-    right = config(online_corruption_scale_profile="dataset_std_scaled_extension")
+    left = config(
+        corruption_profile="legacy_extension",
+        online_corruption_scale_profile="rpex_official_code",
+    )
+    right = config(
+        corruption_profile="legacy_extension",
+        online_corruption_scale_profile="dataset_std_scaled_extension",
+    )
     assert condition(left) != condition(right)
     for c in (left, right):
         c.corruption_target = "rewards"
@@ -167,7 +192,7 @@ def test_comparison_includes_online_reward_support_at_nonunit_epsilon():
         implementation_profile="official_code_reference",
         corruption_range=2.0,
     )
-    custom = config("rewards", corruption_range=2.0)
+    custom = config("rewards", corruption_range=2.0, corruption_profile="legacy_extension")
     assert condition(official)["reward_replacement_bounds"] == {
         "offline": 60.0,
         "online": 30.0,
@@ -182,7 +207,9 @@ def test_cross_algorithm_plot_rejects_different_conditions():
     import pandas as pd
 
     conditions = [
-        condition(config(online_corruption_scale_profile=scale))
+        condition(config(
+            corruption_profile="legacy_extension", online_corruption_scale_profile=scale
+        ))
         for scale in ("rpex_official_code", "dataset_std_scaled_extension")
     ]
     frame = pd.DataFrame(
@@ -268,7 +295,10 @@ def test_provenance_changes_when_dirty_content_changes_without_status_change(tmp
 )
 @pytest.mark.parametrize("epsilon", [0.0, 1.0, 2.0])
 def test_random_reward_replacement_matches_declared_support(profile, epsilon):
-    c = config("rewards", implementation_profile=profile, corruption_range=epsilon)
+    c = config(
+        "rewards", implementation_profile=profile, corruption_range=epsilon,
+        corruption_profile="legacy_extension",
+    )
     original = np.full(8, 500.0, np.float32)
     offline = corrupt_offline_reward_values(original, c, np.random.default_rng(7))
     expected = np.random.default_rng(7).uniform(-1, 1, size=8) * 30 * epsilon

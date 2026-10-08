@@ -107,7 +107,7 @@ class FidelityProfileTest(unittest.TestCase):
                 self.assertEqual(config.evaluation_mode, "deterministic")
                 self.assertEqual(config.evaluation_policy_profile, "deterministic")
                 self.assertEqual(
-                    config.action_execution_profile, "clip_to_action_space"
+                    config.action_execution_profile, "official_algorithm_behavior"
                 )
         tuning = ExperimentConfig(
             "wsrl",
@@ -219,6 +219,7 @@ class FidelityProfileTest(unittest.TestCase):
             "hopper-medium-v2",
             corruption="adversarial",
             corruption_target="mixed",
+            corruption_profile="legacy_extension",
             mixed_ratios=(0.0, 0.0, 1.0, 0.0),
             suite_profile="research_benchmark",
             run_purpose="research_benchmark",
@@ -373,6 +374,7 @@ class FidelityProfileTest(unittest.TestCase):
             corruption="random",
             corruption_target="observations",
             online_corruption_scale_profile="dataset_std_scaled_extension",
+            corruption_profile="legacy_extension",
         )
         self.assertTrue(
             np.array_equal(
@@ -408,6 +410,7 @@ class FidelityProfileTest(unittest.TestCase):
                 corruption="adversarial",
                 corruption_target="rewards",
                 adversarial_attack_profile="experimental_sign_pgd",
+                corruption_profile="legacy_extension",
             )
         experimental = ExperimentConfig(
             "rpex",
@@ -415,6 +418,7 @@ class FidelityProfileTest(unittest.TestCase):
             corruption="adversarial",
             corruption_target="rewards",
             adversarial_attack_profile="experimental_sign_pgd",
+            corruption_profile="legacy_extension",
             allow_experimental_adversarial_attack=True,
         )
         self.assertEqual(
@@ -1013,7 +1017,7 @@ class FidelityProfileTest(unittest.TestCase):
             )
 
         for key, value in (
-            ("online_corruption_scale_profile", "rpex_official_code"),
+            ("online_corruption_scale_profile", "dataset_std_scaled_extension"),
             ("corruption_rate", {"offline": 0.9, "online": 0.9}),
             ("corruption_range", 123.0),
             ("dataset_sha256", "different-dataset"),

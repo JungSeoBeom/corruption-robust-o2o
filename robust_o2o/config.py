@@ -38,7 +38,6 @@ from .fidelity import (
 
 
 PQE_NUMERICS_VERSION = "centered_moments_strict_priorities_v1"
-CANDIDATE_ALGORITHMS = ("care_o2o", "arw_o2o", "rg_o2o")
 
 ALGORITHMS = (
     "rpex",
@@ -50,7 +49,6 @@ ALGORITHMS = (
     "wsrl",
     "ro2o",
     "pessimistic_q_ensemble",
-    *CANDIDATE_ALGORITHMS,
 )
 
 DEFAULT_PROTOCOL = "gymnasium_mujoco_v4_d4rl_v2"
@@ -66,9 +64,6 @@ ACTION_DIMS = {
 
 
 ALGORITHM_TITLES = {
-    "care_o2o": "CARE-O2O",
-    "arw_o2o": "ARW-O2O",
-    "rg_o2o": "RG-O2O",
     "rpex": "RPEX: Robust Policy Expansion for Offline-to-Online RL under Diverse Data Corruption",
     "riql_pex": "RPEX ablation: RIQL + Policy Expansion",
     "riql_naive": "Towards Robust Offline Reinforcement Learning under Diverse Data Corruption",
@@ -81,7 +76,6 @@ ALGORITHM_TITLES = {
 }
 
 ALGORITHM_ALIASES = {
-    "care-o2o": "care_o2o", "arw-o2o": "arw_o2o", "rg-o2o": "rg_o2o",
     "riql+pex": "riql_pex",
     "riql-pex": "riql_pex",
     "riql_naive": "riql_naive",
@@ -193,28 +187,6 @@ class ExperimentConfig:
     max_episode_steps: int = 1_000
 
     hidden_dim: int = 256
-    # PDF working candidates: declared implementation defaults, not paper-tuned.
-    candidate_audit_folds: int = 2
-    candidate_audit_steps: Optional[int] = None
-    candidate_recalibration_steps: int = 1000
-    candidate_generator_steps: Optional[int] = None
-    candidate_candidates: int = 10
-    candidate_diffusion_steps: int = 20
-    candidate_check_probability: float = 0.05
-    candidate_optimism: float = 1.0
-    candidate_mad_multiplier: float = 1.4826
-    candidate_trust_min: float = 0.05
-    candidate_trust_temperature: float = 1.0
-    candidate_uncertainty_allowance: float = 1.0
-    candidate_residual_threshold: float = 2.0
-    candidate_scale_floor: float = 1.0
-    candidate_scale_window: int = 2048
-    candidate_bootstrap_probability: float = 0.8
-    candidate_retention_period: int = 100
-    candidate_retention_mode: str = "adaptive"
-    candidate_retention_smoothing: float = 0.1
-    candidate_bias_scale: float = 1.0
-    candidate_advantage_clip: float = 5.0
     hidden_layers: int = 2
     learning_rate: float = 3e-4
     actor_learning_rate: Optional[float] = None
@@ -235,6 +207,9 @@ class ExperimentConfig:
     evaluation_policy_profile: str = "official_code_epsilon_switching"
     attack_timing: str = "official_code_post_transition_replay_poisoning"
     random_attack_semantics: str = "post_transition_replay_poisoning"
+    # Corruption is shared across learners; it must not inherit their objective
+    # profiles. Legacy extensions require an explicit opt-in.
+    corruption_profile: str = "riql_rpex_code"
     mixed_corruption_profile: str = "generic_partitioned_mixed"
     action_execution_profile: str = "clip_to_action_space"
     policy_extraction: Optional[str] = None
@@ -351,36 +326,6 @@ class ExperimentConfig:
                 "select canonical algorithm='cal_ql' for new runs"
             )
         self.algorithm = ALGORITHM_ALIASES.get(requested_algorithm, requested_algorithm)
-        if self.algorithm in CANDIDATE_ALGORITHMS:
-            if self.candidate_retention_mode not in ("adaptive", "fixed", "none"):
-                raise ValueError("candidate_retention_mode must be adaptive, fixed, or none")
-            if self.implementation_profile not in (None, "common_budget_robustness"):
-                raise ValueError("CRO2O candidates are unverified working proposals; use common_budget_robustness")
-            if self.action_distribution != "tanh_gaussian" or self.deterministic_policy:
-                raise ValueError("CRO2O candidates require matched bounded stochastic initializers")
-            if self.candidate_audit_steps is None:
-                self.candidate_audit_steps = self.offline_steps
-            if self.candidate_generator_steps is None:
-                self.candidate_generator_steps = self.offline_steps
-            for name in ("candidate_audit_folds", "candidate_candidates", "candidate_diffusion_steps", "candidate_scale_window", "candidate_retention_period"):
-                if getattr(self, name) < (2 if name in ("candidate_audit_folds", "candidate_diffusion_steps") else 1):
-                    raise ValueError(f"invalid {name}")
-            for name in ("candidate_audit_steps", "candidate_generator_steps", "candidate_recalibration_steps"):
-                if getattr(self, name) < 0:
-                    raise ValueError(f"invalid {name}")
-            for name in ("candidate_trust_min", "candidate_bootstrap_probability"):
-                if not 0 < getattr(self, name) < 1:
-                    raise ValueError(f"{name} must be in (0,1)")
-            if not 0 < self.candidate_retention_smoothing <= 1:
-                raise ValueError("candidate_retention_smoothing must be in (0,1]")
-            for name in ("candidate_scale_floor", "candidate_trust_temperature", "candidate_mad_multiplier", "candidate_bias_scale", "candidate_advantage_clip"):
-                if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
-                    raise ValueError(f"{name} must be finite and positive")
-            if not 0 <= self.candidate_check_probability <= 1:
-                raise ValueError("candidate_check_probability must be in [0,1]")
-            for name in ("candidate_optimism", "candidate_uncertainty_allowance", "candidate_residual_threshold"):
-                if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
-                    raise ValueError(f"{name} must be finite and non-negative")
         self.env_name = normalize_env_name(self.env_name)
         self.corruption = self.corruption.lower()
         self.corruption_target = self.corruption_target.lower()
@@ -409,6 +354,9 @@ class ExperimentConfig:
         self.evaluation_policy_profile = self.evaluation_policy_profile.lower()
         self.attack_timing = self.attack_timing.lower()
         self.random_attack_semantics = self.random_attack_semantics.lower()
+        self.corruption_profile = self.corruption_profile.lower()
+        if self.corruption_profile not in ("riql_rpex_code", "legacy_extension"):
+            raise ValueError("corruption_profile must be riql_rpex_code or legacy_extension")
         self.mixed_corruption_profile = self.mixed_corruption_profile.lower()
         self.action_execution_profile = LEGACY_ACTION_EXECUTION_PROFILE_ALIASES.get(
             self.action_execution_profile.lower(), self.action_execution_profile.lower()
@@ -463,6 +411,17 @@ class ExperimentConfig:
 
         self._resolve_role_seeds()
         self._resolve_implementation_profile()
+        if self.uses_source_corruption:
+            if self.corruption != "clean" and self.corruption_target == "mixed":
+                raise ValueError(
+                    "The pinned RIQL/RPEX code has no mixed corruption contract; "
+                    "partitioned mixed requires corruption_profile=legacy_extension"
+                )
+            self.attack_timing = "official_code_post_transition_replay_poisoning"
+            self.random_attack_semantics = "post_transition_replay_poisoning"
+            self.action_execution_profile = "official_algorithm_behavior"
+            if self.corruption == "adversarial" and self.adversarial_attack_profile != "rpex_official_adam":
+                raise ValueError("riql_rpex_code requires adversarial_attack_profile=rpex_official_adam")
         if (
             self.implementation_profile == "official_code_reference"
             and self.corruption_seed != self.seed
@@ -475,7 +434,7 @@ class ExperimentConfig:
         if self.online_corruption_scale_profile is None:
             self.online_corruption_scale_profile = (
                 "rpex_official_code"
-                if self.implementation_profile
+                if self.uses_source_corruption or self.implementation_profile
                 in ("official_code_reference", "research_benchmark")
                 else "dataset_std_scaled_extension"
             )
@@ -488,6 +447,11 @@ class ExperimentConfig:
                 else "experimental_scaled_sign_flip"
             )
         self._resolve_algorithm_profile()
+        if self.uses_source_corruption and self.online_corruption_scale_profile != "rpex_official_code":
+            raise ValueError(
+                "riql_rpex_code requires online_corruption_scale_profile=rpex_official_code; "
+                "dataset_std_scaled_extension requires corruption_profile=legacy_extension"
+            )
         if self.online_attack_step_size is None:
             self.online_attack_step_size = (
                 0.1
@@ -625,6 +589,11 @@ class ExperimentConfig:
         if self.state_normalization not in ("standard", "robust_median_mad", "none"):
             raise ValueError(
                 "state_normalization must be standard, robust_median_mad, or none"
+            )
+        if self.uses_source_corruption and self.state_normalization == "robust_median_mad":
+            raise ValueError(
+                "riql_rpex_code requires upstream mean/std normalization or none; "
+                "robust_median_mad requires corruption_profile=legacy_extension"
             )
         if self.action_distribution not in (
             "tanh_gaussian",
@@ -823,10 +792,13 @@ class ExperimentConfig:
                 f"research_benchmark {self.algorithm} requires "
                 f"evaluation_policy_profile={expected_evaluation_policy}"
             )
-        if self.action_execution_profile != "clip_to_action_space":
+        expected_action_execution = (
+            "official_algorithm_behavior" if self.uses_source_corruption else "clip_to_action_space"
+        )
+        if self.action_execution_profile != expected_action_execution:
             raise ValueError(
                 "research_benchmark requires action_execution_profile="
-                "clip_to_action_space"
+                f"{expected_action_execution}"
             )
         if self.attack_timing != "official_code_post_transition_replay_poisoning":
             raise ValueError(
@@ -976,7 +948,7 @@ class ExperimentConfig:
 
     def _resolve_role_seeds(self) -> None:
         official_corruption_stream = (
-            self.implementation_profile == "official_code_reference"
+            self.uses_source_corruption or self.implementation_profile == "official_code_reference"
             or self.suite_profile
             in ("method_fidelity", "primary_research_benchmark")
         )
@@ -1408,8 +1380,25 @@ class ExperimentConfig:
         return self.checkpoint_period
 
     @property
+    def uses_source_corruption(self) -> bool:
+        return self.corruption_profile == "riql_rpex_code"
+
+    @property
+    def corruption_semantics_version(self) -> str:
+        return "riql_rpex_code_v1" if self.uses_source_corruption else "legacy_extension_v8"
+
+    @property
+    def attack_rng_schema(self) -> str:
+        if self.uses_source_corruption:
+            return "rpex_code_init_phase_private_actor_v1"
+        return (
+            "upstream_single_torch" if self.implementation_profile == "official_code_reference"
+            else "phase_private_torch_v1"
+        )
+
+    @property
     def online_corruption_coordinate_system(self) -> str:
-        """Units of online random state noise, distinct from replay storage.
+        """Coordinates of online state attacks, distinct from replay storage.
 
         RPEX adds unit noise to the normalized environment observation. We
         implement that in raw replay coordinates using the fitted normalizer's
@@ -1420,21 +1409,27 @@ class ExperimentConfig:
             and (self.mixed_ratios[0] > 0 or self.mixed_ratios[3] > 0)
         )
         if (
-            self.corruption == "random"
-            and state_target
+            (
+                (self.corruption == "random" and state_target)
+                or (
+                    self.uses_source_corruption and self.corruption == "adversarial"
+                    and self.corruption_target != "rewards"
+                )
+            )
             and self.online_corruption_scale_profile == "rpex_official_code"
             and self.normalize_states
             and self.state_normalization != "none"
         ):
-            return "normalized_random_state_units_v1"
+            return (
+                "normalized_source_state_units_v2" if self.uses_source_corruption
+                else "normalized_random_state_units_v1"
+            )
         return "raw"
 
     @property
     def effective_offline_ratio(self) -> float:
         if self.offline_ratio is not None:
             return self.offline_ratio
-        if self.algorithm in CANDIDATE_ALGORITHMS:
-            return 0.5
         if (
             self.algorithm in ("rpex", "riql_pex")
             and self.online_replay_profile == "paper_offline_online_mixture"
@@ -1463,18 +1458,9 @@ class ExperimentConfig:
         if self.is_research_suite:
             self._validate_research_benchmark()
         result = asdict(self)
+        result["corruption_semantics_version"] = self.corruption_semantics_version
+        result["attack_rng_schema"] = self.attack_rng_schema
         result["online_corruption_coordinate_system"] = self.online_corruption_coordinate_system
-        if self.algorithm in CANDIDATE_ALGORITHMS:
-            result["candidate_spec"] = {
-                "version": "cro2o_working_notes_20260915_v1",
-                **{k: v for k, v in result.items() if k.startswith("candidate_")},
-                "evaluation": (
-                    "stochastic_diffusion_exploitation_reranking"
-                    if self.algorithm == "rg_o2o" else "deterministic_base_actor"
-                ),
-                "audit_unit": "trajectory_block",
-                "logged_action_contract": "existing_unclipped_replay_poisoning",
-            }
         result["pqe_numerics_version"] = (
             PQE_NUMERICS_VERSION if self.algorithm == "pessimistic_q_ensemble" else None
         )
@@ -1541,13 +1527,6 @@ class ExperimentConfig:
                 else "algorithm_profile_default"
             )
         )
-        if self.algorithm in CANDIDATE_ALGORITHMS:
-            result["evaluation_action_sampling"] = result["candidate_spec"]["evaluation"]
-            result["online_replay_sampler"] = "private_numpy_choice_with_replacement"
-            result["offline_ratio_rule"] = (
-                f"separately_normalized_sources_{self.candidate_retention_mode}"
-                if self.algorithm == "arw_o2o" else "fixed_count_mixture_trust_weighted"
-            )
         result["evaluation_env_strategy"] = "separate_clean_environment"
         result["evaluation_seed_schedule"] = (
             "reseed_each_call_episode_as_seed_plus_10000_plus_episode"
@@ -1794,6 +1773,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-name", required=True)
     parser.add_argument("--corruption", choices=CORRUPTION_MODES, default="clean")
     parser.add_argument("--corruption-target", choices=CORRUPTION_TARGETS, default="none")
+    parser.add_argument(
+        "--corruption-profile", choices=("riql_rpex_code", "legacy_extension"),
+        default="riql_rpex_code",
+        help="shared RIQL/RPEX source corruption, or explicitly selected historical extensions",
+    )
     parser.add_argument("--stage", choices=("offline", "online", "both"), default="both")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--learner-seed", type=int)
@@ -2067,21 +2051,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--offline-ratio", type=float)
-    candidate_defaults = {
-        "audit-folds": (int, 2), "audit-steps": (int, None),
-        "recalibration-steps": (int, 1000), "generator-steps": (int, None),
-        "candidates": (int, 10), "diffusion-steps": (int, 20),
-        "check-probability": (float, .05), "optimism": (float, 1.),
-        "mad-multiplier": (float, 1.4826), "trust-min": (float, .05),
-        "trust-temperature": (float, 1.), "uncertainty-allowance": (float, 1.),
-        "residual-threshold": (float, 2.), "scale-floor": (float, 1.),
-        "scale-window": (int, 2048), "bootstrap-probability": (float, .8),
-        "retention-period": (int, 100), "retention-smoothing": (float, .1),
-        "bias-scale": (float, 1.), "advantage-clip": (float, 5.),
-    }
-    for name, (kind, default) in candidate_defaults.items():
-        parser.add_argument(f"--candidate-{name}", type=kind, default=default)
-    parser.add_argument("--candidate-retention-mode", choices=("adaptive", "fixed", "none"), default="adaptive")
     return parser
 
 
