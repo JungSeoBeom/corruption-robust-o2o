@@ -29,6 +29,9 @@ env/
 /comparison.ipynb
 /run_55_experiment.py
 
+# Local-only CRO2O training project (restored separately from public main)
+/local_cro2o/
+
 # Accidental files created by pasted CLI options / shell redirection
 /--*
 
